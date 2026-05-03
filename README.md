@@ -1,6 +1,15 @@
-# FMail
+<p align="center">
+  <img src="FMail.png" alt="FMail icon" width="128" height="128">
+</p>
 
-A small, opinionated macOS email **viewer** that fixes four specific Apple Mail pain points. Compose / send stay in Mail.app — FMail does not try to be a full mail client.
+<h1 align="center">FMail</h1>
+
+<p align="center">
+  A small, opinionated macOS email <strong>viewer</strong> that fixes four specific Apple Mail pain points.<br>
+  Compose / send stay in Mail.app — FMail does not try to be a full mail client.
+</p>
+
+---
 
 ## Why
 

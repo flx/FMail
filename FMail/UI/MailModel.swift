@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -312,6 +313,7 @@ final class MailModel {
         self.mailboxes = mboxes
         self.accounts = finalAccounts
         self.allUnreadCount = (try? await db.countAllUnreadExcludingDrafts()) ?? 0
+        updateDockBadge()
 
         // Refresh threads if the current scope still resolves.
         switch selection {
@@ -324,6 +326,20 @@ final class MailModel {
         case .none:
             break
         }
+    }
+
+    /// Pushes `allUnreadCount` to the Dock tile. Empty string clears the badge.
+    /// Numbers ≥ 1000 are shown as "999+" to keep the badge legible.
+    private func updateDockBadge() {
+        let label: String
+        if allUnreadCount <= 0 {
+            label = ""
+        } else if allUnreadCount > 999 {
+            label = "999+"
+        } else {
+            label = "\(allUnreadCount)"
+        }
+        NSApplication.shared.dockTile.badgeLabel = label.isEmpty ? nil : label
     }
 
     func selectAllMailboxes() {
