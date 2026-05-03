@@ -219,7 +219,7 @@ The `~/Library/Mail/V*/` path and Envelope Index schema are private API in spiri
 
 - **Full Disk Access** required (read `~/Library/Mail/`). Surfaced via a clear first-run flow.
 - **Contacts permission** required for name resolution. Lazy-requested on first reply.
-- **Automation permission** ("FMail wants to control Mail.app") — *not currently requested*: v1 uses `mailto:` URLs via `NSWorkspace`, not AppleScript. The usage-string is in `Info.plist` for the future AppleScript path.
+- **Automation permission** ("FMail wants to control Mail.app") required for **Mark as Read / Mark as Unread**. Triggered the first time the user clicks one of those buttons; if denied (or never prompted because dismissed), surfacing a one-click button that opens **System Settings → Privacy & Security → Automation → FMail → Mail**. The TCC error -1743 ("Not authorized to send Apple events to Mail") is the user-visible signal. `NSAppleEventsUsageDescription` is set in `Info.plist`. Compose / reply do NOT use AppleScript — those go via `mailto:` URLs through `NSWorkspace`, no Automation permission needed.
 - **No network** in v1. App makes zero outbound connections.
 - **Sandboxing**: **not sandboxed in v1** (deferred to Phase 5 — FSEventStream + sandbox interaction unproven). Signed ad-hoc for local dev; no notarisation yet.
 - **No telemetry**. Period.

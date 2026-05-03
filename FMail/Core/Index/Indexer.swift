@@ -112,8 +112,8 @@ final class Indexer: Sendable {
         await report(progress, "Recomputing counts")
         try await indexDB.recomputeMailboxCounts()
 
-        await report(progress, "Building FTS index")
-        try await indexDB.rebuildFTS()
+        await report(progress, "Updating FTS index")
+        try await indexDB.incrementalUpdateFTS()
 
         try await indexDB.setMeta("last_full_sync_at", String(Int(Date().timeIntervalSince1970)))
         try await indexDB.setMeta("schema_version_at_sync", String(Schema.currentVersion))

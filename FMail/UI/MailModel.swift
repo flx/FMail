@@ -604,17 +604,36 @@ final class MailModel {
         let accountEmail = acct?.emailAddress
         let mailboxPath = mb?.pathComponents
 
-        // Apply UI changes synchronously, FIRST.
+        // Apply UI changes synchronously, FIRST — instant feedback even if
+        // Mail.app takes a moment to process the AppleScript.
         skipSyncsUntil = Date().addingTimeInterval(30)
         applyOptimisticReadFlag(messageRowId: message.rowId, isRead: isRead)
 
-        // Tell Mail.app to actually do it; don't wait.
-        MailScripter.setReadStatusFireAndForget(
-            rfcMessageId: rfcId,
-            isRead: isRead,
-            accountEmail: accountEmail,
-            mailboxPathComponents: mailboxPath
-        )
+        // Run osascript in a subprocess (background queue inside the
+        // function). FMail's main thread is free; Mail.app blocks briefly
+        // while it scans the targeted mailbox, but we don't.
+        Task.detached {
+            let result = await MailScripter.setReadStatus(
+                rfcMessageId: rfcId,
+                isRead: isRead,
+                accountEmail: accountEmail,
+                mailboxPathComponents: mailboxPath
+            )
+            // Surface only failures the user can act on (permission issues,
+            // unknown message). Success = silent.
+            switch result {
+            case .ok:
+                break
+            case .notFound:
+                await MainActor.run { [weak self] in
+                    self?.bodyError = "Mail.app couldn't find this message — its body may not be downloaded yet (try Open in Mail.app first)."
+                }
+            case .failed(let msg):
+                await MainActor.run { [weak self] in
+                    self?.bodyError = "Mark-as-read failed: \(msg)"
+                }
+            }
+        }
     }
 
     private func applyOptimisticReadFlag(messageRowId: Int, isRead: Bool) {

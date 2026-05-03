@@ -203,9 +203,23 @@ private struct MessageBlock: View {
 
     @ViewBuilder
     private func bodyErrorBlock(_ message: String) -> some View {
+        let isPermissionError = message.contains("-1743") || message.lowercased().contains("not authorized")
         VStack(alignment: .leading, spacing: 8) {
             Label(message, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
+            if isPermissionError {
+                Text("FMail needs permission to send Apple events to Mail.app for Mark-as-Read to work. Open Automation settings, find FMail in the list, and check the box next to Mail.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button {
+                    let url = URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Automation")
+                        ?? URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    Label("Open Privacy & Security → Automation", systemImage: "lock.shield")
+                }
+                .controlSize(.small)
+            }
             if let rfcId = self.message.rfcMessageId, !rfcId.isEmpty {
                 Button {
                     _ = MailAppOpener.openMessage(rfcMessageId: rfcId)

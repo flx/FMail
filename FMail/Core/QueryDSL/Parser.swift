@@ -117,7 +117,7 @@ struct QueryParser {
         case "to": return .toAddr(v)
         case "cc": return .ccAddr(v)
         case "subject", "subj": return .subject(v)
-        case "body": return .body(v)
+        case "body", "content", "text": return .body(v)
         case "attachment", "filename": return .attachmentName(v)
         case "in": return .mailboxKind(v.lowercased())
         case "account": return .account(v)

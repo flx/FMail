@@ -46,6 +46,8 @@ Daily-driver capable. Phases 0–4 shipped — all four pain points closed. Phas
 - macOS 14 (Sonoma) or later.
 - Apple Mail set up with your accounts (FMail reads its on-disk data; it doesn't talk to mail servers itself).
 - **Full Disk Access** granted to FMail (so it can read `~/Library/Mail/`). The app prompts on first launch.
+- **Contacts permission** (optional) — used to suggest the right address per contact when replying. Lazy-prompted the first time you reply.
+- **Automation permission** to control Mail.app (optional) — required for "Mark as Read" / "Mark as Unread", which drive Mail.app via AppleScript. macOS prompts the first time you click one of those buttons. If you decline or dismiss the prompt, you'll need to enable it manually under **System Settings → Privacy & Security → Automation → FMail → Mail**. (FMail surfaces a one-click button to open that pane when it detects the permission has been denied.)
 
 ## Build
 

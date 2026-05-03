@@ -285,11 +285,14 @@ actor IndexDB {
             """)
     }
 
-    /// Rebuild the FTS index from current messages + recipients. Body content
-    /// is left empty here; BodyIndexer fills it in as a separate sweep.
-    func rebuildFTS() throws {
+    /// Incremental FTS update: inserts FTS rows for new messages, removes
+    /// rows for messages that no longer exist. Existing rows are NOT touched,
+    /// so body content the BodyIndexer populated survives across syncs.
+    ///
+    /// (Older versions of this method DELETEd everything and re-INSERTed —
+    /// which wiped body content every sync, see Schema v5 for the recovery.)
+    func incrementalUpdateFTS() throws {
         try inTransaction {
-            try Schema.exec(db!, "DELETE FROM messages_fts;")
             try Schema.exec(db!, """
             INSERT INTO messages_fts(rowid, subject, body_text, sender, recipients, attachment_names)
             SELECT m.apple_rowid,
@@ -302,8 +305,22 @@ actor IndexDB {
                    ), ''),
                    ''
             FROM messages m
+            WHERE m.apple_rowid NOT IN (SELECT rowid FROM messages_fts)
+            """)
+            try Schema.exec(db!, """
+            DELETE FROM messages_fts
+            WHERE rowid NOT IN (SELECT apple_rowid FROM messages)
             """)
         }
+    }
+
+    /// Force full rebuild — used by manual "Rebuild Index" actions or schema
+    /// migrations. Wipes body content; BodyIndexer must be re-run to restore it.
+    func rebuildFTS() throws {
+        try inTransaction {
+            try Schema.exec(db!, "DELETE FROM messages_fts;")
+        }
+        try incrementalUpdateFTS()
     }
 
     /// Update one message's body text in FTS. Called by BodyIndexer.

@@ -4,7 +4,7 @@ import SQLite3
 /// FMail's own SQLite schema. Versioned via `schema_version` so future
 /// migrations can detect prior state and upgrade in place.
 enum Schema {
-    static let currentVersion: Int = 4
+    static let currentVersion: Int = 5
 
     /// Apply migrations to bring the DB up to `currentVersion`. Idempotent.
     static func apply(to db: OpaquePointer) throws {
@@ -26,6 +26,7 @@ enum Schema {
         if v < 2 { try migrateTo2(db) }
         if v < 3 { try migrateTo3(db) }
         if v < 4 { try migrateTo4(db) }
+        if v < 5 { try migrateTo5(db) }
     }
 
     static func currentSchemaVersion(_ db: OpaquePointer) -> Int {
@@ -157,6 +158,26 @@ enum Schema {
         case cc = 1
         case bcc = 2
         case from = 3
+    }
+
+    /// v5: recover from a pre-fix bug where every sync wiped FTS body content.
+    /// Reset `body_indexed = 0` for all messages so the body indexer re-runs
+    /// and re-populates body text into FTS. The Indexer's FTS update is now
+    /// incremental (only inserts new rows / removes deleted rows; existing
+    /// rows are left alone) so body content survives subsequent syncs.
+    private static func migrateTo5(_ db: OpaquePointer) throws {
+        let statements = [
+            "UPDATE messages SET body_indexed = 0;",
+            "INSERT INTO schema_version(version, applied_at) VALUES (5, strftime('%s','now'));"
+        ]
+        try exec(db, "BEGIN TRANSACTION;")
+        do {
+            for s in statements { try exec(db, s) }
+            try exec(db, "COMMIT;")
+        } catch {
+            try? exec(db, "ROLLBACK;")
+            throw error
+        }
     }
 
     /// v4: store the RFC 2822 Message-ID header on each message, joined from

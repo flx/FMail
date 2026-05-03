@@ -1,45 +1,78 @@
 import AppKit
 import Foundation
 
-/// AppleScript-driven write-back to Mail.app. Used for actions FMail itself
-/// can't perform (because it never writes to Apple Mail's local store):
-/// mark-as-read, mark-as-unread, etc.
+/// AppleScript-driven write-back to Mail.app. Runs scripts via `/usr/bin/osascript`
+/// in a subprocess — keeps FMail's main thread free and avoids NSAppleScript's
+/// fussy main-thread / runloop requirements. The first invocation triggers
+/// macOS's Automation permission prompt ("FMail wants to control Mail.app").
 ///
-/// Triggers the macOS Automation permission prompt the first time it runs
-/// ("FMail wants to control Mail.app"). `NSAppleEventsUsageDescription` is
-/// already set in the bundle Info.plist.
+/// The script needs to wait for Mail.app's responses (to look up account /
+/// mailbox / message), so we don't use `ignoring application responses` —
+/// that would make the lookup steps return nothing. Mail.app does block its
+/// own UI briefly while it scans the target mailbox; we keep that scan to
+/// one specific mailbox to minimise the lockup.
 enum MailScripter {
-    /// Asks Mail.app to set a message's read status. Returns immediately —
-    /// the AppleScript is fire-and-forget so neither FMail nor Mail.app
-    /// freeze while we wait. Caller is expected to update the local UI
-    /// optimistically; the next sync (and FSEvents) reconciles eventually.
-    ///
-    /// The lookup is targeted at the message's canonical account+mailbox so
-    /// Mail.app only scans one mailbox's messages — much cheaper than walking
-    /// every account/mailbox.
-    static func setReadStatusFireAndForget(
+    /// Asks Mail.app to set a message's read status. Returns when osascript
+    /// finishes (Mail.app has applied the change or reported it couldn't find
+    /// the message). Caller should run this with a Task and not await it on
+    /// the main actor — UI feedback should be optimistic (already done before
+    /// this is called).
+    static func setReadStatus(
         rfcMessageId: String,
         isRead: Bool,
         accountEmail: String?,
         mailboxPathComponents: [String]?
-    ) {
+    ) async -> Result {
         let cleaned = rfcMessageId
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-        guard !cleaned.isEmpty else { return }
+        guard !cleaned.isEmpty else { return .failed("Empty Message-ID") }
 
         let escapedId = appleScriptEscape(cleaned)
         let readBool = isRead ? "true" : "false"
 
-        let bodyScript: String
+        let source = makeScript(
+            escapedId: escapedId,
+            readBool: readBool,
+            accountEmail: accountEmail,
+            mailboxPathComponents: mailboxPathComponents
+        )
+
+        let (stdout, stderr, exitCode) = await runOsascript(source)
+        if exitCode != 0 {
+            let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = detail.isEmpty ? stdout : detail
+            return .failed("osascript exit \(exitCode): \(body)")
+        }
+        let count = Int(stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        return count > 0 ? .ok(matched: count) : .notFound
+    }
+
+    enum Result: Sendable {
+        case ok(matched: Int)
+        case notFound
+        case failed(String)
+    }
+
+    // MARK: — Script construction
+
+    private static func makeScript(
+        escapedId: String,
+        readBool: String,
+        accountEmail: String?,
+        mailboxPathComponents: [String]?
+    ) -> String {
         if let accountEmail, !accountEmail.isEmpty,
            let mailboxPathComponents, !mailboxPathComponents.isEmpty {
-            // Targeted: navigate directly to the message's home mailbox.
+            // Targeted: navigate directly to the message's home mailbox so
+            // Mail.app only scans that one mailbox's messages.
             let escapedEmail = appleScriptEscape(accountEmail)
             let mailboxRef = buildMailboxRef(pathComponents: mailboxPathComponents)
-            bodyScript = """
+            return """
+            tell application "Mail"
                 set targetId to "\(escapedId)"
                 set targetEmail to "\(escapedEmail)"
+                set foundCount to 0
                 set theAccount to missing value
                 repeat with acc in accounts
                     try
@@ -55,16 +88,19 @@ enum MailScripter {
                         set matches to (messages of targetMailbox whose message id is targetId)
                         repeat with msg in matches
                             set read status of msg to \(readBool)
+                            set foundCount to foundCount + 1
                         end repeat
                     end try
                 end if
+                return foundCount
+            end tell
             """
         } else {
-            // Fallback: walk one level deep across all accounts. Slower and
-            // misses Gmail's nested layout, but covers common iCloud cases
-            // when we don't have account/mailbox metadata.
-            bodyScript = """
+            // Fallback: walk one level deep across all accounts.
+            return """
+            tell application "Mail"
                 set targetId to "\(escapedId)"
+                set foundCount to 0
                 repeat with anAccount in accounts
                     try
                         repeat with mbox in (mailboxes of anAccount)
@@ -72,33 +108,15 @@ enum MailScripter {
                                 set matches to (messages of mbox whose message id is targetId)
                                 repeat with msg in matches
                                     set read status of msg to \(readBool)
+                                    set foundCount to foundCount + 1
                                 end repeat
                             end try
                         end repeat
                     end try
                 end repeat
+                return foundCount
+            end tell
             """
-        }
-
-        // `ignoring application responses` — fire the apple event without
-        // waiting for Mail.app to finish processing. The NSAppleScript call
-        // returns immediately, so neither FMail nor the user's interaction
-        // with Mail.app's UI gets blocked while Mail.app does the work.
-        let source = """
-        tell application "Mail"
-            ignoring application responses
-            \(bodyScript)
-            end ignoring
-        end tell
-        """
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let script = NSAppleScript(source: source) else { return }
-            var error: NSDictionary?
-            _ = script.executeAndReturnError(&error)
-            // Errors silently ignored — there's no UI to show them to in the
-            // fire-and-forget model, and the next sync will reconcile state
-            // either way. (For debugging, set a breakpoint on `error != nil`.)
         }
     }
 
@@ -116,5 +134,33 @@ enum MailScripter {
     private static func appleScriptEscape(_ s: String) -> String {
         s.replacingOccurrences(of: "\\", with: "\\\\")
          .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    // MARK: — osascript subprocess
+
+    /// Runs an AppleScript via `/usr/bin/osascript` in a subprocess. Returns
+    /// (stdout, stderr, exitCode). Subprocess execution doesn't block our
+    /// main thread; Mail.app processes the apple events on its own thread.
+    private static func runOsascript(_ source: String) async -> (String, String, Int32) {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-e", source]
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                process.standardOutput = outPipe
+                process.standardError = errPipe
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    continuation.resume(returning: (out, err, process.terminationStatus))
+                } catch {
+                    continuation.resume(returning: ("", error.localizedDescription, -1))
+                }
+            }
+        }
     }
 }
