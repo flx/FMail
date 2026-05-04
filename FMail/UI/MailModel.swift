@@ -177,15 +177,15 @@ final class MailModel {
         guard let bodyIndexer else { return }
         if bodyIndexerTask != nil { return }
         let snapshotMailboxes = mailboxes
-        bodyIndexerTask = Task.detached { [weak self] in
+        // Plain `Task { ... }` from this @MainActor function inherits MainActor
+        // isolation. The await on `runUntilDone` releases the main actor while
+        // the BodyIndexer actor does its work; capturing `[weak self]` once at
+        // the top is enough — no further isolation hops to send `self` across.
+        bodyIndexerTask = Task { [weak self] in
             await bodyIndexer.runUntilDone(mailboxes: snapshotMailboxes) { snapshot in
-                Task { @MainActor [weak self] in
-                    self?.bodyIndexProgress = snapshot
-                }
+                self?.bodyIndexProgress = snapshot
             }
-            await MainActor.run { [weak self] in
-                self?.bodyIndexerTask = nil
-            }
+            self?.bodyIndexerTask = nil
         }
     }
 
