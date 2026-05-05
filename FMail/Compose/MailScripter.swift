@@ -119,11 +119,11 @@ enum MailScripter {
         var blocks: [String] = []
         for (_, group) in groups {
             let escapedEmail = appleScriptEscape(group.email)
-            // Same iterate-by-name approach as setReadStatusBatch.
+            // Same filter-form mailbox lookup as setReadStatusBatch.
             let candidateNames = mailboxNameCandidates(pathComponents: group.path)
-            let nameLiterals = candidateNames
-                .map { "\"\(appleScriptEscape($0))\"" }
-                .joined(separator: ", ")
+            let nameCondition = candidateNames
+                .map { "name = \"\(appleScriptEscape($0))\"" }
+                .joined(separator: " or ")
             // UID-first; only run the slow `whose message id` scan if UIDs
             // didn't hit. Action: read `source` to force Mail.app to fetch
             // the body.
@@ -146,13 +146,13 @@ enum MailScripter {
                         end try
                     end repeat
                     if theAccount is not missing value then
-                        set targetNames to {\(nameLiterals)}
                         try
-                            repeat with mbox in (mailboxes of theAccount)
+                            -- See comment in setReadStatusBatch: filter-form
+                            -- avoids per-mailbox AppleEvent roundtrips.
+                            set candidates to (mailboxes of theAccount whose \(nameCondition))
+                            repeat with mbox in candidates
                                 try
-                                    if (name of mbox) is in targetNames then
             \(inner)
-                                    end if
                                 end try
                             end repeat
                         end try
@@ -259,9 +259,12 @@ enum MailScripter {
             // name on a STORED account reference) is unreliable for some
             // names like `All Mail` (errors -1728) — so we always iterate.
             let candidateNames = mailboxNameCandidates(pathComponents: group.path)
-            let nameLiterals = candidateNames
-                .map { "\"\(appleScriptEscape($0))\"" }
-                .joined(separator: ", ")
+            // `whose name is in {…}` errors with -1700 (Mail.app rejects
+            // the list specifier — same problem as `whose id is in {…}`).
+            // OR-chain works.
+            let nameCondition = candidateNames
+                .map { "name = \"\(appleScriptEscape($0))\"" }
+                .joined(separator: " or ")
             let action = "set read status of msg to \(readBool)"
             let inner = makeLookupBlock(
                 uids: group.uids,
@@ -292,26 +295,28 @@ enum MailScripter {
                     end repeat
                     if theAccount is not missing value then
                         set countBefore to foundCount
-                        set targetNames to {\(nameLiterals)}
-                        -- Iterate by name so we don't depend on
-                        -- `mailbox "X" of theAccount` (which Mail.app
-                        -- silently fails for some mailbox names like
-                        -- `All Mail` even when the mailbox exists).
+                        -- `(mailboxes of theAccount whose name = X or name = Y)`
+                        -- forces Mail.app to evaluate the filter ONCE and
+                        -- return a resolved list. Iterating the result
+                        -- (`repeat with mbox in candidates`) avoids ~30
+                        -- per-mailbox AppleEvent roundtrips that
+                        -- `repeat with mbox in (mailboxes of theAccount)`
+                        -- would incur. Empirically: 8 IDs in `All Mail`
+                        -- went from ~30s → ~8s with this pattern.
                         try
-                            repeat with mbox in (mailboxes of theAccount)
+                            set candidates to (mailboxes of theAccount whose \(nameCondition))
+                            repeat with mbox in candidates
                                 try
-                                    if (name of mbox) is in targetNames then
             \(inner)
-                                    end if
                                 end try
                             end repeat
                         end try
                         if foundCount = countBefore then
-                            -- Targeted name-iteration found nothing — fall
-                            -- back to walking every mailbox of the account
-                            -- plus one nested level deep. Slow (every
-                            -- mailbox gets scanned) but only triggers when
-                            -- the leaf-name match misses.
+                            -- Targeted name-match found nothing — fall back
+                            -- to walking every mailbox of the account plus
+                            -- one nested level deep. Slow (every mailbox
+                            -- gets scanned) but only triggers when the
+                            -- leaf-name match misses entirely.
                             try
                                 repeat with mbox in (mailboxes of theAccount)
                                     try

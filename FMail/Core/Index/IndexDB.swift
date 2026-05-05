@@ -549,6 +549,28 @@ actor IndexDB {
         return nil
     }
 
+    /// One-shot rowid → thread_id map. Used by the optimistic-flip path
+    /// to update every affected thread's summary in `threadsForSelectedMailbox`,
+    /// not just the currently open one.
+    func threadIds(forMessages rowids: [Int]) throws -> [Int: Int] {
+        guard !rowids.isEmpty else { return [:] }
+        let placeholders = rowids.map { _ in "?" }.joined(separator: ",")
+        let sql = "SELECT apple_rowid, thread_id FROM messages WHERE apple_rowid IN (\(placeholders))"
+        var stmt: OpaquePointer?
+        try prepare(sql, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        for (i, id) in rowids.enumerated() {
+            bind(stmt, Int32(i + 1), Int64(id))
+        }
+        var out: [Int: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let rowid = Int(sqlite3_column_int64(stmt, 0))
+            let tid = Int(sqlite3_column_int64(stmt, 1))
+            out[rowid] = tid
+        }
+        return out
+    }
+
     func countTotalMessages() throws -> Int {
         var stmt: OpaquePointer?
         try prepare("SELECT COUNT(*) FROM messages", into: &stmt)

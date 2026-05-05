@@ -266,14 +266,44 @@ final class MailModel {
     /// once-per-message. Optimistic UI updates fire immediately for every
     /// message before osascript runs.
     func setReadStatusForMessages(_ messages: [MessageHeader], isRead: Bool) {
-        // Single batched optimistic update — applies every visible counter
-        // delta in one pass and commits each array (`searchResults`,
-        // `messagesInSelectedThread`, `mailboxes`) with a single mutation,
-        // which @Observable can reliably propagate to SwiftUI.
-        applyOptimisticReadFlags(messageRowIds: messages.map(\.rowId), isRead: isRead)
+        Task { @MainActor in
+            await self.setReadStatusForMessagesAsync(messages, isRead: isRead)
+        }
+    }
 
-        // Build batch entries. Prefer IMAP UID for AppleScript lookup
-        // (Mail.app indexes by id) and fall back to RFC Message-ID otherwise.
+    private func setReadStatusForMessagesAsync(_ messages: [MessageHeader], isRead: Bool) async {
+        // Look up thread_id for each message so we can route through the
+        // thread-aware optimistic flip path. Without this, marking from
+        // search results updates `searchResults` correctly but leaves the
+        // thread-list summaries (`threadsForSelectedMailbox`) stale —
+        // user clears the search and sees blue dots on the just-flipped
+        // threads.
+        let perThread: [(threadId: Int, messages: [MessageHeader])]
+        if let db = indexDB,
+           let map = try? await db.threadIds(forMessages: messages.map(\.rowId)) {
+            var byThread: [Int: [MessageHeader]] = [:]
+            for msg in messages {
+                if let tid = map[msg.rowId] {
+                    byThread[tid, default: []].append(msg)
+                }
+            }
+            perThread = byThread.map { ($0.key, $0.value) }
+        } else {
+            perThread = []
+        }
+
+        // Apply the thread-aware optimistic update — same path used by
+        // markSelectedThreadsAsRead, so search-bulk and thread-bulk are
+        // visually consistent.
+        if !perThread.isEmpty {
+            applyOptimisticThreadBulkRead(perThread: perThread, isRead: isRead)
+        } else {
+            // Fallback if DB isn't ready or the lookup failed: at least
+            // do the per-message flip so the search/reader views update.
+            applyOptimisticReadFlags(messageRowIds: messages.map(\.rowId), isRead: isRead)
+        }
+
+        // Build AppleScript batch entries.
         let entries: [MailScripter.BatchEntry] = messages.compactMap { msg in
             let mb = mailboxes.first { $0.rowId == msg.mailboxRowId }
             let acct = mb.flatMap { mb in accounts.first { $0.uuid == mb.accountUUID } }
