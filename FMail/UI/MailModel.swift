@@ -448,15 +448,17 @@ final class MailModel {
         }
     }
 
-    /// After each sync, ask Mail.app to fetch bodies for any new unread
-    /// messages we don't have yet. Fires the AppleScript and returns —
-    /// Mail.app does the IMAP grunt work in the background, FSEventStream
-    /// picks up the resulting `.emlx` files, BodyIndexer indexes them, and
-    /// the user sees fully-rendered bodies as they appear in the list.
-    /// Limit kept small so a backfill doesn't lock Mail.app's UI.
+    /// After each sync, ask Mail.app to fetch bodies for ALL unread
+    /// messages we don't have on disk yet. Fires the AppleScript and
+    /// returns — Mail.app does the IMAP grunt work in the background,
+    /// FSEventStream picks up the resulting `.emlx` files, BodyIndexer
+    /// indexes them, and the user sees fully-rendered bodies as they
+    /// appear in the list. No limit: a fresh-install or post-vacation
+    /// backlog of N messages costs N/5 chunks × ~5s each in Mail.app
+    /// time (background — FMail's UI stays responsive).
     private func fetchMissingUnreadBodies() async {
         guard let db = indexDB else { return }
-        guard let candidates = try? await db.fetchUnreadMissingBody(limit: 10),
+        guard let candidates = try? await db.fetchUnreadMissingBody(limit: nil),
               !candidates.isEmpty else { return }
 
         let entries: [MailScripter.BatchEntry] = candidates.compactMap { c -> MailScripter.BatchEntry? in
@@ -819,19 +821,78 @@ final class MailModel {
         }
         do {
             let body = try await bodyLoader.loadBody(messageRowId: message.rowId, mailbox: homeMailbox)
-            if selectedMessageId == message.rowId {
+            if selectedMessageId != message.rowId { return }  // user navigated away
+            if let body {
                 bodyForSelectedMessage = body
                 isLoadingBody = false
-                if body == nil {
-                    let path = homeMailbox.pathComponents.joined(separator: "/")
-                    bodyError = "No .emlx file on disk for message rowid \(message.rowId) in \(path). Mail.app may not have downloaded the body yet — open the message in Mail.app once and try again."
-                }
+                return
             }
+            // No .emlx on disk — Mail.app fetched only the header. Ask Mail.app
+            // to download the body now (synchronously, on the AppleScript
+            // serial queue), then retry the local read. The post-sync
+            // pre-fetch only covers ~10 messages; on-demand has to fill in
+            // the rest when the user actually opens one.
+            await fetchBodyOnDemandAndReload(message: message, homeMailbox: homeMailbox)
         } catch {
             if selectedMessageId == message.rowId {
                 bodyError = String(describing: error)
                 isLoadingBody = false
             }
+        }
+    }
+
+    /// Body is missing from disk — ask Mail.app to download it via
+    /// AppleScript (`source of msg` triggers an IMAP fetch), then retry
+    /// the local read. Bounded retry: we know the AppleScript completed,
+    /// but Mail.app sometimes lags briefly between the AppleEvent return
+    /// and writing the .emlx to disk. We poll every 500 ms for up to 8s
+    /// after the script returns; if still nothing, surface the error.
+    private func fetchBodyOnDemandAndReload(message: MessageHeader, homeMailbox: Mailbox) async {
+        guard let acct = accounts.first(where: { $0.uuid == homeMailbox.accountUUID }),
+              let email = acct.emailAddress else {
+            // Fallback: surface the original error, can't even build a fetch.
+            bodyError = "No .emlx file on disk for message rowid \(message.rowId) in \(homeMailbox.pathComponents.joined(separator: "/")). Mail.app may not have downloaded the body yet — open the message in Mail.app once and try again."
+            isLoadingBody = false
+            return
+        }
+
+        let entry = MailScripter.BatchEntry(
+            rfcMessageId: message.rfcMessageId ?? "",
+            appleRowId: message.rowId,
+            accountEmail: email,
+            mailboxPathComponents: homeMailbox.pathComponents
+        )
+
+        // Run on the same serial queue as Mark-as-Read so we don't compete
+        // with concurrent osascript invocations against Mail.app.
+        await MailScripter.fetchBodies([entry])
+
+        // The AppleScript returned, meaning Mail.app's `source of msg` read
+        // resolved. Now invalidate the .emlx cache for this mailbox and
+        // re-read. Mail.app may need a beat to flush the new file to disk.
+        guard selectedMessageId == message.rowId, let bodyLoader else { return }
+        await bodyLoader.invalidate(mailboxRowId: homeMailbox.rowId)
+
+        let pollDeadline = Date().addingTimeInterval(8)
+        while Date() < pollDeadline {
+            if selectedMessageId != message.rowId { return }
+            if let body = try? await bodyLoader.loadBody(messageRowId: message.rowId, mailbox: homeMailbox),
+               body != nil {
+                bodyForSelectedMessage = body
+                isLoadingBody = false
+                return
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            await bodyLoader.invalidate(mailboxRowId: homeMailbox.rowId)
+        }
+
+        // Still nothing on disk — surface the error so the user can fall
+        // back to "Open in Mail.app". This usually means Mail.app couldn't
+        // find the message via apple_rowid OR the IMAP fetch is still in
+        // flight (slow network).
+        if selectedMessageId == message.rowId {
+            bodyError = "Mail.app didn't deliver the body for rowid \(message.rowId) within 8s — try again or use Open in Mail.app."
+            isLoadingBody = false
         }
     }
 
