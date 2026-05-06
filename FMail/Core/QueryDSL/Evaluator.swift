@@ -1,24 +1,22 @@
 import Foundation
 
-/// Compiled query: an FTS5 MATCH expression plus auxiliary SQL conditions.
+/// Compiled query: a single WHERE-clause SQL boolean expression on `messages m`.
+/// Text predicates compile to `m.apple_rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)`
+/// subqueries; date / flag / scope predicates compile to direct SQL conditions
+/// on `m.*`. AND / OR / NOT all compose via native SQL boolean operators.
 ///
-/// FTS5 has its own boolean syntax (AND, OR, NOT, "phrase", `column:value`)
-/// which we leverage for text matching across subject/body/sender/recipients.
-/// Date and flag predicates are expressed as plain SQL conditions on the
-/// `messages` table.
+/// As an optimization, *pure-text* subtrees (no date/flag/scope) collapse into
+/// a single FTS5 MATCH expression — FTS5 has its own AND / OR / NOT — so a
+/// query like `from:kyoko OR from:meiko` becomes one MATCH subquery, not two.
 struct CompiledQuery {
-    /// FTS5 MATCH string. Empty if no text predicates were present.
-    let ftsExpression: String
-    /// Extra SQL fragment to AND into the WHERE clause (no leading AND).
-    let sqlConditions: String
-    /// Bindings for the SQL fragment, in order.
+    /// SQL boolean expression, suitable as a WHERE clause body.
+    let whereClause: String
+    /// Bindings in WHERE-order. Mix of text (FTS expressions) and integers.
     let bindings: [SQLBinding]
-    /// What the parser understood. Shown to the user above the results.
+    /// Human-readable reconstruction shown in the "Interpreted as" strip.
     let interpretation: String
 
-    var hasAnyConstraint: Bool {
-        !ftsExpression.isEmpty || !sqlConditions.isEmpty
-    }
+    var hasAnyConstraint: Bool { !whereClause.isEmpty }
 }
 
 enum SQLBinding {
@@ -28,130 +26,295 @@ enum SQLBinding {
 
 enum Evaluator {
     static func compile(_ node: QueryNode) -> CompiledQuery {
-        var fts = FTSBuilder()
-        var sql = SQLBuilder()
-        var human = HumanBuilder()
-        emit(node, fts: &fts, sql: &sql, human: &human, polarity: true)
-        return CompiledQuery(
-            ftsExpression: fts.build(),
-            sqlConditions: sql.build(),
-            bindings: sql.bindings,
-            interpretation: human.build()
-        )
+        let compiled = compileNode(node)
+        let interpretation = humanize(node)
+        switch compiled {
+        case .empty:
+            return CompiledQuery(whereClause: "", bindings: [], interpretation: interpretation)
+        case .text(let expr):
+            // Top-level pure-text query: wrap in a single MATCH subquery.
+            return CompiledQuery(
+                whereClause: ftsSubquery(positive: true),
+                bindings: [.text(expr)],
+                interpretation: interpretation
+            )
+        case .sql(let frag, let bs):
+            return CompiledQuery(whereClause: frag, bindings: bs, interpretation: interpretation)
+        }
     }
 
-    private static func emit(_ node: QueryNode, fts: inout FTSBuilder, sql: inout SQLBuilder, human: inout HumanBuilder, polarity: Bool) {
+    // MARK: — Internal compile output
+
+    /// Result of compiling one AST node. `text` is an FTS5 expression that
+    /// hasn't been wrapped in a MATCH subquery yet (so adjacent text-only
+    /// subtrees can fuse into one MATCH). `sql` is a SQL fragment on `m.*`.
+    private indirect enum Compiled {
+        case empty
+        case text(String)
+        case sql(fragment: String, bindings: [SQLBinding])
+    }
+
+    private static func compileNode(_ node: QueryNode) -> Compiled {
         switch node {
         case .empty:
-            return
-        case .and(let children):
-            for c in children { emit(c, fts: &fts, sql: &sql, human: &human, polarity: polarity) }
-        case .or(let children):
-            // OR is hard to express across both FTS and SQL. For Phase 3 we
-            // only support OR among text predicates (which FTS5 handles).
-            // Mixing OR with date/flag SQL conditions requires UNION; defer.
-            var inner = FTSBuilder()
-            for (i, c) in children.enumerated() {
-                if i > 0 { inner.appendRaw(" OR ") }
-                emit(c, fts: &inner, sql: &sql, human: &human, polarity: polarity)
-            }
-            if !inner.isEmpty {
-                fts.appendGroup(inner.build())
-            }
-        case .not(let inner):
-            switch inner {
-            case .term(let t):
-                emitTerm(t, fts: &fts, sql: &sql, human: &human, polarity: !polarity)
-            default:
-                // Generic NOT around a sub-expression: encode in FTS as NOT (..).
-                var sub = FTSBuilder()
-                emit(inner, fts: &sub, sql: &sql, human: &human, polarity: !polarity)
-                if !sub.isEmpty {
-                    fts.appendRaw(" NOT (\(sub.build()))")
-                }
-            }
+            return .empty
         case .term(let t):
-            emitTerm(t, fts: &fts, sql: &sql, human: &human, polarity: polarity)
+            return compileTerm(t)
+        case .not(let inner):
+            return compileNOT(compileNode(inner))
+        case .and(let children):
+            return compileAND(children.map(compileNode))
+        case .or(let children):
+            return compileOR(children.map(compileNode))
         }
     }
 
-    private static func emitTerm(_ term: Term, fts: inout FTSBuilder, sql: inout SQLBuilder, human: inout HumanBuilder, polarity: Bool) {
+    private static func compileTerm(_ term: Term) -> Compiled {
         switch term {
         case .anyText(let w):
-            fts.appendBare(w, negate: !polarity)
-            human.appendText(w, negate: !polarity)
+            let safe = sanitize(w)
+            guard !safe.isEmpty else { return .empty }
+            return .text("\(safe)*")
         case .phrase(let p):
-            fts.appendPhrase(p, negate: !polarity)
-            human.appendText("\"\(p)\"", negate: !polarity)
+            let safe = sanitize(p)
+            guard !safe.isEmpty else { return .empty }
+            return .text("\"\(safe)\"")
         case .fromAddr(let v):
-            fts.appendField("sender", v, negate: !polarity)
-            human.appendField("from", v, negate: !polarity)
+            return ftsField("sender", v)
         case .toAddr(let v):
-            fts.appendField("recipients", v, negate: !polarity)
-            human.appendField("to", v, negate: !polarity)
+            return ftsField("recipients", v)
         case .ccAddr(let v):
-            fts.appendField("recipients", v, negate: !polarity)
-            human.appendField("cc", v, negate: !polarity)
+            return ftsField("recipients", v)
         case .subject(let v):
-            fts.appendField("subject", v, negate: !polarity)
-            human.appendField("subject", v, negate: !polarity)
+            return ftsField("subject", v)
         case .body(let v):
-            fts.appendField("body_text", v, negate: !polarity)
-            human.appendField("body", v, negate: !polarity)
+            return ftsField("body_text", v)
         case .attachmentName(let v):
-            fts.appendField("attachment_names", v, negate: !polarity)
-            human.appendField("attachment", v, negate: !polarity)
+            return ftsField("attachment_names", v)
         case .dateBefore(let d):
-            sql.appendCondition("m.date_received < ?", binding: .int(Int64(d.timeIntervalSince1970)))
-            human.appendField("before", iso(d), negate: false)
+            return .sql(
+                fragment: "m.date_received < ?",
+                bindings: [.int(Int64(d.timeIntervalSince1970))]
+            )
         case .dateAfter(let d):
-            sql.appendCondition("m.date_received >= ?", binding: .int(Int64(d.timeIntervalSince1970)))
-            human.appendField("after", iso(d), negate: false)
-        case .dateInRange(let start, let end):
-            sql.appendCondition("m.date_received >= ?", binding: .int(Int64(start.timeIntervalSince1970)))
-            sql.appendCondition("m.date_received < ?", binding: .int(Int64(end.timeIntervalSince1970)))
-            // Show the user the inclusive range boundaries: end-1day reads
-            // more naturally than the half-open form.
-            let cal = Calendar.current
-            let endInclusive = cal.date(byAdding: .day, value: -1, to: end) ?? end
-            let label: String
-            if cal.isDate(start, inSameDayAs: endInclusive) {
-                label = iso(start)
-            } else {
-                label = "\(iso(start))..\(iso(endInclusive))"
-            }
-            human.appendField("during", label, negate: false)
+            return .sql(
+                fragment: "m.date_received >= ?",
+                bindings: [.int(Int64(d.timeIntervalSince1970))]
+            )
+        case .dateInRange(let s, let e):
+            return .sql(
+                fragment: "(m.date_received >= ? AND m.date_received < ?)",
+                bindings: [
+                    .int(Int64(s.timeIntervalSince1970)),
+                    .int(Int64(e.timeIntervalSince1970))
+                ]
+            )
         case .isUnread:
-            sql.appendCondition(polarity ? "m.is_read = 0" : "m.is_read = 1")
-            human.appendBare("unread", negate: !polarity)
+            return .sql(fragment: "m.is_read = 0", bindings: [])
         case .isRead:
-            sql.appendCondition(polarity ? "m.is_read = 1" : "m.is_read = 0")
-            human.appendBare("read", negate: !polarity)
+            return .sql(fragment: "m.is_read = 1", bindings: [])
         case .isFlagged:
-            sql.appendCondition(polarity ? "m.is_flagged = 1" : "m.is_flagged = 0")
-            human.appendBare("flagged", negate: !polarity)
+            return .sql(fragment: "m.is_flagged = 1", bindings: [])
         case .isUnflagged:
-            sql.appendCondition(polarity ? "m.is_flagged = 0" : "m.is_flagged = 1")
-            human.appendBare("unflagged", negate: !polarity)
+            return .sql(fragment: "m.is_flagged = 0", bindings: [])
         case .hasAttachment:
-            sql.appendCondition(polarity ? "m.has_attachment = 1" : "m.has_attachment = 0")
-            human.appendField("has", "attachment", negate: !polarity)
+            return .sql(fragment: "m.has_attachment = 1", bindings: [])
         case .noAttachment:
-            sql.appendCondition(polarity ? "m.has_attachment = 0" : "m.has_attachment = 1")
-            human.appendField("has", "no attachment", negate: !polarity)
+            return .sql(fragment: "m.has_attachment = 0", bindings: [])
         case .mailboxKind(let kind):
-            sql.appendCondition("m.mailbox_rowid IN (SELECT apple_rowid FROM mailboxes WHERE kind = ?)", binding: .text(kind))
-            human.appendField("in", kind, negate: !polarity)
+            return .sql(
+                fragment: "m.mailbox_rowid IN (SELECT apple_rowid FROM mailboxes WHERE kind = ?)",
+                bindings: [.text(kind)]
+            )
         case .account(let acc):
-            sql.appendCondition("m.account_uuid IN (SELECT uuid FROM accounts WHERE email_address = ? OR uuid LIKE ?)",
-                                bindings: [.text(acc), .text("\(acc)%")])
-            human.appendField("account", acc, negate: !polarity)
-        case .unknownField(let name, let value):
-            // Surface the value as FTS bag-of-words so the user still gets results,
-            // and tell them in the interpretation strip.
-            fts.appendBare(value, negate: !polarity)
-            human.appendField("\(name)?", value, negate: !polarity)
+            return .sql(
+                fragment: "m.account_uuid IN (SELECT uuid FROM accounts WHERE email_address = ? OR uuid LIKE ?)",
+                bindings: [.text(acc), .text("\(acc)%")]
+            )
+        case .unknownField(_, let value):
+            // Surface unknown fields as bag-of-words so the user still gets
+            // results — matches the original behavior.
+            let safe = sanitize(value)
+            guard !safe.isEmpty else { return .empty }
+            return .text("\(safe)*")
         }
+    }
+
+    private static func ftsField(_ column: String, _ value: String) -> Compiled {
+        let safe = sanitize(value)
+        guard !safe.isEmpty else { return .empty }
+        return .text("{\(column)}: \(safe)*")
+    }
+
+    // MARK: — Combinators
+
+    private static func compileAND(_ items: [Compiled]) -> Compiled {
+        let nonEmpty = filterEmpties(items)
+        guard !nonEmpty.isEmpty else { return .empty }
+        if nonEmpty.count == 1 { return nonEmpty[0] }
+
+        // Fast path: all-text → fuse into one FTS expression. FTS5 treats
+        // space-separated terms as implicit AND.
+        if let texts = allText(nonEmpty) {
+            return .text(texts.joined(separator: " "))
+        }
+
+        // Mixed: convert each branch to SQL form, AND them.
+        var fragments: [String] = []
+        var allBindings: [SQLBinding] = []
+        for item in nonEmpty {
+            let (f, b) = sqlForm(of: item)
+            fragments.append("(\(f))")
+            allBindings.append(contentsOf: b)
+        }
+        return .sql(fragment: fragments.joined(separator: " AND "), bindings: allBindings)
+    }
+
+    private static func compileOR(_ items: [Compiled]) -> Compiled {
+        let nonEmpty = filterEmpties(items)
+        guard !nonEmpty.isEmpty else { return .empty }
+        if nonEmpty.count == 1 { return nonEmpty[0] }
+
+        // Fast path: all-text → fuse into one FTS expression with explicit OR.
+        // Wrap in parens because FTS5's NOT > AND > OR precedence would
+        // otherwise let an outer AND bind tighter than this OR.
+        if let texts = allText(nonEmpty) {
+            return .text("(" + texts.joined(separator: " OR ") + ")")
+        }
+
+        // Mixed: convert each branch to SQL form, OR them.
+        var fragments: [String] = []
+        var allBindings: [SQLBinding] = []
+        for item in nonEmpty {
+            let (f, b) = sqlForm(of: item)
+            fragments.append("(\(f))")
+            allBindings.append(contentsOf: b)
+        }
+        return .sql(fragment: fragments.joined(separator: " OR "), bindings: allBindings)
+    }
+
+    private static func compileNOT(_ item: Compiled) -> Compiled {
+        switch item {
+        case .empty:
+            return .empty
+        case .text(let expr):
+            // FTS5 has only binary NOT (`a NOT b`), no unary form, so we
+            // negate text predicates by lifting them into a `NOT IN (subquery)`.
+            return .sql(fragment: ftsSubquery(positive: false), bindings: [.text(expr)])
+        case .sql(let f, let b):
+            return .sql(fragment: "NOT (\(f))", bindings: b)
+        }
+    }
+
+    /// Convert any Compiled to its SQL-fragment form. Text predicates wrap
+    /// into a MATCH subquery; SQL predicates pass through; empty becomes
+    /// the always-true literal so it doesn't break boolean composition.
+    private static func sqlForm(of item: Compiled) -> (String, [SQLBinding]) {
+        switch item {
+        case .empty:
+            return ("1", [])
+        case .text(let expr):
+            return (ftsSubquery(positive: true), [.text(expr)])
+        case .sql(let f, let b):
+            return (f, b)
+        }
+    }
+
+    private static func ftsSubquery(positive: Bool) -> String {
+        let op = positive ? "IN" : "NOT IN"
+        return "m.apple_rowid \(op) (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)"
+    }
+
+    // MARK: — Helpers
+
+    private static func filterEmpties(_ items: [Compiled]) -> [Compiled] {
+        items.filter {
+            if case .empty = $0 { return false }
+            return true
+        }
+    }
+
+    /// Returns the text expressions if every item is `.text`, else nil.
+    private static func allText(_ items: [Compiled]) -> [String]? {
+        var out: [String] = []
+        out.reserveCapacity(items.count)
+        for item in items {
+            guard case .text(let s) = item else { return nil }
+            out.append(s)
+        }
+        return out
+    }
+
+    /// Strip characters that confuse the FTS5 query parser. Matches the
+    /// original sanitization rules.
+    private static func sanitize(_ s: String) -> String {
+        var out = ""
+        for ch in s where !"\"():*-".contains(ch) {
+            out.append(ch)
+        }
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+
+    // MARK: — Human-readable reconstruction
+
+    private static func humanize(_ node: QueryNode) -> String {
+        switch node {
+        case .empty:
+            return ""
+        case .term(let t):
+            return humanTerm(t, negate: false)
+        case .not(let inner):
+            if case .term(let t) = inner {
+                return humanTerm(t, negate: true)
+            }
+            let s = humanize(inner)
+            return s.isEmpty ? "" : "-(\(s))"
+        case .and(let children):
+            return children.map(humanize).filter { !$0.isEmpty }.joined(separator: " ")
+        case .or(let children):
+            let parts = children.map(humanize).filter { !$0.isEmpty }
+            if parts.isEmpty { return "" }
+            if parts.count == 1 { return parts[0] }
+            return "(" + parts.joined(separator: " OR ") + ")"
+        }
+    }
+
+    private static func humanTerm(_ term: Term, negate: Bool) -> String {
+        let pre = negate ? "-" : ""
+        switch term {
+        case .anyText(let w):
+            return pre + w
+        case .phrase(let p):
+            return "\(pre)\"\(p)\""
+        case .fromAddr(let v): return "\(pre)from:\(quoteIfNeeded(v))"
+        case .toAddr(let v):   return "\(pre)to:\(quoteIfNeeded(v))"
+        case .ccAddr(let v):   return "\(pre)cc:\(quoteIfNeeded(v))"
+        case .subject(let v):  return "\(pre)subject:\(quoteIfNeeded(v))"
+        case .body(let v):     return "\(pre)body:\(quoteIfNeeded(v))"
+        case .attachmentName(let v): return "\(pre)attachment:\(quoteIfNeeded(v))"
+        case .dateBefore(let d): return "\(pre)before:\(iso(d))"
+        case .dateAfter(let d):  return "\(pre)after:\(iso(d))"
+        case .dateInRange(let s, let e):
+            let cal = Calendar.current
+            let endInclusive = cal.date(byAdding: .day, value: -1, to: e) ?? e
+            let label = cal.isDate(s, inSameDayAs: endInclusive)
+                ? iso(s)
+                : "\(iso(s))..\(iso(endInclusive))"
+            return "\(pre)during:\(label)"
+        case .isUnread:    return "\(pre)unread"
+        case .isRead:      return "\(pre)read"
+        case .isFlagged:   return "\(pre)flagged"
+        case .isUnflagged: return "\(pre)unflagged"
+        case .hasAttachment: return "\(pre)has:attachment"
+        case .noAttachment:  return "\(pre)has:no attachment"
+        case .mailboxKind(let kind): return "\(pre)in:\(kind)"
+        case .account(let acc):      return "\(pre)account:\(quoteIfNeeded(acc))"
+        case .unknownField(let name, let value): return "\(pre)\(name)?:\(quoteIfNeeded(value))"
+        }
+    }
+
+    private static func quoteIfNeeded(_ s: String) -> String {
+        s.contains(" ") ? "\"\(s)\"" : s
     }
 
     private static func iso(_ d: Date) -> String {
@@ -160,92 +323,4 @@ enum Evaluator {
         f.dateFormat = "yyyy-MM-dd"
         return f.string(from: d)
     }
-}
-
-// MARK: — Builders
-
-private struct FTSBuilder {
-    private var pieces: [String] = []
-
-    var isEmpty: Bool { pieces.isEmpty }
-
-    mutating func appendBare(_ word: String, negate: Bool) {
-        let safe = sanitize(word)
-        guard !safe.isEmpty else { return }
-        // Prefix match by default so "v" finds "vermont". Use quoted phrase
-        // ("v") if you want an exact token.
-        let term = "\(safe)*"
-        pieces.append(negate ? "NOT \(term)" : term)
-    }
-
-    mutating func appendPhrase(_ phrase: String, negate: Bool) {
-        let safe = sanitize(phrase)
-        guard !safe.isEmpty else { return }
-        // Quoted phrases stay exact — that's the point of using quotes.
-        let q = "\"\(safe)\""
-        pieces.append(negate ? "NOT \(q)" : q)
-    }
-
-    mutating func appendField(_ column: String, _ value: String, negate: Bool) {
-        let safe = sanitize(value)
-        guard !safe.isEmpty else { return }
-        // Prefix match for field values too, so subject:v finds vermont.
-        let core = "{\(column)}: \(safe)*"
-        pieces.append(negate ? "NOT (\(core))" : core)
-    }
-
-    mutating func appendRaw(_ s: String) { pieces.append(s) }
-
-    mutating func appendGroup(_ s: String) { pieces.append("(\(s))") }
-
-    func build() -> String {
-        // FTS5 implicit AND between space-separated tokens.
-        return pieces.joined(separator: " ")
-    }
-
-    /// Strip characters that confuse the FTS5 query parser. We're permissive
-    /// and let the parser do strict checks.
-    private func sanitize(_ s: String) -> String {
-        var out = ""
-        for ch in s where !"\"():*-".contains(ch) {
-            out.append(ch)
-        }
-        return out.trimmingCharacters(in: .whitespaces)
-    }
-}
-
-private struct SQLBuilder {
-    private var conditions: [String] = []
-    private(set) var bindings: [SQLBinding] = []
-
-    mutating func appendCondition(_ sql: String) {
-        conditions.append(sql)
-    }
-    mutating func appendCondition(_ sql: String, binding: SQLBinding) {
-        conditions.append(sql)
-        bindings.append(binding)
-    }
-    mutating func appendCondition(_ sql: String, bindings extra: [SQLBinding]) {
-        conditions.append(sql)
-        bindings.append(contentsOf: extra)
-    }
-    func build() -> String {
-        return conditions.joined(separator: " AND ")
-    }
-}
-
-private struct HumanBuilder {
-    private var pieces: [String] = []
-
-    mutating func appendText(_ s: String, negate: Bool) {
-        pieces.append(negate ? "-\(s)" : s)
-    }
-    mutating func appendField(_ name: String, _ value: String, negate: Bool) {
-        let part = "\(name):\(value.contains(" ") ? "\"\(value)\"" : value)"
-        pieces.append(negate ? "-\(part)" : part)
-    }
-    mutating func appendBare(_ s: String, negate: Bool) {
-        pieces.append(negate ? "-\(s)" : s)
-    }
-    func build() -> String { pieces.joined(separator: " ") }
 }

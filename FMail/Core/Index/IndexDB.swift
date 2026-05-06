@@ -477,53 +477,27 @@ actor IndexDB {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    /// Run a compiled search query and return matched messages, newest first
-    /// (or by FTS rank when an FTS expression was supplied).
+    /// Run a compiled search query and return matched messages, newest first.
+    /// The compiled query is a single SQL boolean expression on `messages m`;
+    /// text predicates compile to `apple_rowid IN (SELECT rowid FROM messages_fts ...)`
+    /// subqueries, so AND / OR / NOT all compose natively here. Search always
+    /// excludes drafts/trash/junk (canonical or label) — to search inside one
+    /// of those, navigate to that mailbox first.
     func search(_ q: CompiledQuery, limit: Int = 200) throws -> [MessageHeader] {
-        var sql: String
-        var bindings: [SQLBinding] = []
+        guard q.hasAnyConstraint else { return [] }
 
-        // Search always excludes drafts/trash/junk (canonical or label),
-        // matching the All Mailboxes view. To search inside one of those
-        // explicitly, navigate to that mailbox first — search is global
-        // by design.
-        if !q.ftsExpression.isEmpty {
-            // FTS5's MATCH operator requires the literal table name on the LHS;
-            // an alias is interpreted as a column, hence the join uses the full
-            // table name throughout.
-            sql = """
-            SELECT m.apple_rowid, m.mailbox_rowid,
-                   COALESCE(m.subject_prefix, '') || m.subject,
-                   m.sender_address, m.sender_display,
-                   m.date_sent, m.date_received,
-                   m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
-            FROM messages_fts
-            JOIN messages m ON m.apple_rowid = messages_fts.rowid
-            WHERE messages_fts MATCH ?
-              AND \(Self.systemMailboxExcludeFilter)
-            """
-            bindings.append(.text(q.ftsExpression))
-            if !q.sqlConditions.isEmpty {
-                sql += " AND " + q.sqlConditions
-                bindings.append(contentsOf: q.bindings)
-            }
-            sql += " ORDER BY m.date_received DESC LIMIT ?"
-        } else if !q.sqlConditions.isEmpty {
-            sql = """
-            SELECT m.apple_rowid, m.mailbox_rowid,
-                   COALESCE(m.subject_prefix, '') || m.subject,
-                   m.sender_address, m.sender_display,
-                   m.date_sent, m.date_received,
-                   m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
-            FROM messages m
-            WHERE \(q.sqlConditions)
-              AND \(Self.systemMailboxExcludeFilter)
-            ORDER BY m.date_received DESC LIMIT ?
-            """
-            bindings.append(contentsOf: q.bindings)
-        } else {
-            return []
-        }
+        let sql = """
+        SELECT m.apple_rowid, m.mailbox_rowid,
+               COALESCE(m.subject_prefix, '') || m.subject,
+               m.sender_address, m.sender_display,
+               m.date_sent, m.date_received,
+               m.is_read, m.is_flagged, m.rfc_message_id, m.imap_uid
+        FROM messages m
+        WHERE (\(q.whereClause))
+          AND \(Self.systemMailboxExcludeFilter)
+        ORDER BY m.date_received DESC LIMIT ?
+        """
+        var bindings = q.bindings
         bindings.append(.int(Int64(limit)))
 
         var stmt: OpaquePointer?
