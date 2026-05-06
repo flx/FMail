@@ -51,6 +51,18 @@ struct AppShell: View {
         .task {
             await model.boot()
         }
+        .alert(
+            "Bulk action failed",
+            isPresented: Binding(
+                get: { model.bulkActionError != nil },
+                set: { if !$0 { model.bulkActionError = nil } }
+            ),
+            presenting: model.bulkActionError
+        ) { _ in
+            Button("OK", role: .cancel) { model.bulkActionError = nil }
+        } message: { msg in
+            Text(msg)
+        }
         .background {
             // ⌘F focuses the search bar.
             Button("Find") { searchFocused = true }

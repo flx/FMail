@@ -87,7 +87,6 @@ enum MIMEParser {
         else { return [] }
 
         var parts: [Data] = []
-        var cursor = 0
         let bytes = [UInt8](body)
         let delimBytes = [UInt8](delimData)
         let closeBytes = [UInt8](closeData)
@@ -104,7 +103,6 @@ enum MIMEParser {
                 continue
             }
             if matches(bytes, at: i, with: delimBytes) {
-                // Make sure this isn't a closing delimiter we'd duplicate.
                 positions.append(i)
                 i += delimBytes.count
                 continue
@@ -128,9 +126,7 @@ enum MIMEParser {
                     parts.append(Data(bytes[lineEnd..<end]))
                 }
             }
-            cursor = next
         }
-        _ = cursor
         return parts
     }
 

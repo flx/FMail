@@ -73,6 +73,7 @@ final class FileWatcher: @unchecked Sendable {
             2.0,
             flags
         ) else {
+            Log.fileWatcher.error("FSEventStreamCreate returned nil — real-time updates disabled.")
             return
         }
 
@@ -80,6 +81,7 @@ final class FileWatcher: @unchecked Sendable {
         if FSEventStreamStart(s) {
             self.stream = s
         } else {
+            Log.fileWatcher.error("FSEventStreamStart returned false — real-time updates disabled.")
             FSEventStreamRelease(s)
         }
     }

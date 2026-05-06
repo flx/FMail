@@ -21,41 +21,6 @@ enum MailScripter {
         label: "com.felixmatschke.FMail.applescript",
         qos: .userInitiated
     )
-    /// Asks Mail.app to set a message's read status. Returns when osascript
-    /// finishes (Mail.app has applied the change or reported it couldn't find
-    /// the message). Caller should run this with a Task and not await it on
-    /// the main actor — UI feedback should be optimistic (already done before
-    /// this is called).
-    static func setReadStatus(
-        rfcMessageId: String,
-        isRead: Bool,
-        accountEmail: String?,
-        mailboxPathComponents: [String]?
-    ) async -> Result {
-        let cleaned = rfcMessageId
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-        guard !cleaned.isEmpty else { return .failed("Empty Message-ID") }
-
-        let escapedId = appleScriptEscape(cleaned)
-        let readBool = isRead ? "true" : "false"
-
-        let source = makeScript(
-            escapedId: escapedId,
-            readBool: readBool,
-            accountEmail: accountEmail,
-            mailboxPathComponents: mailboxPathComponents
-        )
-
-        let (stdout, stderr, exitCode) = await runOsascript(source)
-        if exitCode != 0 {
-            let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            let body = detail.isEmpty ? stdout : detail
-            return .failed("osascript exit \(exitCode): \(body)")
-        }
-        let count = Int(stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        return count > 0 ? .ok(matched: count) : .notFound
-    }
 
     enum Result: Sendable {
         case ok(matched: Int)
@@ -77,6 +42,8 @@ enum MailScripter {
         let mailboxPathComponents: [String]?
     }
 
+    // MARK: — Public API
+
     /// Asks Mail.app to load the message bodies for the given entries.
     /// Reads `source of msg` for each, which is the AppleScript-visible
     /// trigger that forces Mail.app to fetch the body over IMAP/Gmail-API
@@ -85,85 +52,19 @@ enum MailScripter {
     /// FSEventStream picks up the new file and our BodyIndexer reads it.
     static func fetchBodies(_ entries: [BatchEntry]) async {
         guard !entries.isEmpty else { return }
+        let bucketed = bucketByMailbox(entries)
+        guard !bucketed.groups.isEmpty else { return }
 
-        // Re-use the same per-mailbox bucketing as setReadStatusBatch so
-        // each mailbox is opened once and we use UID lookups when possible.
-        struct GroupKey: Hashable {
-            let email: String
-            let pathKey: String
-        }
-        struct Group {
-            let email: String
-            let path: [String]
-            var uids: [Int] = []
-            var rfcIds: [String] = []
-        }
-        var groups: [GroupKey: Group] = [:]
-
-        for e in entries {
-            guard let email = e.accountEmail, !email.isEmpty,
-                  let path = e.mailboxPathComponents, !path.isEmpty else { continue }
-            let key = GroupKey(email: email, pathKey: path.joined(separator: "/"))
-            var g = groups[key] ?? Group(email: email, path: path)
-            if let uid = e.appleRowId { g.uids.append(uid) }
-            let raw = e.rfcMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
-            let stripped = raw.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-            if !stripped.isEmpty {
-                g.rfcIds.append("<\(stripped)>")
-                g.rfcIds.append(stripped)
-            }
-            groups[key] = g
-        }
-        guard !groups.isEmpty else { return }
-
-        var blocks: [String] = []
-        for (_, group) in groups {
-            let escapedEmail = appleScriptEscape(group.email)
-            // Same filter-form mailbox lookup as setReadStatusBatch.
-            let candidateNames = mailboxNameCandidates(pathComponents: group.path)
-            let nameCondition = candidateNames
-                .map { "name = \"\(appleScriptEscape($0))\"" }
-                .joined(separator: " or ")
-            // UID-first; only run the slow `whose message id` scan if UIDs
-            // didn't hit. Action: read `source` to force Mail.app to fetch
-            // the body.
-            let inner = makeLookupBlock(
-                uids: group.uids,
-                rfcIds: group.rfcIds,
-                mailboxRef: "mbox",
+        let blocks = bucketed.groups.values.map { group in
+            buildAccountScopedBlock(
+                group: group,
                 action: "set _ to source of msg",
-                indent: "                                "
+                withFallbackWalk: false
             )
-            blocks.append("""
-                try
-                    set theAccount to missing value
-                    repeat with acc in accounts
-                        try
-                            if (email addresses of acc) contains "\(escapedEmail)" then
-                                set theAccount to acc
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
-                    if theAccount is not missing value then
-                        try
-                            -- See comment in setReadStatusBatch: filter-form
-                            -- avoids per-mailbox AppleEvent roundtrips.
-                            set candidates to (mailboxes of theAccount whose \(nameCondition))
-                            repeat with mbox in candidates
-                                try
-            \(inner)
-                                end try
-                            end repeat
-                        end try
-                    end if
-                end try
-            """)
         }
 
-        // foundCount is mutated by makeLookupBlock to short-circuit slow
-        // Message-ID scans. We don't read it back here (fire-and-forget),
-        // but it must exist before the inner blocks reference it.
+        // foundCount is referenced by makeLookupBlock to short-circuit slow
+        // Message-ID scans. We don't read it back here (fire-and-forget).
         let source = """
         with timeout of 600 seconds
             tell application "Mail"
@@ -172,217 +73,29 @@ enum MailScripter {
             end tell
         end timeout
         """
-
-        // Run on the serial queue (same as Mark-as-Read) so multiple Mail.app
-        // operations from FMail don't race each other.
         _ = await runOsascript(source)
     }
 
     /// Mark many messages read/unread with a SINGLE osascript invocation.
     /// Entries are grouped by `(accountEmail, mailboxPath)`; each group
-    /// scans its mailbox exactly once with `whose message id is in {...}`,
-    /// so even a 100-message batch in one Gmail mailbox is one linear scan
-    /// instead of 100. Falls through to the broad-walk path for entries
-    /// that don't have account/mailbox info.
+    /// scans its mailbox exactly once with `whose id is …`, so even a
+    /// 100-message batch in one Gmail mailbox is one linear scan instead
+    /// of 100. Falls through to the broad-walk path for entries that
+    /// don't have account/mailbox info.
     static func setReadStatusBatch(_ entries: [BatchEntry], isRead: Bool) async -> Result {
         guard !entries.isEmpty else { return .notFound }
+        let bucketed = bucketByMailbox(entries)
+        let action = "set read status of msg to \(isRead ? "true" : "false")"
 
-        let readBool = isRead ? "true" : "false"
-
-        // Bucket targeted entries by (account email, joined mailbox path).
-        // For each bucket we collect IMAP UIDs (fast `whose id is N`) and
-        // RFC Message-IDs (slow `whose message id is "..."`) separately.
-        struct GroupKey: Hashable {
-            let email: String
-            let pathKey: String
+        var blocks: [String] = bucketed.groups.values.map { group in
+            buildAccountScopedBlock(group: group, action: action, withFallbackWalk: true)
         }
-        struct Group {
-            let email: String
-            let path: [String]
-            var uids: [Int] = []
-            var rfcIds: [String] = []
-        }
-        var targetedGroups: [GroupKey: Group] = [:]
-        var fallbackUIDs: [Int] = []
-        var fallbackRfcIds: [String] = []
-
-        for e in entries {
-            let raw = e.rfcMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
-            let stripped = raw.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-            let bracketed = stripped.isEmpty ? "" : "<\(stripped)>"
-
-            let hasUID = e.appleRowId != nil
-            let hasRfc = !stripped.isEmpty
-            guard hasUID || hasRfc else { continue }
-            if let email = e.accountEmail, !email.isEmpty,
-               let path = e.mailboxPathComponents, !path.isEmpty {
-                let key = GroupKey(email: email, pathKey: path.joined(separator: "/"))
-                var group = targetedGroups[key] ?? Group(email: email, path: path)
-                if let uid = e.appleRowId { group.uids.append(uid) }
-                // Include both bracketed and stripped forms because Mail.app's
-                // `message id` property has been observed to return either
-                // form depending on the protocol/source. Idempotent — Mail.app
-                // setting `read status` on the same message twice is harmless.
-                if !bracketed.isEmpty { group.rfcIds.append(bracketed) }
-                if !stripped.isEmpty { group.rfcIds.append(stripped) }
-                targetedGroups[key] = group
-            } else {
-                if let uid = e.appleRowId { fallbackUIDs.append(uid) }
-                if !bracketed.isEmpty { fallbackRfcIds.append(bracketed) }
-                if !stripped.isEmpty { fallbackRfcIds.append(stripped) }
-            }
-        }
-
-        var blocks: [String] = []
-
-        // Performance: Mail.app indexes messages by `id` (= Apple Envelope
-        // Index ROWID) so `whose id is N` is O(log n). `whose message id is X`
-        // is a LINEAR SCAN — for [Gmail]/All Mail at 100k+ messages, each
-        // takes seconds, and Mail.app blocks its main thread (= beachball).
-        //
-        // Strategy: try the fast UID lookup first. ONLY fall back to the
-        // slow Message-ID scan if the UID lookup didn't match anything in
-        // this mailbox candidate. apple_rowid is always present, so in
-        // practice the Message-ID branch is dead code — kept as a safety
-        // net for the rare case where rowId mismatches.
-        //
-        // We try multiple mailbox path variants because Mail.app's view
-        // of Gmail flattens the [Gmail] container.
-        for (_, group) in targetedGroups {
-            let escapedEmail = appleScriptEscape(group.email)
-            // Names to match against `(name of mbox)` while iterating
-            // `mailboxes of theAccount`. We collect every plausible form
-            // because Mail.app's view of Gmail varies — the leaf name
-            // (e.g. `All Mail`) usually wins, but some setups also expose
-            // the slash-joined form (`[Gmail]/All Mail`) as a single
-            // mailbox. Empirically, `mailbox "X" of theAccount` (lookup by
-            // name on a STORED account reference) is unreliable for some
-            // names like `All Mail` (errors -1728) — so we always iterate.
-            let candidateNames = mailboxNameCandidates(pathComponents: group.path)
-            // `whose name is in {…}` errors with -1700 (Mail.app rejects
-            // the list specifier — same problem as `whose id is in {…}`).
-            // OR-chain works.
-            let nameCondition = candidateNames
-                .map { "name = \"\(appleScriptEscape($0))\"" }
-                .joined(separator: " or ")
-            let action = "set read status of msg to \(readBool)"
-            let inner = makeLookupBlock(
-                uids: group.uids,
-                rfcIds: group.rfcIds,
-                mailboxRef: "mbox",
-                action: action,
-                indent: "                                "
-            )
-            // Same lookup block, deeper indent, for the brute-walk fallback.
-            let fallbackBody = makeLookupBlock(
-                uids: group.uids,
-                rfcIds: group.rfcIds,
-                mailboxRef: "mbox",
-                action: action,
-                indent: "                                            "
-            )
-
-            blocks.append("""
-                try
-                    set theAccount to missing value
-                    repeat with acc in accounts
-                        try
-                            if (email addresses of acc) contains "\(escapedEmail)" then
-                                set theAccount to acc
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
-                    if theAccount is not missing value then
-                        set countBefore to foundCount
-                        -- `(mailboxes of theAccount whose name = X or name = Y)`
-                        -- forces Mail.app to evaluate the filter ONCE and
-                        -- return a resolved list. Iterating the result
-                        -- (`repeat with mbox in candidates`) avoids ~30
-                        -- per-mailbox AppleEvent roundtrips that
-                        -- `repeat with mbox in (mailboxes of theAccount)`
-                        -- would incur. Empirically: 8 IDs in `All Mail`
-                        -- went from ~30s → ~8s with this pattern.
-                        try
-                            set candidates to (mailboxes of theAccount whose \(nameCondition))
-                            repeat with mbox in candidates
-                                try
-            \(inner)
-                                end try
-                            end repeat
-                        end try
-                        if foundCount = countBefore then
-                            -- Targeted name-match found nothing — fall back
-                            -- to walking every mailbox of the account plus
-                            -- one nested level deep. Slow (every mailbox
-                            -- gets scanned) but only triggers when the
-                            -- leaf-name match misses entirely.
-                            try
-                                repeat with mbox in (mailboxes of theAccount)
-                                    try
-            \(fallbackBody)
-                                    end try
-                                    try
-                                        repeat with submbox in (mailboxes of mbox)
-                                            try
-                                                set mbox to submbox
-            \(fallbackBody)
-                                            end try
-                                        end repeat
-                                    end try
-                                end repeat
-                            end try
-                        end if
-                    end if
-                end try
-            """)
-        }
-
-        if !fallbackUIDs.isEmpty || !fallbackRfcIds.isEmpty {
-            var inner: [String] = []
-            if !fallbackUIDs.isEmpty {
-                let lit = fallbackUIDs.map(String.init).joined(separator: ", ")
-                inner.append("""
-                                    set fallbackUIDs to {\(lit)}
-                                    repeat with aUID in fallbackUIDs
-                                        try
-                                            set matches to (messages of mbox whose id is aUID)
-                                            repeat with msg in matches
-                                                set read status of msg to \(readBool)
-                                                set foundCount to foundCount + 1
-                                            end repeat
-                                        end try
-                                    end repeat
-                """)
-            }
-            if !fallbackRfcIds.isEmpty {
-                let lit = fallbackRfcIds.map { "\"\(appleScriptEscape($0))\"" }.joined(separator: ", ")
-                inner.append("""
-                                    set fallbackMsgIds to {\(lit)}
-                                    repeat with aMsgId in fallbackMsgIds
-                                        try
-                                            set matches to (messages of mbox whose message id is aMsgId)
-                                            repeat with msg in matches
-                                                set read status of msg to \(readBool)
-                                                set foundCount to foundCount + 1
-                                            end repeat
-                                        end try
-                                    end repeat
-                """)
-            }
-            blocks.append("""
-                try
-                    repeat with anAccount in accounts
-                        try
-                            repeat with mbox in (mailboxes of anAccount)
-                                try
-            \(inner.joined(separator: "\n"))
-                                end try
-                            end repeat
-                        end try
-                    end repeat
-                end try
-            """)
+        if let fallback = buildCrossAccountFallback(
+            uids: bucketed.fallbackUIDs,
+            rfcIds: bucketed.fallbackRfcIds,
+            action: action
+        ) {
+            blocks.append(fallback)
         }
 
         let source = """
@@ -405,88 +118,222 @@ enum MailScripter {
         return count > 0 ? .ok(matched: count) : .notFound
     }
 
+    // MARK: — Bucketing
+
+    private struct GroupKey: Hashable {
+        let email: String
+        let pathKey: String
+    }
+
+    private struct Group {
+        let email: String
+        let path: [String]
+        var uids: [Int] = []
+        var rfcIds: [String] = []
+    }
+
+    private struct BucketedEntries {
+        let groups: [GroupKey: Group]
+        let fallbackUIDs: [Int]
+        let fallbackRfcIds: [String]
+    }
+
+    /// Bucket entries by `(accountEmail, mailboxPath)` so each Mail.app
+    /// mailbox is scanned exactly once. Entries without account+path info
+    /// land in the fallback arrays (used by setReadStatusBatch only).
+    /// RFC Message-IDs are added in both bracketed and stripped forms —
+    /// Mail.app's `message id` property has been observed to return either,
+    /// and idempotent set on the same message twice is harmless.
+    private static func bucketByMailbox(_ entries: [BatchEntry]) -> BucketedEntries {
+        var groups: [GroupKey: Group] = [:]
+        var fallbackUIDs: [Int] = []
+        var fallbackRfcIds: [String] = []
+
+        for e in entries {
+            let stripped = e.rfcMessageId
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+            let bracketed = stripped.isEmpty ? "" : "<\(stripped)>"
+            let hasUID = e.appleRowId != nil
+            let hasRfc = !stripped.isEmpty
+            guard hasUID || hasRfc else { continue }
+
+            if let email = e.accountEmail, !email.isEmpty,
+               let path = e.mailboxPathComponents, !path.isEmpty {
+                let key = GroupKey(email: email, pathKey: path.joined(separator: "/"))
+                var group = groups[key] ?? Group(email: email, path: path)
+                if let uid = e.appleRowId { group.uids.append(uid) }
+                if !bracketed.isEmpty { group.rfcIds.append(bracketed) }
+                if !stripped.isEmpty { group.rfcIds.append(stripped) }
+                groups[key] = group
+            } else {
+                if let uid = e.appleRowId { fallbackUIDs.append(uid) }
+                if !bracketed.isEmpty { fallbackRfcIds.append(bracketed) }
+                if !stripped.isEmpty { fallbackRfcIds.append(stripped) }
+            }
+        }
+        return BucketedEntries(groups: groups, fallbackUIDs: fallbackUIDs, fallbackRfcIds: fallbackRfcIds)
+    }
+
     // MARK: — Script construction
 
-    private static func makeScript(
-        escapedId: String,
-        readBool: String,
-        accountEmail: String?,
-        mailboxPathComponents: [String]?
+    /// AppleScript snippet for one targeted `(account, mailbox-path)` group.
+    /// Resolves the account by email, then iterates `(mailboxes of acct
+    /// whose name = X or name = Y)` so Mail.app evaluates the filter once
+    /// and returns a resolved list — empirically 30s → 8s for an 8-message
+    /// batch in `All Mail` vs. iterating every mailbox.
+    ///
+    /// `withFallbackWalk: true` adds a brute-walk fallback that scans every
+    /// mailbox + one nested level when the targeted name-match misses.
+    /// Used by setReadStatusBatch (fetchBodies just gives up if missed).
+    private static func buildAccountScopedBlock(
+        group: Group,
+        action: String,
+        withFallbackWalk: Bool
     ) -> String {
-        let body: String
-        if let accountEmail, !accountEmail.isEmpty,
-           let mailboxPathComponents, !mailboxPathComponents.isEmpty {
-            // Targeted: navigate directly to the message's home mailbox so
-            // Mail.app only scans that one mailbox's messages.
-            let escapedEmail = appleScriptEscape(accountEmail)
-            let mailboxRef = buildMailboxRef(pathComponents: mailboxPathComponents)
-            body = """
-                set targetId to "\(escapedId)"
-                set targetEmail to "\(escapedEmail)"
-                set foundCount to 0
+        let escapedEmail = appleScriptEscape(group.email)
+        let nameCondition = mailboxNameCandidates(pathComponents: group.path)
+            .map { "name = \"\(appleScriptEscape($0))\"" }
+            .joined(separator: " or ")
+        let inner = makeLookupBlock(
+            uids: group.uids,
+            rfcIds: group.rfcIds,
+            mailboxRef: "mbox",
+            action: action,
+            indent: "                                "
+        )
+
+        if !withFallbackWalk {
+            return """
+                try
+                    set theAccount to missing value
+                    repeat with acc in accounts
+                        try
+                            if (email addresses of acc) contains "\(escapedEmail)" then
+                                set theAccount to acc
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+                    if theAccount is not missing value then
+                        try
+                            set candidates to (mailboxes of theAccount whose \(nameCondition))
+                            repeat with mbox in candidates
+                                try
+            \(inner)
+                                end try
+                            end repeat
+                        end try
+                    end if
+                end try
+            """
+        }
+
+        let fallbackBody = makeLookupBlock(
+            uids: group.uids,
+            rfcIds: group.rfcIds,
+            mailboxRef: "mbox",
+            action: action,
+            indent: "                                            "
+        )
+        return """
+            try
                 set theAccount to missing value
                 repeat with acc in accounts
                     try
-                        if (email addresses of acc) contains targetEmail then
+                        if (email addresses of acc) contains "\(escapedEmail)" then
                             set theAccount to acc
                             exit repeat
                         end if
                     end try
                 end repeat
                 if theAccount is not missing value then
+                    set countBefore to foundCount
                     try
-                        set targetMailbox to \(mailboxRef)
-                        set matches to (messages of targetMailbox whose message id is targetId)
-                        repeat with msg in matches
-                            set read status of msg to \(readBool)
-                            set foundCount to foundCount + 1
+                        set candidates to (mailboxes of theAccount whose \(nameCondition))
+                        repeat with mbox in candidates
+                            try
+        \(inner)
+                            end try
                         end repeat
                     end try
+                    if foundCount = countBefore then
+                        -- Targeted name-match found nothing — fall back to
+                        -- walking every mailbox of the account plus one
+                        -- nested level. Slow but only triggers on miss.
+                        try
+                            repeat with mbox in (mailboxes of theAccount)
+                                try
+        \(fallbackBody)
+                                end try
+                                try
+                                    repeat with submbox in (mailboxes of mbox)
+                                        try
+                                            set mbox to submbox
+        \(fallbackBody)
+                                        end try
+                                    end repeat
+                                end try
+                            end repeat
+                        end try
+                    end if
                 end if
-                return foundCount
-            """
-        } else {
-            // Fallback: walk one level deep across all accounts.
-            body = """
-                set targetId to "\(escapedId)"
-                set foundCount to 0
+            end try
+        """
+    }
+
+    /// Cross-account walk for entries that lacked account+mailbox info.
+    /// Returns nil if there's nothing to fall back to.
+    private static func buildCrossAccountFallback(
+        uids: [Int],
+        rfcIds: [String],
+        action: String
+    ) -> String? {
+        guard !uids.isEmpty || !rfcIds.isEmpty else { return nil }
+        var inner: [String] = []
+        if !uids.isEmpty {
+            let lit = uids.map(String.init).joined(separator: ", ")
+            inner.append("""
+                                    set fallbackUIDs to {\(lit)}
+                                    repeat with aUID in fallbackUIDs
+                                        try
+                                            set matches to (messages of mbox whose id is aUID)
+                                            repeat with msg in matches
+                                                \(action)
+                                                set foundCount to foundCount + 1
+                                            end repeat
+                                        end try
+                                    end repeat
+            """)
+        }
+        if !rfcIds.isEmpty {
+            let lit = rfcIds.map { "\"\(appleScriptEscape($0))\"" }.joined(separator: ", ")
+            inner.append("""
+                                    set fallbackMsgIds to {\(lit)}
+                                    repeat with aMsgId in fallbackMsgIds
+                                        try
+                                            set matches to (messages of mbox whose message id is aMsgId)
+                                            repeat with msg in matches
+                                                \(action)
+                                                set foundCount to foundCount + 1
+                                            end repeat
+                                        end try
+                                    end repeat
+            """)
+        }
+        return """
+            try
                 repeat with anAccount in accounts
                     try
                         repeat with mbox in (mailboxes of anAccount)
                             try
-                                set matches to (messages of mbox whose message id is targetId)
-                                repeat with msg in matches
-                                    set read status of msg to \(readBool)
-                                    set foundCount to foundCount + 1
-                                end repeat
+        \(inner.joined(separator: "\n"))
                             end try
                         end repeat
                     end try
                 end repeat
-                return foundCount
-            """
-        }
-
-        // Wrap in a 5-minute timeout: the default 60 s isn't enough for a
-        // linear scan of [Gmail]/All Mail (100k+ messages) on slower disks.
-        return """
-        with timeout of 300 seconds
-            tell application "Mail"
-            \(body)
-            end tell
-        end timeout
+            end try
         """
-    }
-
-    /// Build an AppleScript object reference like
-    /// `mailbox "All Mail" of mailbox "[Gmail]" of theAccount`
-    /// from path components like `["[Gmail]", "All Mail"]`.
-    private static func buildMailboxRef(pathComponents: [String]) -> String {
-        var ref = "theAccount"
-        for component in pathComponents {
-            ref = "mailbox \"\(appleScriptEscape(component))\" of \(ref)"
-        }
-        return ref
     }
 
     /// Names to match against `(name of mbox)` when iterating mailboxes
@@ -615,7 +462,9 @@ enum MailScripter {
                     let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                     let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                     let elapsed = Date().timeIntervalSince(started)
-                    fputs("[FMail.MailScripter] (\(String(format: "%.1fs", elapsed)), exit \(process.terminationStatus)) stdout=\(out.trimmingCharacters(in: .whitespacesAndNewlines)) stderr=\(err.trimmingCharacters(in: .whitespacesAndNewlines))\n", stderr)
+                    let outTrim = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let errTrim = err.trimmingCharacters(in: .whitespacesAndNewlines)
+                    Log.mailScripter.info("(\(String(format: "%.1fs", elapsed)), exit \(process.terminationStatus)) stdout=\(outTrim, privacy: .public) stderr=\(errTrim, privacy: .public)")
                     continuation.resume(returning: (out, err, process.terminationStatus))
                 } catch {
                     continuation.resume(returning: ("", error.localizedDescription, -1))

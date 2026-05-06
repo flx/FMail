@@ -8,14 +8,7 @@ struct SidebarView: View {
             get: { model.selection },
             set: { newSel in
                 guard let newSel else { return }
-                switch newSel {
-                case .allMailboxes:
-                    model.selectAllMailboxes()
-                case .mailbox(let id):
-                    if let mb = model.mailboxes.first(where: { $0.rowId == id }) {
-                        model.selectMailbox(mb)
-                    }
-                }
+                model.select(newSel)
             }
         )) {
             Section {

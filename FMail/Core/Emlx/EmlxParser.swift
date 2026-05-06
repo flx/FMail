@@ -23,19 +23,6 @@ enum EmlxParserError: Error {
 }
 
 enum EmlxParser {
-    /// Returns just the Subject header (RFC 2047 decoded). Used by Phase 0
-    /// diagnostic and as a fast path. For full parsing use `parse(url:)`.
-    static func subject(of url: URL) throws -> String? {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        guard let data = try handle.read(upToCount: 16_384), !data.isEmpty else { return nil }
-        let (text, _) = peelLengthPrefix(data)
-        let (headerStr, _) = splitHeaderBody(text)
-        let parsed = HeaderParser.parse(headerStr)
-        guard let raw = parsed["subject"] else { return nil }
-        return EncodedWord.decode(raw)
-    }
-
     /// Full parse. Returns headers, MIME-decoded body, and the trailer flag bits
     /// when present.
     static func parse(url: URL) throws -> ParsedEmlx {
@@ -73,31 +60,6 @@ enum EmlxParser {
         let rfc = Data(bytes[bodyStart..<(bodyStart + length)])
         let trailer = Data(bytes[(bodyStart + length)...])
         return (rfc, trailer)
-    }
-
-    /// Variant returning a String for the case where the caller wants to read a
-    /// fixed prefix from a FileHandle.
-    private static func peelLengthPrefix(_ data: Data) -> (String, Int) {
-        var lfIdx = 0
-        let bytes = [UInt8](data)
-        while lfIdx < bytes.count, bytes[lfIdx] != 0x0A { lfIdx += 1 }
-        guard lfIdx < bytes.count else {
-            return (String(decoding: data, as: UTF8.self), 0)
-        }
-        let prefix = String(bytes: bytes[0..<lfIdx], encoding: .ascii) ?? ""
-        let length = Int(prefix.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        let rest = Data(bytes[(lfIdx + 1)...])
-        let str = String(data: rest, encoding: .utf8) ?? String(data: rest, encoding: .isoLatin1) ?? ""
-        return (str, length)
-    }
-
-    /// Split a decoded String into header/body around the first blank line.
-    private static func splitHeaderBody(_ text: String) -> (String, String) {
-        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
-        if let r = normalized.range(of: "\n\n") {
-            return (String(normalized[..<r.lowerBound]), String(normalized[r.upperBound...]))
-        }
-        return (normalized, "")
     }
 
     private static func splitHeaderBodyBytes(_ data: Data) -> (String, Data) {

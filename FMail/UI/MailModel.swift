@@ -40,7 +40,13 @@ final class MailModel {
     var threadsError: String?
     var bodyForSelectedMessage: MessageBody?
     var isLoadingBody = false
+    /// Error from loading the *currently selected* message's body. Shown inline
+    /// in the reader. Distinct from `bulkActionError` so a bulk Mark-as-Read
+    /// failure doesn't masquerade as a body-load failure.
     var bodyError: String?
+    /// Error from a bulk action (Mark Read/Unread across multiple messages).
+    /// Surfaced as an alert in AppShell. Cleared on dismiss.
+    var bulkActionError: String?
     var showHidden = false
 
     // Search
@@ -55,7 +61,10 @@ final class MailModel {
     /// selected, the bulk-action bar appears above the list.
     var selectedSearchResultIds: Set<Int> = []
 
-    private var indexDB: IndexDB?
+    /// Visible to ReadStatusController (which mutates DB rows on optimistic
+    /// flips) and other in-module collaborators. External callers should
+    /// not reach into the index directly.
+    var indexDB: IndexDB?
     private var bodyLoader: BodyLoader?
     private var indexer: Indexer?
     private var bodyIndexer: BodyIndexer?
@@ -67,8 +76,15 @@ final class MailModel {
     /// Used by our own write-backs (Mark as Read etc.) to suppress the
     /// follow-up sync that'd otherwise fire from Mail.app's `.emlx` flag-plist
     /// modification — we've already updated our index optimistically, so the
-    /// re-mirror is wasted work.
-    private var skipSyncsUntil: Date?
+    /// re-mirror is wasted work. Mutated by ReadStatusController.
+    var skipSyncsUntil: Date?
+
+    /// Owns Mark Read / Unread for messages, threads, and search results.
+    /// `@ObservationIgnored` keeps it out of @Observable's tracking so we
+    /// can use `lazy` (the controller captures `self`, so the value can't
+    /// be created until self is fully initialized).
+    @ObservationIgnored
+    private(set) lazy var readStatus = ReadStatusController(model: self)
     private var searchTask: Task<Void, Never>?
     private var bodyIndexerTask: Task<Void, Never>?
 
@@ -255,95 +271,11 @@ final class MailModel {
         searchError = nil
     }
 
+    /// Bulk-mark from the search results selection. Forwards to
+    /// `ReadStatusController` which owns the optimistic-flip + AppleScript
+    /// dispatch.
     func markSelectedSearchResultsAsRead(_ isRead: Bool) {
-        let messages = searchResults.filter { selectedSearchResultIds.contains($0.rowId) }
-        guard !messages.isEmpty else { return }
-        setReadStatusForMessages(messages, isRead: isRead)
-    }
-
-    /// Batch Mark as Read for many messages at once. One osascript call
-    /// (grouped by mailbox), so Mail.app scans each mailbox once instead of
-    /// once-per-message. Optimistic UI updates fire immediately for every
-    /// message before osascript runs.
-    func setReadStatusForMessages(_ messages: [MessageHeader], isRead: Bool) {
-        Task { @MainActor in
-            await self.setReadStatusForMessagesAsync(messages, isRead: isRead)
-        }
-    }
-
-    private func setReadStatusForMessagesAsync(_ messages: [MessageHeader], isRead: Bool) async {
-        // Look up thread_id for each message so we can route through the
-        // thread-aware optimistic flip path. Without this, marking from
-        // search results updates `searchResults` correctly but leaves the
-        // thread-list summaries (`threadsForSelectedMailbox`) stale —
-        // user clears the search and sees blue dots on the just-flipped
-        // threads.
-        let perThread: [(threadId: Int, messages: [MessageHeader])]
-        if let db = indexDB,
-           let map = try? await db.threadIds(forMessages: messages.map(\.rowId)) {
-            var byThread: [Int: [MessageHeader]] = [:]
-            for msg in messages {
-                if let tid = map[msg.rowId] {
-                    byThread[tid, default: []].append(msg)
-                }
-            }
-            perThread = byThread.map { ($0.key, $0.value) }
-        } else {
-            perThread = []
-        }
-
-        // Apply the thread-aware optimistic update — same path used by
-        // markSelectedThreadsAsRead, so search-bulk and thread-bulk are
-        // visually consistent.
-        if !perThread.isEmpty {
-            applyOptimisticThreadBulkRead(perThread: perThread, isRead: isRead)
-        } else {
-            // Fallback if DB isn't ready or the lookup failed: at least
-            // do the per-message flip so the search/reader views update.
-            applyOptimisticReadFlags(messageRowIds: messages.map(\.rowId), isRead: isRead)
-        }
-
-        // Build AppleScript batch entries.
-        let entries: [MailScripter.BatchEntry] = messages.compactMap { msg in
-            let mb = mailboxes.first { $0.rowId == msg.mailboxRowId }
-            let acct = mb.flatMap { mb in accounts.first { $0.uuid == mb.accountUUID } }
-            // `rowId` is Apple's Envelope Index ROWID — that's what
-            // Mail.app's AppleScript `id` returns (NOT the IMAP UID).
-            return MailScripter.BatchEntry(
-                rfcMessageId: msg.rfcMessageId ?? "",
-                appleRowId: msg.rowId,
-                accountEmail: acct?.emailAddress,
-                mailboxPathComponents: mb?.pathComponents
-            )
-        }
-        guard !entries.isEmpty else { return }
-
-        // Suppress sync long enough for the batch to land — one batch can
-        // take a while if it spans multiple Gmail accounts.
-        skipSyncsUntil = Date().addingTimeInterval(120)
-
-        Task.detached { [weak self] in
-            let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
-            // Re-extend skip-syncs after AppleScript completes — same
-            // reason as the thread bulk path: brute-walk + IMAP commit
-            // can take minutes, and we don't want sync to overwrite the
-            // optimistic flag with stale Envelope Index data.
-            await MainActor.run {
-                self?.skipSyncsUntil = Date().addingTimeInterval(180)
-            }
-            switch result {
-            case .ok:
-                break
-            case .notFound:
-                await MainActor.run {
-                    self?.bodyError = "Mail.app couldn't find some of the selected messages — they may not have been downloaded yet, or Mail.app's mailbox layout doesn't match (try Tools → Diagnose Mail.app structure)."
-                }
-            case .failed(let msg):
-                await MainActor.run {
-                    self?.bodyError = "Bulk Mark as Read failed: \(msg)"
-                }
-            }
-        }
+        readStatus.markSelectedSearchResults(asRead: isRead)
     }
 
     /// Open a specific message from search results in the reader. Keeps the
@@ -407,7 +339,7 @@ final class MailModel {
             await fetchMissingUnreadBodies()
             indexProgress = .idle
         } catch {
-            print("Incremental sync failed: \(error)")
+            Log.sync.error("Incremental sync failed: \(String(describing: error), privacy: .public)")
         }
 
         // Restart body indexing now that sync is done.
@@ -482,7 +414,8 @@ final class MailModel {
 
     /// Pushes `allUnreadCount` to the Dock tile. Empty string clears the badge.
     /// Numbers ≥ 1000 are shown as "999+" to keep the badge legible.
-    private func updateDockBadge() {
+    /// Internal so ReadStatusController can call it after optimistic flips.
+    func updateDockBadge() {
         let label: String
         if allUnreadCount <= 0 {
             label = ""
@@ -495,21 +428,24 @@ final class MailModel {
     }
 
     func selectAllMailboxes() {
-        selection = .allMailboxes
-        threadsForSelectedMailbox = []
-        selectedThreadId = nil
-        selectedThreadIds = []
-        selectedMessageId = nil
-        messagesInSelectedThread = []
-        bodyForSelectedMessage = nil
-        bodyError = nil
-        threadsError = nil
-        isLoadingThreads = true
-        Task { await loadThreadsForSelected() }
+        select(.allMailboxes)
     }
 
     func selectMailbox(_ mailbox: Mailbox) {
-        selection = .mailbox(mailbox.rowId)
+        select(.mailbox(mailbox.rowId))
+    }
+
+    /// Unified sidebar setter. Switches scope, clears reader/thread state,
+    /// and kicks off a thread-list load. Silently no-ops on a `.mailbox(id)`
+    /// for a mailbox that's not currently in `mailboxes` — guards against a
+    /// stale id (deleted mailbox, persisted-then-restored selection) putting
+    /// the UI into a "selected something that doesn't exist" state.
+    func select(_ newSelection: SidebarSelection) {
+        if case .mailbox(let id) = newSelection,
+           !mailboxes.contains(where: { $0.rowId == id }) {
+            return
+        }
+        selection = newSelection
         threadsForSelectedMailbox = []
         selectedThreadId = nil
         selectedThreadIds = []
@@ -552,185 +488,9 @@ final class MailModel {
         }
     }
 
-    /// Mark every message in every currently-selected thread as read/unread.
-    /// Honors the active scope (e.g. excludes drafts/trash/junk in
-    /// All Mailboxes view) so we never accidentally flip a junk-folder
-    /// message just because it shares a thread with a real one.
-    ///
-    /// The optimistic update is *thread-aware*: each selected thread's
-    /// `ThreadSummary.unreadCount` is decremented by the actual count of
-    /// flipped messages in that thread. Without this, threads other than
-    /// the currently-open one wouldn't visually update because their
-    /// messages aren't loaded into `messagesInSelectedThread` and the
-    /// generic per-message path can't find them.
+    /// Bulk-mark from the threads selection. Forwards to ReadStatusController.
     func markSelectedThreadsAsRead(_ isRead: Bool) async {
-        guard let db = indexDB else { return }
-        let viewScope: IndexDB.ThreadViewScope
-        if isAllMailboxesScope {
-            viewScope = .excludeAllSystem
-        } else if let kind = selectedMailbox?.kind, ["drafts", "trash", "junk"].contains(kind) {
-            viewScope = .includeAll
-        } else {
-            viewScope = .excludeDrafts
-        }
-        var perThread: [(threadId: Int, messages: [MessageHeader])] = []
-        for tid in selectedThreadIds {
-            if let msgs = try? await db.loadThreadMessages(threadId: tid, scope: viewScope) {
-                let toFlip = msgs.filter { $0.isRead != isRead }
-                if !toFlip.isEmpty { perThread.append((tid, toFlip)) }
-            }
-        }
-        guard !perThread.isEmpty else { return }
-
-        applyOptimisticThreadBulkRead(perThread: perThread, isRead: isRead)
-
-        // The generic AppleScript path is reused.
-        let allMessages = perThread.flatMap { $0.messages }
-        let entries: [MailScripter.BatchEntry] = allMessages.compactMap { msg in
-            let mb = mailboxes.first { $0.rowId == msg.mailboxRowId }
-            let acct = mb.flatMap { mb in accounts.first { $0.uuid == mb.accountUUID } }
-            return MailScripter.BatchEntry(
-                rfcMessageId: msg.rfcMessageId ?? "",
-                appleRowId: msg.rowId,
-                accountEmail: acct?.emailAddress,
-                mailboxPathComponents: mb?.pathComponents
-            )
-        }
-        guard !entries.isEmpty else { return }
-
-        skipSyncsUntil = Date().addingTimeInterval(120)
-
-        Task.detached { [weak self] in
-            let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
-            // Extend the sync-skip past the AppleScript completion. The
-            // brute-walk fallback can take minutes, and Mail.app may need
-            // additional time after `set read status` to commit to its
-            // Envelope Index. Without this, sync runs before Mail.app has
-            // persisted, sees stale unread, and overwrites our optimistic
-            // flag with `excluded.is_read` in upsertMessages.
-            await MainActor.run {
-                self?.skipSyncsUntil = Date().addingTimeInterval(180)
-            }
-            switch result {
-            case .ok:
-                break
-            case .notFound:
-                await MainActor.run {
-                    self?.bodyError = "Mail.app couldn't find some of the selected messages — they may not have been downloaded yet, or Mail.app's mailbox layout doesn't match (try Tools → Diagnose Mail.app structure)."
-                }
-            case .failed(let msg):
-                await MainActor.run {
-                    self?.bodyError = "Bulk Mark as Read failed: \(msg)"
-                }
-            }
-        }
-    }
-
-    /// Thread-aware optimistic flip. Updates every selected thread's
-    /// summary by the count of its flipped messages — works even for
-    /// threads whose messages aren't loaded into `messagesInSelectedThread`
-    /// (i.e., closed threads in a multi-select).
-    private func applyOptimisticThreadBulkRead(
-        perThread: [(threadId: Int, messages: [MessageHeader])],
-        isRead: Bool
-    ) {
-        let perMessageDelta = isRead ? -1 : 1
-
-        // Update every selected thread's summary.
-        var newThreads = threadsForSelectedMailbox
-        for (tid, msgs) in perThread {
-            if let idx = newThreads.firstIndex(where: { $0.threadId == tid }) {
-                let s = newThreads[idx]
-                let delta = msgs.count * perMessageDelta
-                newThreads[idx] = ThreadSummary(
-                    threadId: s.threadId,
-                    latestDateReceived: s.latestDateReceived,
-                    messageCount: s.messageCount,
-                    unreadCount: max(0, s.unreadCount + delta),
-                    flaggedCount: s.flaggedCount,
-                    latestSubject: s.latestSubject,
-                    latestSenderDisplay: s.latestSenderDisplay,
-                    latestMessageRowId: s.latestMessageRowId
-                )
-            }
-        }
-        threadsForSelectedMailbox = newThreads
-
-        // Aggregate per-mailbox deltas, update sidebar counts.
-        let allMessages = perThread.flatMap { $0.messages }
-        var mailboxDeltas: [Int: Int] = [:]
-        for msg in allMessages {
-            mailboxDeltas[msg.mailboxRowId, default: 0] += perMessageDelta
-        }
-        if !mailboxDeltas.isEmpty {
-            var newMailboxes = mailboxes
-            for (mid, delta) in mailboxDeltas {
-                if let idx = newMailboxes.firstIndex(where: { $0.rowId == mid }) {
-                    let mb = newMailboxes[idx]
-                    newMailboxes[idx] = Mailbox(
-                        rowId: mb.rowId, accountUUID: mb.accountUUID,
-                        pathComponents: mb.pathComponents,
-                        totalCount: mb.totalCount,
-                        unreadCount: max(0, mb.unreadCount + delta),
-                        hidden: mb.hidden, kind: mb.kind
-                    )
-                }
-            }
-            mailboxes = newMailboxes
-        }
-
-        // Update messagesInSelectedThread for any flipped message that is
-        // in the open thread (so the reader's per-message dot updates too).
-        let flippedRowIds = Set(allMessages.map(\.rowId))
-        var newMessagesInThread = messagesInSelectedThread
-        var anyChangedInThread = false
-        for idx in newMessagesInThread.indices {
-            let m = newMessagesInThread[idx]
-            if flippedRowIds.contains(m.rowId), m.isRead != isRead {
-                newMessagesInThread[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
-                anyChangedInThread = true
-            }
-        }
-        if anyChangedInThread { messagesInSelectedThread = newMessagesInThread }
-
-        // Same for searchResults if any of these messages are showing there.
-        var newSearchResults = searchResults
-        var anyChangedInSearch = false
-        for idx in newSearchResults.indices {
-            let m = newSearchResults[idx]
-            if flippedRowIds.contains(m.rowId), m.isRead != isRead {
-                newSearchResults[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
-                anyChangedInSearch = true
-            }
-        }
-        if anyChangedInSearch { searchResults = newSearchResults }
-
-        // Global counter + dock badge.
-        let totalDelta = allMessages.count * perMessageDelta
-        allUnreadCount = max(0, allUnreadCount + totalDelta)
-        updateDockBadge()
-
-        // Persist to DB.
-        if let db = indexDB {
-            let ids = allMessages.map(\.rowId)
-            Task {
-                for id in ids {
-                    try? await db.setIsRead(rowid: id, isRead: isRead)
-                }
-            }
-        }
+        await readStatus.markSelectedThreads(asRead: isRead)
     }
 
     func selectMessage(_ message: MessageHeader) {
@@ -981,151 +741,6 @@ final class MailModel {
         _ = MailComposer.handOff(req)
     }
 
-    // MARK: — Read-status writeback (AppleScript → Mail.app)
-
-    /// Optimistic-first read-status toggle. We:
-    ///   1. Apply the change to our own DB + every visible counter immediately
-    ///      so the UI is instant.
-    ///   2. Suppress the FSEvent-triggered sync that'd fire when Mail.app
-    ///      writes back to the `.emlx` flag plist (we already know what the
-    ///      result will be).
-    ///   3. Fire the AppleScript at Mail.app in the background, scoped to the
-    ///      message's canonical account + mailbox so Mail.app only scans that
-    ///      one mailbox. Wrapped in `ignoring application responses` so neither
-    ///      FMail nor the user's interaction with Mail.app gets blocked.
-    /// The next real sync (after the suppression window) reconciles in case
-    /// Mail.app couldn't apply the change.
-    func setReadStatus(_ message: MessageHeader, isRead: Bool) {
-        // Delegate to the batch path so the single-message flow gets the
-        // same multi-mailbox-variant + brute-walk fallback + longer
-        // sync-skip window. Cheaper to maintain one code path.
-        setReadStatusForMessages([message], isRead: isRead)
-    }
-
-    /// Single-message convenience that delegates to the batch path.
-    private func applyOptimisticReadFlag(messageRowId: Int, isRead: Bool) {
-        applyOptimisticReadFlags(messageRowIds: [messageRowId], isRead: isRead)
-    }
-
-    /// Batch optimistic flip. Applies *all* changes to each array
-    /// (`searchResults`, `messagesInSelectedThread`, `mailboxes`,
-    /// `threadsForSelectedMailbox`) with a single assignment per array, so
-    /// SwiftUI sees one observable mutation per array and reliably re-renders
-    /// every affected row in one pass. Counters (mailbox unread, thread
-    /// unread, allUnreadCount) are aggregated across the batch.
-    private func applyOptimisticReadFlags(messageRowIds: [Int], isRead: Bool) {
-        guard !messageRowIds.isEmpty else { return }
-
-        // Working copies — mutate locally, commit at the end.
-        var newSearchResults = searchResults
-        var newMessagesInThread = messagesInSelectedThread
-
-        var unreadCountDelta = 0
-        var mailboxDeltas: [Int: Int] = [:]   // mailbox rowId → unread delta
-        var flippedRowIds: [Int] = []         // ids whose state actually changed
-
-        for rowId in messageRowIds {
-            var prevIsRead: Bool? = nil
-            var mailboxRowId: Int? = nil
-
-            if let idx = newMessagesInThread.firstIndex(where: { $0.rowId == rowId }) {
-                let m = newMessagesInThread[idx]
-                prevIsRead = m.isRead
-                mailboxRowId = m.mailboxRowId
-                newMessagesInThread[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
-            }
-            if let idx = newSearchResults.firstIndex(where: { $0.rowId == rowId }) {
-                let m = newSearchResults[idx]
-                if prevIsRead == nil { prevIsRead = m.isRead }
-                if mailboxRowId == nil { mailboxRowId = m.mailboxRowId }
-                newSearchResults[idx] = MessageHeader(
-                    rowId: m.rowId, mailboxRowId: m.mailboxRowId, subject: m.subject,
-                    senderAddress: m.senderAddress, senderDisplay: m.senderDisplay,
-                    dateSent: m.dateSent, dateReceived: m.dateReceived,
-                    isRead: isRead, isFlagged: m.isFlagged,
-                    rfcMessageId: m.rfcMessageId, imapUID: m.imapUID
-                )
-            }
-
-            // Aggregate counter deltas only when the state actually changed.
-            if let prev = prevIsRead, prev != isRead {
-                let d = isRead ? -1 : 1
-                unreadCountDelta += d
-                if let mid = mailboxRowId {
-                    mailboxDeltas[mid, default: 0] += d
-                }
-                flippedRowIds.append(rowId)
-            }
-        }
-
-        // Commit array changes — one mutation each.
-        searchResults = newSearchResults
-        messagesInSelectedThread = newMessagesInThread
-
-        // Mailbox sidebar counts.
-        if !mailboxDeltas.isEmpty {
-            var newMailboxes = mailboxes
-            for (mid, delta) in mailboxDeltas {
-                if let idx = newMailboxes.firstIndex(where: { $0.rowId == mid }) {
-                    let mb = newMailboxes[idx]
-                    newMailboxes[idx] = Mailbox(
-                        rowId: mb.rowId, accountUUID: mb.accountUUID,
-                        pathComponents: mb.pathComponents,
-                        totalCount: mb.totalCount,
-                        unreadCount: max(0, mb.unreadCount + delta),
-                        hidden: mb.hidden, kind: mb.kind
-                    )
-                }
-            }
-            mailboxes = newMailboxes
-        }
-
-        // Currently-displayed thread's summary — count how many flipped
-        // messages belong to the open thread (may differ when the user is
-        // bulk-marking from search results that span multiple threads).
-        if !flippedRowIds.isEmpty,
-           let tid = selectedThreadId,
-           let summaryIdx = threadsForSelectedMailbox.firstIndex(where: { $0.threadId == tid }) {
-            let inThreadCount = flippedRowIds.filter { id in
-                newMessagesInThread.contains(where: { $0.rowId == id })
-            }.count
-            if inThreadCount > 0 {
-                let threadDelta = inThreadCount * (isRead ? -1 : 1)
-                let s = threadsForSelectedMailbox[summaryIdx]
-                threadsForSelectedMailbox[summaryIdx] = ThreadSummary(
-                    threadId: s.threadId,
-                    latestDateReceived: s.latestDateReceived,
-                    messageCount: s.messageCount,
-                    unreadCount: max(0, s.unreadCount + threadDelta),
-                    flaggedCount: s.flaggedCount,
-                    latestSubject: s.latestSubject,
-                    latestSenderDisplay: s.latestSenderDisplay,
-                    latestMessageRowId: s.latestMessageRowId
-                )
-            }
-        }
-
-        // Global counter + dock badge.
-        allUnreadCount = max(0, allUnreadCount + unreadCountDelta)
-        updateDockBadge()
-
-        // Persist all flipped rows to our DB so the change survives until
-        // the next sync confirms.
-        if let db = indexDB, !flippedRowIds.isEmpty {
-            let ids = flippedRowIds
-            Task {
-                for id in ids {
-                    try? await db.setIsRead(rowid: id, isRead: isRead)
-                }
-            }
-        }
-    }
 }
 
 enum SidebarSelection: Hashable, Sendable {

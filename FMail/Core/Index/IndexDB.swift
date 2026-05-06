@@ -425,108 +425,6 @@ actor IndexDB {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    // MARK: — Contact address preferences (Phase 4)
-
-    struct ContactPrefs: Sendable, Equatable {
-        let contactId: String
-        let preferredAddress: String?
-        let blockedAddresses: Set<String>
-    }
-
-    func loadContactPrefs(contactId: String) throws -> ContactPrefs {
-        var stmt: OpaquePointer?
-        try prepare("SELECT preferred_address, blocked_addresses FROM contact_prefs WHERE contact_id = ?", into: &stmt)
-        defer { sqlite3_finalize(stmt) }
-        bind(stmt, 1, contactId)
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            let preferred = sqlite3_column_text(stmt, 0).map { String(cString: $0) }
-            let blockedJson = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "[]"
-            let blocked = Self.decodeStringArray(blockedJson)
-            return ContactPrefs(contactId: contactId, preferredAddress: preferred, blockedAddresses: Set(blocked))
-        }
-        return ContactPrefs(contactId: contactId, preferredAddress: nil, blockedAddresses: [])
-    }
-
-    func setPreferredAddress(contactId: String, address: String?) throws {
-        let existing = try loadContactPrefs(contactId: contactId)
-        try writeContactPrefs(ContactPrefs(
-            contactId: contactId,
-            preferredAddress: address,
-            blockedAddresses: existing.blockedAddresses
-        ))
-    }
-
-    func addBlockedAddress(contactId: String, address: String) throws {
-        var existing = try loadContactPrefs(contactId: contactId)
-        var blocked = existing.blockedAddresses
-        blocked.insert(address.lowercased())
-        try writeContactPrefs(ContactPrefs(
-            contactId: contactId,
-            preferredAddress: existing.preferredAddress == address ? nil : existing.preferredAddress,
-            blockedAddresses: blocked
-        ))
-        _ = existing
-    }
-
-    func removeBlockedAddress(contactId: String, address: String) throws {
-        let existing = try loadContactPrefs(contactId: contactId)
-        var blocked = existing.blockedAddresses
-        blocked.remove(address.lowercased())
-        try writeContactPrefs(ContactPrefs(
-            contactId: contactId,
-            preferredAddress: existing.preferredAddress,
-            blockedAddresses: blocked
-        ))
-    }
-
-    func loadAllContactPrefs() throws -> [ContactPrefs] {
-        var stmt: OpaquePointer?
-        try prepare("SELECT contact_id, preferred_address, blocked_addresses FROM contact_prefs", into: &stmt)
-        defer { sqlite3_finalize(stmt) }
-        var out: [ContactPrefs] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let cid = String(cString: sqlite3_column_text(stmt, 0))
-            let preferred = sqlite3_column_text(stmt, 1).map { String(cString: $0) }
-            let blockedJson = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? "[]"
-            out.append(ContactPrefs(
-                contactId: cid,
-                preferredAddress: preferred,
-                blockedAddresses: Set(Self.decodeStringArray(blockedJson))
-            ))
-        }
-        return out
-    }
-
-    private func writeContactPrefs(_ p: ContactPrefs) throws {
-        let blockedJson = Self.encodeStringArray(Array(p.blockedAddresses).sorted())
-        let sql = """
-        INSERT INTO contact_prefs(contact_id, preferred_address, blocked_addresses)
-        VALUES (?, ?, ?)
-        ON CONFLICT(contact_id) DO UPDATE SET
-            preferred_address = excluded.preferred_address,
-            blocked_addresses = excluded.blocked_addresses
-        """
-        var stmt: OpaquePointer?
-        try prepare(sql, into: &stmt)
-        defer { sqlite3_finalize(stmt) }
-        bind(stmt, 1, p.contactId)
-        bindOptional(stmt, 2, p.preferredAddress)
-        bind(stmt, 3, blockedJson)
-        try stepDone(stmt)
-    }
-
-    private static func encodeStringArray(_ a: [String]) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: a, options: []) else { return "[]" }
-        return String(data: data, encoding: .utf8) ?? "[]"
-    }
-
-    private static func decodeStringArray(_ s: String) -> [String] {
-        guard let data = s.data(using: .utf8),
-              let arr = try? JSONSerialization.jsonObject(with: data) as? [String]
-        else { return [] }
-        return arr
-    }
-
     /// Optimistic local update for is_read after a successful AppleScript
     /// write to Mail.app. The next FSEvents-triggered sync confirms it.
     func setIsRead(rowid: Int, isRead: Bool) throws {
@@ -1069,33 +967,36 @@ actor IndexDB {
         }
     }
 
-    private func prepare(_ sql: String, into stmt: inout OpaquePointer?) throws {
+    /// Internal: visible to extensions of IndexDB in other files (e.g.
+    /// IndexDB+ContactPrefs). External callers should still go through the
+    /// typed APIs above.
+    func prepare(_ sql: String, into stmt: inout OpaquePointer?) throws {
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         if rc != SQLITE_OK {
             throw IndexDBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
     }
 
-    private func stepDone(_ stmt: OpaquePointer?) throws {
+    func stepDone(_ stmt: OpaquePointer?) throws {
         let rc = sqlite3_step(stmt)
         if rc != SQLITE_DONE && rc != SQLITE_ROW {
             throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
     }
 
-    private nonisolated func bind(_ stmt: OpaquePointer?, _ pos: Int32, _ value: String) {
+    nonisolated func bind(_ stmt: OpaquePointer?, _ pos: Int32, _ value: String) {
         sqlite3_bind_text(stmt, pos, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
     }
 
-    private nonisolated func bind(_ stmt: OpaquePointer?, _ pos: Int32, _ value: Int) {
+    nonisolated func bind(_ stmt: OpaquePointer?, _ pos: Int32, _ value: Int) {
         sqlite3_bind_int64(stmt, pos, Int64(value))
     }
 
-    private nonisolated func bind(_ stmt: OpaquePointer?, _ pos: Int32, _ value: Int64) {
+    nonisolated func bind(_ stmt: OpaquePointer?, _ pos: Int32, _ value: Int64) {
         sqlite3_bind_int64(stmt, pos, value)
     }
 
-    private nonisolated func bindOptional(_ stmt: OpaquePointer?, _ pos: Int32, _ value: String?) {
+    nonisolated func bindOptional(_ stmt: OpaquePointer?, _ pos: Int32, _ value: String?) {
         if let v = value {
             bind(stmt, pos, v)
         } else {
@@ -1103,68 +1004,11 @@ actor IndexDB {
         }
     }
 
-    private nonisolated func bindOptional(_ stmt: OpaquePointer?, _ pos: Int32, _ value: Int?) {
+    nonisolated func bindOptional(_ stmt: OpaquePointer?, _ pos: Int32, _ value: Int?) {
         if let v = value {
             bind(stmt, pos, v)
         } else {
             sqlite3_bind_null(stmt, pos)
         }
     }
-}
-
-// MARK: — Wire types
-
-struct IndexedMessage {
-    let appleRowId: Int
-    let appleMessageIdHash: Int64
-    let mailboxRowId: Int
-    let accountUUID: String
-    let subject: String
-    let subjectPrefix: String
-    let subjectNormalized: String
-    let senderAddress: String?
-    let senderDisplay: String?
-    let dateSent: Int?
-    let dateReceived: Int?
-    let isRead: Bool
-    let isFlagged: Bool
-    let hasAttachment: Bool
-    let rfcMessageId: String?
-    let imapUID: Int?
-}
-
-struct IndexedRecipient {
-    let messageRowId: Int
-    let kind: Int       // 0=to, 1=cc, 2=bcc, 3=from
-    let position: Int
-    let address: String
-    let display: String?
-}
-
-struct IndexedMessageLink {
-    let fromMessageRowId: Int
-    let toMessageIdHash: Int64
-    let isParent: Bool
-}
-
-struct IndexedThread {
-    let threadId: Int
-    let rootMessageRowId: Int
-    let latestDateReceived: Int
-    let messageCount: Int
-    let unreadCount: Int
-    let flaggedCount: Int
-    let memberRowIds: [Int]
-}
-
-struct ThreadSummary: Identifiable, Hashable {
-    let threadId: Int
-    let latestDateReceived: Date?
-    let messageCount: Int
-    let unreadCount: Int
-    let flaggedCount: Int
-    let latestSubject: String
-    let latestSenderDisplay: String
-    let latestMessageRowId: Int
-    var id: Int { threadId }
 }

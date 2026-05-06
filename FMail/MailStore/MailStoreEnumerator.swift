@@ -25,46 +25,4 @@ enum MailStoreEnumerator {
     static func envelopeIndexURL(in versionDir: URL) -> URL {
         versionDir.appendingPathComponent("MailData/Envelope Index")
     }
-
-    /// Walks the version directory and returns the first non-partial `.emlx`
-    /// found. Used only by the Phase 0 diagnostic.
-    static func findFirstEmlx(in versionDir: URL) -> URL? {
-        guard let enumerator = FileManager.default.enumerator(
-            at: versionDir,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-        for case let url as URL in enumerator {
-            let name = url.lastPathComponent
-            if url.pathExtension == "emlx" && !name.contains(".partial.") {
-                return url
-            }
-        }
-        return nil
-    }
-
-    /// Finds the on-disk `.emlx` file for a given message rowid within a
-    /// mailbox's `.mbox` directory tree. The file structure is
-    /// `<inner-uuid>/Data/.../Messages/<rowid>.emlx`. We walk to find the
-    /// matching file (full or partial). Returns nil if not found.
-    static func findEmlx(rowId: Int, in mailboxDir: URL) -> URL? {
-        let target = "\(rowId).emlx"
-        let partial = "\(rowId).partial.emlx"
-        guard let enumerator = FileManager.default.enumerator(
-            at: mailboxDir,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-        var partialMatch: URL? = nil
-        for case let url as URL in enumerator {
-            let name = url.lastPathComponent
-            if name == target { return url }
-            if name == partial { partialMatch = url }
-        }
-        return partialMatch
-    }
 }
