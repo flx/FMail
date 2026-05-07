@@ -97,6 +97,9 @@ private struct MessageBlock: View {
     /// (e.g. newsletter graphs). False by default — privacy-preserving.
     /// Resets when the user navigates away (MessageBlock recreated).
     @State private var loadRemoteImages: Bool = false
+    /// Disclosure state for the expanded-message header detail block
+    /// (full sender address, To/Cc, exact date+time). Collapsed by default.
+    @State private var showDetails: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -110,13 +113,8 @@ private struct MessageBlock: View {
                 } else if isLoadingBody {
                     ProgressView()
                 } else if let messageBody {
-                    if !messageBody.attachmentNames.isEmpty {
-                        HStack {
-                            Image(systemName: "paperclip").foregroundStyle(.secondary)
-                            Text(messageBody.attachmentNames.joined(separator: ", "))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                    if !messageBody.attachments.isEmpty {
+                        attachmentsBlock(messageBody.attachments)
                     }
                     bodyContent(messageBody)
                 }
@@ -137,10 +135,9 @@ private struct MessageBlock: View {
 
     @ViewBuilder
     private var header: some View {
-        HStack {
+        HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(message.senderDisplay.isEmpty ? message.senderAddress : message.senderDisplay)
-                    .font(message.isRead ? .body : .body.bold())
+                senderLine
                 if isExpanded {
                     Text(message.subject.isEmpty ? "(no subject)" : message.subject)
                         .font(.title3.weight(.semibold))
@@ -150,6 +147,10 @@ private struct MessageBlock: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                }
+                if isExpanded && showDetails {
+                    detailsBlock
+                        .padding(.top, 6)
                 }
             }
             Spacer()
@@ -163,6 +164,147 @@ private struct MessageBlock: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Sender line. When the message is expanded, prepend a disclosure caret
+    /// that toggles the full-headers detail block.
+    @ViewBuilder
+    private var senderLine: some View {
+        let displayed = message.senderDisplay.isEmpty ? message.senderAddress : message.senderDisplay
+        if isExpanded {
+            Button {
+                showDetails.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: showDetails ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(displayed)
+                        .font(message.isRead ? .body : .body.bold())
+                }
+            }
+            .buttonStyle(.plain)
+            .help(showDetails ? "Hide details" : "Show full sender address, recipients, and exact time")
+        } else {
+            Text(displayed)
+                .font(message.isRead ? .body : .body.bold())
+        }
+    }
+
+    /// Full-fidelity headers shown beneath the subject when the user expands
+    /// the disclosure: real sender address, To/Cc, exact date+time-with-seconds.
+    /// To/Cc come from the parsed `.emlx` so they're only available once the
+    /// body has loaded.
+    @ViewBuilder
+    private var detailsBlock: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            detailRow(label: "From", value: fromLine)
+            if let to = recipientLine(forHeader: "to") {
+                detailRow(label: "To", value: to)
+            }
+            if let cc = recipientLine(forHeader: "cc") {
+                detailRow(label: "Cc", value: cc)
+            }
+            if let date = message.dateReceived ?? message.dateSent {
+                detailRow(label: "Date", value: Self.fullDateFormatter.string(from: date))
+            }
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+    }
+
+    @ViewBuilder
+    private func detailRow(label: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 36, alignment: .trailing)
+            Text(value)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var fromLine: String {
+        let display = message.senderDisplay.trimmingCharacters(in: .whitespaces)
+        let address = message.senderAddress.trimmingCharacters(in: .whitespaces)
+        if display.isEmpty { return address }
+        if address.isEmpty { return display }
+        return "\(display) <\(address)>"
+    }
+
+    private func recipientLine(forHeader name: String) -> String? {
+        guard let raw = messageBody?.headers[name], !raw.isEmpty else { return nil }
+        return EncodedWord.decode(raw)
+    }
+
+    /// E.g. "Wed, May 6, 2026 at 10:23:45 AM EDT". Day-of-week + month name +
+    /// year + time-to-the-second + timezone abbreviation. Locale-aware.
+    private static let fullDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale.current
+        f.dateFormat = "EEE, MMM d, yyyy 'at' h:mm:ss a zzz"
+        return f
+    }()
+
+    /// Clickable attachment list. Each row triggers a save panel pointing
+    /// at the user's preferred destination, with the attachment's filename
+    /// pre-filled. FMail isn't sandboxed so the chosen URL is writable
+    /// directly without scoped-bookmark gymnastics.
+    @ViewBuilder
+    private func attachmentsBlock(_ attachments: [Attachment]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(attachments.enumerated()), id: \.offset) { _, att in
+                Button {
+                    saveAttachment(att)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "paperclip")
+                            .foregroundStyle(.secondary)
+                        Text(att.name)
+                        Text(formatBytes(att.data.count))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                        Spacer(minLength: 8)
+                        Image(systemName: "arrow.down.circle")
+                            .foregroundStyle(.tint)
+                    }
+                    .font(.caption)
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .help("Save \(att.name)…")
+            }
+        }
+    }
+
+    private func saveAttachment(_ attachment: Attachment) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = attachment.name
+        panel.canCreateDirectories = true
+        panel.title = "Save attachment"
+        panel.message = "Save \"\(attachment.name)\" (\(formatBytes(attachment.data.count)))"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try attachment.data.write(to: url)
+        } catch {
+            // Non-fatal: surface as an alert from a separate panel so the
+            // user knows why no file appeared.
+            let alert = NSAlert()
+            alert.messageText = "Couldn't save attachment"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+        }
+    }
+
+    private func formatBytes(_ count: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(count), countStyle: .file)
     }
 
     @ViewBuilder

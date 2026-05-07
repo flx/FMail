@@ -12,7 +12,9 @@ import Foundation
 struct MIMEContent {
     let plainText: String?
     let html: String?
-    let attachmentNames: [String]
+    let attachments: [Attachment]
+
+    var attachmentNames: [String] { attachments.map(\.name) }
 }
 
 enum MIMEParser {
@@ -31,25 +33,33 @@ enum MIMEParser {
         // Single part.
         let decoded = decodeTransferEncoding(body, encoding: transferEncoding)
         let charset = contentType.parameters["charset"] ?? "utf-8"
+        let ctLabel = "\(contentType.major)/\(contentType.minor)"
 
         switch (contentType.major, contentType.minor) {
         case ("text", "plain"):
             let text = stringFrom(decoded, charset: charset)
-            // If there's a filename, treat as attachment too.
             if let name = attachmentName(in: partHeaders) {
-                return MIMEContent(plainText: text, html: nil, attachmentNames: [name])
+                return MIMEContent(
+                    plainText: text, html: nil,
+                    attachments: [Attachment(name: name, contentType: ctLabel, data: decoded)]
+                )
             }
-            return MIMEContent(plainText: text, html: nil, attachmentNames: [])
+            return MIMEContent(plainText: text, html: nil, attachments: [])
         case ("text", "html"):
             let text = stringFrom(decoded, charset: charset)
             if let name = attachmentName(in: partHeaders) {
-                return MIMEContent(plainText: nil, html: text, attachmentNames: [name])
+                return MIMEContent(
+                    plainText: nil, html: text,
+                    attachments: [Attachment(name: name, contentType: ctLabel, data: decoded)]
+                )
             }
-            return MIMEContent(plainText: nil, html: text, attachmentNames: [])
+            return MIMEContent(plainText: nil, html: text, attachments: [])
         default:
-            // Treat as attachment.
             let name = attachmentName(in: partHeaders) ?? defaultAttachmentName(for: contentType)
-            return MIMEContent(plainText: nil, html: nil, attachmentNames: [name])
+            return MIMEContent(
+                plainText: nil, html: nil,
+                attachments: [Attachment(name: name, contentType: ctLabel, data: decoded)]
+            )
         }
     }
 
@@ -57,7 +67,7 @@ enum MIMEParser {
         let parts = splitMultipart(body: body, boundary: boundary)
         var aggregatePlain: String?
         var aggregateHTML: String?
-        var attachments: [String] = []
+        var attachments: [Attachment] = []
 
         for partData in parts {
             let (partHeaders, partBody) = splitHeaderBody(partData)
@@ -71,12 +81,12 @@ enum MIMEParser {
             if let h = parsed.html, aggregateHTML == nil {
                 aggregateHTML = h
             }
-            attachments.append(contentsOf: parsed.attachmentNames)
+            attachments.append(contentsOf: parsed.attachments)
         }
 
         // For multipart/alternative, prefer plain over html. Both are returned;
         // the caller decides what to render.
-        return MIMEContent(plainText: aggregatePlain, html: aggregateHTML, attachmentNames: attachments)
+        return MIMEContent(plainText: aggregatePlain, html: aggregateHTML, attachments: attachments)
     }
 
     private static func splitMultipart(body: Data, boundary: String) -> [Data] {

@@ -2,6 +2,9 @@ import SwiftUI
 
 struct SidebarView: View {
     @Bindable var model: MailModel
+    /// Per-account expansion state. Empty = all collapsed (default on launch).
+    /// In-memory only; resets each launch.
+    @State private var expandedAccounts: Set<String> = []
 
     var body: some View {
         List(selection: Binding(
@@ -17,11 +20,15 @@ struct SidebarView: View {
             }
 
             ForEach(model.mailboxesByAccount, id: \.0.uuid) { (account, mailboxes) in
-                Section(account.displayName) {
+                DisclosureGroup(isExpanded: expansionBinding(for: account.uuid)) {
                     ForEach(mailboxes) { mb in
                         MailboxRow(mailbox: mb)
                             .tag(SidebarSelection.mailbox(mb.rowId))
                     }
+                } label: {
+                    Text(account.displayName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -34,6 +41,16 @@ struct SidebarView: View {
                 .help("Show hidden mailboxes (All Mail, Recovered, SendLater)")
             }
         }
+    }
+
+    private func expansionBinding(for uuid: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedAccounts.contains(uuid) },
+            set: { newValue in
+                if newValue { expandedAccounts.insert(uuid) }
+                else { expandedAccounts.remove(uuid) }
+            }
+        )
     }
 }
 

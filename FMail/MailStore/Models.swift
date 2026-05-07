@@ -53,12 +53,25 @@ struct MessageHeader: Identifiable, Hashable {
     var id: Int { rowId }
 }
 
+/// One attachment extracted from an `.emlx`. `data` holds the decoded bytes
+/// (after Content-Transfer-Encoding decode), so saving via `NSSavePanel`
+/// is just a `data.write(to:)`.
+struct Attachment {
+    let name: String
+    let contentType: String
+    let data: Data
+}
+
 /// Fully-parsed message body for display in the reader.
 struct MessageBody: Equatable {
     let headers: ParsedHeaders
     let plainText: String?
     let html: String?
-    let attachmentNames: [String]
+    let attachments: [Attachment]
+
+    /// Names of attachments, in order. Convenience for code that only
+    /// cares about display (FTS indexing, header line "paperclip + names").
+    var attachmentNames: [String] { attachments.map(\.name) }
 
     /// Best text for rendering: plain if available, otherwise HTML stripped.
     var displayText: String {
@@ -68,10 +81,14 @@ struct MessageBody: Equatable {
     }
 
     static func == (lhs: MessageBody, rhs: MessageBody) -> Bool {
-        // Only the textual content matters for equality (used by SwiftUI
-        // change-detection). Headers identity is good enough via address compare.
-        lhs.plainText == rhs.plainText
-            && lhs.html == rhs.html
-            && lhs.attachmentNames == rhs.attachmentNames
+        // Only the textual content + attachment list matters for SwiftUI
+        // change detection. Compare attachments by (name, byte count) — full
+        // byte-equality on potentially-multi-MB blobs would be wasteful.
+        guard lhs.plainText == rhs.plainText, lhs.html == rhs.html else { return false }
+        guard lhs.attachments.count == rhs.attachments.count else { return false }
+        for (a, b) in zip(lhs.attachments, rhs.attachments) {
+            if a.name != b.name || a.data.count != b.data.count { return false }
+        }
+        return true
     }
 }

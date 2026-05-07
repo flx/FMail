@@ -23,7 +23,7 @@ actor BodyLoader {
             headers: parsed.headers,
             plainText: parsed.mime.plainText,
             html: parsed.mime.html,
-            attachmentNames: parsed.mime.attachmentNames
+            attachments: parsed.mime.attachments
         )
     }
 
