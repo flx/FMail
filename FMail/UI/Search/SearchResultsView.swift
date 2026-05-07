@@ -48,6 +48,9 @@ struct SearchResultsView: View {
                 }
             }
             .focusable()
+            // Suppress the default macOS blue focus ring; we still want the
+            // view to be focused so .onKeyPress fires.
+            .focusEffectDisabled()
             .onKeyPress(.upArrow) {
                 navigate(by: -1)
                 return .handled

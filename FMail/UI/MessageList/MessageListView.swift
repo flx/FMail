@@ -70,6 +70,10 @@ struct MessageListView: View {
                 }
             }
             .focusable()
+            // Suppress the default macOS blue focus ring; we still want
+            // the view to be focused so .onKeyPress fires, but the ring
+            // bleeds visibly into the surrounding split-view dividers.
+            .focusEffectDisabled()
             .onKeyPress(.upArrow) {
                 navigateThreads(by: -1)
                 return .handled
