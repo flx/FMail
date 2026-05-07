@@ -2,7 +2,7 @@
 
 Companion to `FMailSpec.md`. The spec captures the design intent; this file captures **what's actually shipped**, what diverges from the spec, and what's left.
 
-Last updated: 2026-05-03.
+Last updated: 2026-05-07.
 
 ---
 
@@ -139,6 +139,17 @@ Items already shipped that the original spec put in Phase 5 (chronological-ish o
 - DSL aliases added for body search (`content:`, `text:`).
 - **HTML body rendering** via locked-down `WKWebView` (`Core/UI/Reader/HTMLBodyView.swift`). Strict CSP blocks all network — no tracking pixels, no remote images, no scripts, no fonts. Height auto-measured via `evaluateJavaScript` so the WebView fits naturally inside the outer `ScrollView`. Reload guarded against feedback loops (compares last-loaded `(html, allowRemoteImages)` before reloading).
 - **Per-message "Load remote images"** opt-in. CSP relaxes to `img-src data: cid: http: https:` for that one message instance; scripts/iframes/fonts stay blocked. Per-instance state, not persisted — re-opening the same email starts blocked again.
+- **Boolean `OR` / `NOT` now compose across all predicate types.** Previously the Evaluator routed text predicates into one FTS5 expression and date/flag/scope predicates into a separate SQL `AND` chain — so `(during:2025 OR during:2023)` silently became `during:2025 AND during:2023` (empty). The Evaluator now compiles each AST node into a uniform SQL boolean fragment: text predicates lift into `apple_rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)` subqueries, date/flag/scope predicates emit direct `m.*` conditions. Pure-text subtrees still fuse into one MATCH for efficiency. The interpreted-query strip now also shows `(a OR b)` and `-x` in proper form.
+- **Bulk-action errors split from body-load errors.** Bulk Mark Read/Unread failures used to set `bodyError`, which the reader rendered inline alongside actual body-load failures (and tried to surface a `-1743` Automation deep-link). Bulk failures now land in `bulkActionError` and surface as a modal `.alert` from `AppShell`, with `bodyError` reserved for the reader's "couldn't read this message's `.emlx`" cases.
+- **Internal refactor: god-class split.** `MailModel` (1145 LOC) and `IndexDB` (1170 LOC) were near the top of the file-size list and absorbing too many responsibilities. Refactor split them up:
+  - `UI/ReadStatusController.swift` — owns Mark Read / Unread for messages, threads, search results. Holds `unowned MailModel`. Absorbs the per-message and per-thread optimistic-flip siblings, the AppleScript-entry construction (previously duplicated 3×), and the `skipSyncsUntil` window. `MailModel` now exposes thin forwarders for `markSelectedSearchResultsAsRead` / `markSelectedThreadsAsRead`.
+  - `Core/Index/IndexModels.swift` — wire types (`IndexedMessage`, `IndexedRecipient`, `IndexedMessageLink`, `IndexedThread`, `ThreadSummary`, `ContactPrefs`) lifted out of `IndexDB.swift`.
+  - `Core/Index/IndexDB+ContactPrefs.swift` — contact-prefs CRUD as an actor extension. Required widening `prepare` / `bind` / `bindOptional` / `stepDone` from `private` to internal so the extension can use them.
+  - `MailScripter.swift` — `bucketByMailbox`, `buildAccountScopedBlock`, `buildCrossAccountFallback` extracted; `setReadStatusBatch` and `fetchBodies` now share the bucketing + scaffold. Net `setReadStatusBatch` ≈220→30 LOC.
+  - `MailStore/EnvelopeIndexReader.swift` — `EnvelopeReadOnly` (production sync reader) merged in from `Indexer.swift`. The Phase-1 `EnvelopeIndexReader` was pruned to its smoke methods (`messageCount`, `mailboxCount`); dead `loadMailboxes` / `perMailboxCount` / `loadMessages` removed.
+  - Sidebar selection: `selectAllMailboxes()` / `selectMailbox(_:)` collapse onto one `select(_ s: SidebarSelection)`. `SidebarView`'s `Binding(get:set:)` hand-roll became one line. Existence guard preserved (silent no-op for `.mailbox(id)` on a missing id).
+  - `Core/Logging.swift` — central `Log.{sync, mailScripter, fileWatcher, bodyIndexer}` over `os.Logger`. Replaced ad-hoc `print` / `fputs` and surfaced previously-silent FSEventStream failure paths.
+  - Cosmetic: dropped dead `MailModel.setReadStatus(_:isRead:)` (single), `applyOptimisticReadFlag` (singular), `MailScripter.setReadStatus` (single) + `makeScript` + `buildMailboxRef`, `MailStoreEnumerator.findFirstEmlx` / `findEmlx`, `EmlxParser.subject(of:)` + `peelLengthPrefix` + the String-overload `splitHeaderBody`. Removed `MIMEParser.splitMultipart` `cursor` vestige.
 
 Remaining (see "Open work" below).
 
@@ -217,13 +228,14 @@ Roughly in order of value-to-cost.
 
 ```
 FMail/
-├── FMailApp.swift                  Entry point
+├── FMailApp.swift                  Entry point + Tools menu (Diagnose Mail.app structure)
 ├── Compose/
 │   ├── ComposeRequest.swift        ReplyBuilder (reply / reply-all / forward → ComposeRequest)
-│   └── MailComposer.swift          mailto: URL builder
+│   └── MailComposer.swift          mailto: URL builder + MailAppOpener (message:// scheme)
 ├── Contacts/
 │   └── ContactsService.swift       CNContactStore wrapper, address→contact map
 ├── Core/
+│   ├── Logging.swift               os.Logger namespace (Log.sync / .mailScripter / …)
 │   ├── Emlx/
 │   │   ├── EmlxParser.swift        .emlx file parser (length prefix + RFC 822 + flag plist)
 │   │   ├── EncodedWord.swift       RFC 2047 (Q + B encoding)
@@ -232,8 +244,12 @@ FMail/
 │   ├── HTML/
 │   │   └── HTMLStripper.swift      Non-WebKit HTML → text
 │   ├── Index/
-│   │   ├── Schema.swift            Versioned schema (v1, v2, v3)
-│   │   ├── IndexDB.swift           Actor wrapping our SQLite handle
+│   │   ├── Schema.swift            Versioned schema (v1..v6: contact_prefs, message_labels,
+│   │   │                            rfc_message_id, body_indexed reset, imap_uid)
+│   │   ├── IndexDB.swift           Actor wrapping our SQLite handle (read API + bulk writes)
+│   │   ├── IndexDB+ContactPrefs.swift  Actor extension: contact_prefs CRUD
+│   │   ├── IndexModels.swift       Wire types (IndexedMessage, IndexedRecipient, …,
+│   │   │                            ThreadSummary, ContactPrefs)
 │   │   ├── Indexer.swift           Mirrors Apple's Envelope Index → our DB
 │   │   └── BodyIndexer.swift       Background sweep that fills FTS body content
 │   ├── QueryDSL/
@@ -242,22 +258,33 @@ FMail/
 │   │   ├── AST.swift               Boolean tree + Term cases
 │   │   ├── Parser.swift            Tokens → AST + field-term mapping
 │   │   ├── DateExpression.swift    ISO / relative / month-name dates with granularity
-│   │   └── Evaluator.swift         AST → FTS5 expression + SQL conditions + bindings
+│   │   └── Evaluator.swift         AST → SQL boolean WHERE clause + bindings (text leaves
+│   │                                use `apple_rowid IN (… messages_fts MATCH ?)` subqueries;
+│   │                                pure-text subtrees fuse into one MATCH)
 │   └── Threading/
 │       └── ThreadGrouper.swift     Union-find over message_references
 ├── MailStore/
 │   ├── BodyLoader.swift            Actor: per-mailbox rowid→.emlx URL cache + parse on demand
-│   ├── EnvelopeIndexReader.swift   Phase 1 reader (mostly superseded; kept for diagnostics + tests)
-│   ├── FileWatcher.swift           FSEventStream wrapper
+│   ├── EnvelopeIndexReader.swift   Two readers: EnvelopeIndexReader (smoke / Phase0Tests
+│   │                                — messageCount / mailboxCount only); EnvelopeReadOnly
+│   │                                (production sync reader: mailboxes / messages /
+│   │                                recipients / labels / references)
+│   ├── FileWatcher.swift           FSEventStream wrapper (logs setup failures via os.Logger)
 │   ├── MailboxFilter.swift         Hide rules ([Gmail]/All Mail, Recovered, SendLater)
 │   ├── MailboxURL.swift            Parses Apple's `imap://<uuid>/<path>` mailbox URLs
-│   ├── MailStoreEnumerator.swift   Locates ~/Library/Mail/V<N>; finds .emlx by rowid
+│   ├── MailStoreEnumerator.swift   Locates ~/Library/Mail/V<N>; envelope index URL helper
 │   └── Models.swift                MailAccount, Mailbox, MessageHeader, MessageBody
 ├── Permissions/
 │   └── FullDiskAccessFlow.swift    First-run FDA prompt + System Settings deep-link
 └── UI/
-    ├── AppShell.swift              Top-level shell + states (loading / FDA / indexing / ready)
-    ├── MailModel.swift             Main @Observable @MainActor view-model
+    ├── AppShell.swift              Top-level shell + states (loading / FDA / indexing /
+    │                                ready) + bulkActionError alert
+    ├── MailModel.swift             Main @Observable @MainActor view-model. Bulk Mark
+    │                                Read / Unread is delegated to ReadStatusController
+    │                                (lazy, ObservationIgnored).
+    ├── ReadStatusController.swift  Owns Mark Read / Unread: optimistic flip across
+    │                                threads/messages/search-results, AppleScript
+    │                                dispatch, sync-skip window.
     ├── MessageList/
     │   └── MessageListView.swift   Search bar + threads list / search results list
     ├── Reader/

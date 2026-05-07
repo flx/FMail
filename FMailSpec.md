@@ -274,6 +274,9 @@ Already shipped (per IMPLEMENTATION.md):
 - Body-text loss bug fixed (incremental FTS update; Schema v5 reset to recover existing data).
 - Search excludes drafts/trash/junk consistently (canonical + Gmail-label filter).
 - DSL aliases: `during:`, `content:`/`text:` for body, `hasattachment`/`isunread`/etc as no-colon shortcuts.
+- Boolean `OR` / `NOT` now compose across **all** predicate types (text, date, flag, scope). Previously the Evaluator routed text predicates through one FTS5 expression and date/flag/scope predicates through a separate `AND` chain, so e.g. `(during:2025 OR during:2023)` silently became `during:2025 AND during:2023` (empty). Now compiled to one SQL boolean expression with FTS subqueries; pure-text subtrees still fuse into a single `messages_fts MATCH` for efficiency.
+- Bulk Mark Read / Unread failures now surface as a modal alert (`bulkActionError`) instead of masquerading as inline body-load errors in the reader.
+- Internal refactor: `MailModel` (1145 → 753 LOC) and `IndexDB` (1170 → 1014 LOC) split. New: `UI/ReadStatusController.swift`, `Core/Index/IndexModels.swift`, `Core/Index/IndexDB+ContactPrefs.swift`, `Core/Logging.swift` (centralised `os.Logger`). `EnvelopeReadOnly` merged into `MailStore/EnvelopeIndexReader.swift`. `MailScripter` AppleScript-builder helpers extracted (`bucketByMailbox`, `buildAccountScopedBlock`, `buildCrossAccountFallback`).
 
 Remaining targets:
 - Saved searches, keyboard shortcuts (`J`/`K`/`N`), quote folding, Quick Look on attachments.

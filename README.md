@@ -28,7 +28,7 @@ FMail reads Apple Mail's `~/Library/Mail/V*/` store **read-only**, mirrors the m
 
 ## Highlights
 
-- **Search DSL** — `from:kyoko after:2024-03 (invoice OR receipt) -draft has:attachment "exact phrase"`. Date forms include ISO, relative (`7d`, `last week`), month names, and a `during:` operator that auto-widens to the granularity you typed (`during:2026` = all of 2026).
+- **Search DSL** — `from:kyoko after:2024-03 (invoice OR receipt) -draft has:attachment "exact phrase"`. Field operators, boolean operators (`AND` / `OR` / `NOT`) that compose freely across text, dates, and flags, and several flavours of relative date. Full grammar in [Search syntax](#search-syntax) below.
 - **Per-contact preferred address** — never mis-send to a contact's secondary address again.
 - **Threads via union-find** on `Message-ID` / `In-Reply-To` / `References`.
 - **"All Mailboxes" view** across every account, with drafts / trash / junk filtered out. Auto-selected on launch. Dock badge shows the global unread count.
@@ -39,6 +39,82 @@ FMail reads Apple Mail's `~/Library/Mail/V*/` store **read-only**, mirrors the m
 - **Mark as Read / Mark as Unread** via Mail.app (AppleScript) — Mail.app still gets the change so it propagates to the IMAP server.
 - **Zero network connections by default.** No outbound traffic, no telemetry. The only network FMail ever makes is when you explicitly click "Load remote images" on a specific message.
 - **Apple's Gmail label model handled** — `[Gmail]/All Mail` is the canonical store, INBOX/Sent/Important are labels; FMail mirrors the labels table and shows them correctly.
+
+## Search syntax
+
+The search bar takes a structured query. Adjacent terms are AND-ed; everything composes freely with `AND` / `OR` / `NOT`, parens, and quoted phrases.
+
+### Operators
+
+| | |
+|---|---|
+| `AND` | implicit between adjacent terms; can be written explicitly |
+| `OR` | disjunction. Composes across text, date, flag and scope predicates. |
+| `NOT` *or* `-` *prefix* | negation. `NOT` keyword before a term, or `-` glued to it. |
+| `( ... )` | grouping |
+| `"exact phrase"` | verbatim match. Without quotes, terms match by **prefix** — so `subject:v` finds `vermont`. |
+
+### Field operators
+
+| Operator (and aliases) | Matches | Example |
+|---|---|---|
+| `from:` | sender (address or display name) | `from:kyoko` |
+| `to:` | "To:" recipient | `to:me` |
+| `cc:` | "Cc:" recipient | `cc:anna` |
+| `subject:` *(or `subj:`)* | subject only | `subject:invoice` |
+| `body:` *(or `content:`, `text:`)* | body content only | `body:meeting` |
+| `attachment:` *(or `filename:`)* | attachment filename | `attachment:invoice.pdf` |
+| `account:` | scope to one account (email, or UUID prefix) | `account:gmail.com` |
+| `in:` | scope to mailbox kind: `inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`, `all` | `in:sent` |
+| `is:read` / `is:unread` / `is:flagged` *(or `is:starred`)* / `is:unflagged` *(or `is:unstarred`)* | flag scope | `is:unread` |
+| `has:attachment` *(or `has:attachments`, `has:att`)* | attachment scope | `has:attachment` |
+| `before:DATE` | strictly before start of period | `before:2026-03` |
+| `after:DATE` *(or `since:DATE`)* | from a date onwards (see semantics below) | `after:2024` |
+| `on:DATE` / `during:DATE` | the entire period (year / month / day) | `during:2025` |
+
+**No-colon shortcuts** also work as bare words: `hasattachment` (or `hasattachments`), `isunread`, `isread`, `isflagged` (or `isstarred`).
+
+### Date forms
+
+| Form | Examples | Granularity |
+|---|---|---|
+| ISO | `2024-03-15`, `2024-03`, `2024` | day / month / year |
+| Single word | `today`, `yesterday`, `tomorrow` | day |
+| Compact relative ("N units ago") | `7d`, `2w`, `3m`, `1y` | day |
+| Multi-word relative *(must be quoted)* | `"last week"`, `"last month"`, `"last year"`, `"last 30 days"`, `"this week"`, `"this month"`, `"this year"` | day |
+| Month names | `march`, `march 2024` | month |
+
+### Date-bound semantics
+
+`before:` is exclusive of the period; `after:` for partial dates is **after the period** (Gmail-style); `during:` / `on:` matches the whole period at the precision you typed:
+
+| Query | Means |
+|---|---|
+| `before:2026` | `< 2026-01-01` |
+| `before:2026-03` | `< 2026-03-01` |
+| `after:2024` | `>= 2025-01-01` (after all of 2024) |
+| `after:2024-03` | `>= 2024-04-01` (after March 2024) |
+| `after:2024-03-15` | `>= 2024-03-15` (inclusive — full date) |
+| `during:2025` | all of 2025 |
+| `during:2025-03` | all of March 2025 |
+| `during:2025-03-15` | that one day |
+
+### Examples
+
+```text
+kyoko school trip                                # bag-of-words anywhere
+from:kyoko subject:invoice                       # all-fields AND (implicit)
+"exact phrase" -draft                            # phrase + NOT (-)
+from:anna ("school trip" OR "ski trip")          # quoted phrases inside OR
+(from:kyoko OR from:meiko) is:unread             # OR mixes text with flags
+(during:2025 OR during:2023) from:promo          # OR mixes date ranges
+account:gmail.com (subject:invoice OR subject:receipt) after:2024
+in:sent has:attachment after:"last 30 days"      # multi-word date needs quotes
+-(during:2024 from:promo)                        # NOT around a group
+since:march from:anna                            # `since:` is `after:` alias; month name
+```
+
+The search bar shows an **"Interpreted as"** strip below the input — a canonical reconstruction of what the parser made of your query. If a query returns nothing unexpected, this is the first place to look.
 
 ## Status
 
