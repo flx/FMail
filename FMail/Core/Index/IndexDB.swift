@@ -637,15 +637,24 @@ actor IndexDB {
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
-        bind(stmt, 1, Int64(limit))
+        // Fetch headroom so the outgoing-dedup pass can skip rows without
+        // shrinking the result below the caller's expected `limit`.
+        let fetchLimit = min(limit * 2, 1000)
+        bind(stmt, 1, Int64(fetchLimit))
         var out: [ThreadSummary] = []
+        var seenOutgoingKeys: Set<String> = []
         while sqlite3_step(stmt) == SQLITE_ROW {
+            if out.count >= limit { break }
             let tid = Int(sqlite3_column_int64(stmt, 0))
             let latest = Int(sqlite3_column_int64(stmt, 1))
             let local = Int(sqlite3_column_int64(stmt, 2))
             let unread = Int(sqlite3_column_int64(stmt, 3))
             let flagged = Int(sqlite3_column_int64(stmt, 4))
             let repr = try latestNonDraftMessageOfThread(threadId: tid)
+            if let key = Self.outgoingDedupKey(for: repr) {
+                if seenOutgoingKeys.contains(key) { continue }
+                seenOutgoingKeys.insert(key)
+            }
             out.append(ThreadSummary(
                 threadId: tid,
                 latestDateReceived: latest > 0 ? Date(timeIntervalSince1970: TimeInterval(latest)) : nil,
@@ -661,11 +670,27 @@ actor IndexDB {
         return out
     }
 
+    /// Dedup key for outgoing threads: lowercased recipient address +
+    /// normalized subject. Returns nil for incoming threads, threads with
+    /// no resolvable recipient, or threads with an empty normalized subject
+    /// (so we don't collapse every "(no subject)" sent message into one row).
+    /// Apple Mail's auto-save creates intermediate draft revisions that
+    /// land in Sent / All Mail (Gmail's canonical store) with distinct
+    /// Message-IDs but identical (recipient, subject) — this key folds
+    /// them into one row, keeping only the most recent (the SQL above
+    /// orders by `latest DESC`, so the first-seen key wins).
+    private static func outgoingDedupKey(for repr: RepresentativeMessage?) -> String? {
+        guard let repr, repr.isOutgoing,
+              let recipient = repr.dedupRecipient, !recipient.isEmpty
+        else { return nil }
+        let subject = repr.subjectNormalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !subject.isEmpty else { return nil }
+        return "\(recipient)|\(subject)"
+    }
+
     private func latestNonDraftMessageOfThread(threadId: Int) throws -> RepresentativeMessage? {
         let sql = """
-        SELECT m.apple_rowid, m.subject_prefix, m.subject,
-               \(Self.outgoingFlagExpr) AS is_outgoing,
-               \(Self.correspondentExpr) AS correspondent
+        SELECT \(Self.representativeSelectList)
         FROM messages m
         WHERE m.thread_id = ?
           AND \(Self.systemMailboxExcludeFilter)
@@ -709,11 +734,14 @@ actor IndexDB {
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
+        let fetchLimit = min(limit * 2, 1000)
         bind(stmt, 1, Int64(mailboxRowId))
         bind(stmt, 2, Int64(mailboxRowId))
-        bind(stmt, 3, Int64(limit))
+        bind(stmt, 3, Int64(fetchLimit))
         var out: [ThreadSummary] = []
+        var seenOutgoingKeys: Set<String> = []
         while sqlite3_step(stmt) == SQLITE_ROW {
+            if out.count >= limit { break }
             let tid = Int(sqlite3_column_int64(stmt, 0))
             let latest = Int(sqlite3_column_int64(stmt, 1))
             let local = Int(sqlite3_column_int64(stmt, 2))
@@ -721,6 +749,10 @@ actor IndexDB {
             let flagged = Int(sqlite3_column_int64(stmt, 4))
             // Pull representative message info (latest in the thread within this mailbox).
             let repr = try latestMessageOfThreadInMailbox(threadId: tid, mailboxRowId: mailboxRowId)
+            if let key = Self.outgoingDedupKey(for: repr) {
+                if seenOutgoingKeys.contains(key) { continue }
+                seenOutgoingKeys.insert(key)
+            }
             out.append(ThreadSummary(
                 threadId: tid,
                 latestDateReceived: latest > 0 ? Date(timeIntervalSince1970: TimeInterval(latest)) : nil,
@@ -829,9 +861,7 @@ actor IndexDB {
 
     private func latestMessageOfThreadInMailbox(threadId: Int, mailboxRowId: Int) throws -> RepresentativeMessage? {
         let sql = """
-        SELECT m.apple_rowid, m.subject_prefix, m.subject,
-               \(Self.outgoingFlagExpr) AS is_outgoing,
-               \(Self.correspondentExpr) AS correspondent
+        SELECT \(Self.representativeSelectList)
         FROM messages m
         WHERE m.thread_id = ?
           AND (m.mailbox_rowid = ?
@@ -851,12 +881,17 @@ actor IndexDB {
     /// Per-thread representative-message info used to populate one row in
     /// the thread list. `correspondent` is the sender for incoming mail and
     /// the first To-recipient for outgoing mail (sender matches one of our
-    /// account email addresses).
+    /// account email addresses). `subjectNormalized` and `dedupRecipient`
+    /// feed the outgoing-thread dedup pass — see `dedupOutgoing(_:)`.
     private struct RepresentativeMessage {
         let rowId: Int
         let subject: String
+        let subjectNormalized: String
         let correspondent: String
         let isOutgoing: Bool
+        /// Lowercased primary To-recipient address for outgoing messages,
+        /// nil for incoming. Used for dedup, not display.
+        let dedupRecipient: String?
     }
 
     /// SQL expression: `1` when the row's sender matches one of our account
@@ -887,18 +922,49 @@ actor IndexDB {
         END
         """
 
+    /// SQL expression: lowercased primary To-recipient address for outgoing
+    /// rows, NULL otherwise. Feeds the outgoing-dedup key.
+    private static let dedupRecipientExpr = """
+        CASE
+            WHEN LOWER(m.sender_address) IN (
+                SELECT LOWER(email_address) FROM accounts WHERE email_address IS NOT NULL
+            )
+            THEN (SELECT LOWER(r.address)
+                  FROM recipients r
+                  WHERE r.message_rowid = m.apple_rowid AND r.kind = 0
+                  ORDER BY r.position
+                  LIMIT 1)
+            ELSE NULL
+        END
+        """
+
+    /// Common SELECT-list shared by both representative-message queries.
+    private static let representativeSelectList = """
+        m.apple_rowid,
+        m.subject_prefix,
+        m.subject,
+        m.subject_normalized,
+        \(outgoingFlagExpr) AS is_outgoing,
+        \(correspondentExpr) AS correspondent,
+        \(dedupRecipientExpr) AS dedup_recipient
+        """
+
     private static func decodeRepresentative(_ stmt: OpaquePointer?) throws -> RepresentativeMessage? {
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         let rowid = Int(sqlite3_column_int64(stmt, 0))
         let prefix = String(cString: sqlite3_column_text(stmt, 1))
         let subj = String(cString: sqlite3_column_text(stmt, 2))
-        let outgoing = sqlite3_column_int(stmt, 3) != 0
-        let correspondent = String(cString: sqlite3_column_text(stmt, 4))
+        let normalized = String(cString: sqlite3_column_text(stmt, 3))
+        let outgoing = sqlite3_column_int(stmt, 4) != 0
+        let correspondent = String(cString: sqlite3_column_text(stmt, 5))
+        let dedupRecipient = sqlite3_column_text(stmt, 6).map { String(cString: $0) }
         return RepresentativeMessage(
             rowId: rowid,
             subject: prefix + subj,
+            subjectNormalized: normalized,
             correspondent: correspondent,
-            isOutgoing: outgoing
+            isOutgoing: outgoing,
+            dedupRecipient: dedupRecipient
         )
     }
 
