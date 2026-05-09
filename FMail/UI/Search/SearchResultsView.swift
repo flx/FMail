@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct SearchResultsView: View {
-    @Bindable var model: MailModel
+    var model: MailModel
 
     var body: some View {
         if let err = model.searchError {
@@ -101,16 +101,14 @@ struct SearchResultsView: View {
     }
 
     private func handleTap(_ msg: MessageHeader) {
-        let mods = NSEvent.modifierFlags
-        if mods.contains(.command) {
-            // ⌘-click: toggle this row in the selection without opening.
+        switch ListSelectionGesture.action() {
+        case .toggle:
             if model.selectedSearchResultIds.contains(msg.rowId) {
                 model.selectedSearchResultIds.remove(msg.rowId)
             } else {
                 model.selectedSearchResultIds.insert(msg.rowId)
             }
-        } else if mods.contains(.shift) {
-            // ⇧-click: range-select from the first selected (anchor) to here.
+        case .rangeFromAnchor:
             if let anchorId = model.selectedSearchResultIds.first,
                let anchorIdx = model.searchResults.firstIndex(where: { $0.rowId == anchorId }),
                let thisIdx = model.searchResults.firstIndex(where: { $0.rowId == msg.rowId }) {
@@ -122,56 +120,25 @@ struct SearchResultsView: View {
                 model.selectedSearchResultIds = [msg.rowId]
                 model.openFromSearch(msg)
             }
-        } else {
-            // Plain click: replace selection and open in reader.
+        case .open:
             model.selectedSearchResultIds = [msg.rowId]
             model.openFromSearch(msg)
         }
     }
 }
 
-/// Always-visible header above the search results list. Shows the result
-/// count, the multi-selection count when > 1, and the Mark Read / Unread
-/// buttons (greyed out when nothing is selected).
 private struct SearchResultsHeader: View {
-    @Bindable var model: MailModel
+    var model: MailModel
 
     var body: some View {
-        let selectedCount = model.selectedSearchResultIds.count
-        let totalCount = model.searchResults.count
-        HStack(spacing: 8) {
-            Text("\(totalCount) result\(totalCount == 1 ? "" : "s")")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            if selectedCount > 1 {
-                Text("·").foregroundStyle(.tertiary)
-                Text("\(selectedCount) selected")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button {
-                model.markSelectedSearchResultsAsRead(true)
-            } label: {
-                Label("Mark Read", systemImage: "envelope.open")
-            }
-            .disabled(selectedCount == 0)
-            Button {
-                model.markSelectedSearchResultsAsRead(false)
-            } label: {
-                Label("Mark Unread", systemImage: "envelope.badge")
-            }
-            .disabled(selectedCount == 0)
-            if selectedCount > 1 {
-                Button("Clear") {
-                    model.selectedSearchResultIds = []
-                }
-            }
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Color.secondary.opacity(0.06))
+        BulkActionHeader(
+            totalCount: model.searchResults.count,
+            totalLabel: { "\($0) result\($0 == 1 ? "" : "s")" },
+            selectedCount: model.selectedSearchResultIds.count,
+            onMarkRead: { model.markSelectedSearchResultsAsRead(true) },
+            onMarkUnread: { model.markSelectedSearchResultsAsRead(false) },
+            onClearSelection: { model.selectedSearchResultIds = [] }
+        )
     }
 }
 
@@ -193,7 +160,7 @@ private struct SearchResultRow: View {
                         .lineLimit(1)
                     Spacer()
                     if let date = message.dateReceived ?? message.dateSent {
-                        Text(date, format: dateFormat(for: date))
+                        Text(date, format: date.listFormat())
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -224,14 +191,5 @@ private struct SearchResultRow: View {
 
     private var mailbox: Mailbox? {
         mailboxes.first(where: { $0.rowId == message.mailboxRowId })
-    }
-
-    private func dateFormat(for date: Date) -> Date.FormatStyle {
-        let cal = Calendar.current
-        if cal.isDateInToday(date) { return .dateTime.hour().minute() }
-        if cal.isDate(date, equalTo: .now, toGranularity: .year) {
-            return .dateTime.month(.abbreviated).day()
-        }
-        return .dateTime.year().month(.abbreviated).day()
     }
 }

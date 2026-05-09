@@ -21,7 +21,7 @@ struct Mailbox: Identifiable, Hashable {
     let totalCount: Int
     let unreadCount: Int          // computed by FMail, not Apple's drift-prone field
     let hidden: Bool
-    let kind: String              // "inbox" / "sent" / "drafts" / "trash" / "junk" / "archive" / "all" / "other"
+    let kind: MailboxKind
     var id: Int { rowId }
 
     var displayName: String { pathComponents.last ?? "(unnamed)" }
@@ -33,6 +33,32 @@ struct Mailbox: Identifiable, Hashable {
             url.appendPathComponent("\(component).mbox")
         }
         return url
+    }
+}
+
+/// Canonical category for a mailbox, derived from its display name. Stored
+/// in the index DB as `rawValue` so SQL filters (`kind IN ('drafts',...)`)
+/// keep working unchanged.
+enum MailboxKind: String, Sendable, Hashable, CaseIterable {
+    case inbox, sent, drafts, trash, junk, archive, all, other
+
+    /// "System-isolated" kinds — drafts/trash/junk — that we hide from
+    /// other mailboxes' thread views unless the user is browsing one of
+    /// these mailboxes directly.
+    var isSystemIsolated: Bool {
+        switch self {
+        case .drafts, .trash, .junk: return true
+        case .inbox, .sent, .archive, .all, .other: return false
+        }
+    }
+
+    /// Decide which `IndexDB.ThreadViewScope` applies for the current
+    /// sidebar state. `selectedKind == nil` is treated as a non-system
+    /// mailbox (default to `.excludeDrafts`).
+    static func viewScope(forSelectedKind selectedKind: MailboxKind?, allMailboxesScope: Bool) -> IndexDB.ThreadViewScope {
+        if allMailboxesScope { return .excludeAllSystem }
+        if let kind = selectedKind, kind.isSystemIsolated { return .includeAll }
+        return .excludeDrafts
     }
 }
 

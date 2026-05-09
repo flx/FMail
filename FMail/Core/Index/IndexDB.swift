@@ -106,7 +106,7 @@ actor IndexDB {
                 bind(stmt, 5, m.hidden ? 1 : 0)
                 bind(stmt, 6, Int64(m.totalCount))
                 bind(stmt, 7, Int64(m.unreadCount))
-                bind(stmt, 8, mailboxKind(for: m))
+                bind(stmt, 8, mailboxKind(for: m).rawValue)
                 try stepDone(stmt)
             }
         }
@@ -428,12 +428,25 @@ actor IndexDB {
     /// Optimistic local update for is_read after a successful AppleScript
     /// write to Mail.app. The next FSEvents-triggered sync confirms it.
     func setIsRead(rowid: Int, isRead: Bool) throws {
-        var stmt: OpaquePointer?
-        try prepare("UPDATE messages SET is_read = ? WHERE apple_rowid = ?", into: &stmt)
-        defer { sqlite3_finalize(stmt) }
-        bind(stmt, 1, isRead ? 1 : 0)
-        bind(stmt, 2, Int64(rowid))
-        try stepDone(stmt)
+        try setIsReadBatch(rowids: [rowid], isRead: isRead)
+    }
+
+    /// Bulk variant. One transaction for all rowids — either the whole batch
+    /// persists or none of it does, so callers can surface a single error to
+    /// the user instead of N silent partial failures.
+    func setIsReadBatch(rowids: [Int], isRead: Bool) throws {
+        guard !rowids.isEmpty else { return }
+        try inTransaction {
+            var stmt: OpaquePointer?
+            try prepare("UPDATE messages SET is_read = ? WHERE apple_rowid = ?", into: &stmt)
+            defer { sqlite3_finalize(stmt) }
+            for rowid in rowids {
+                sqlite3_reset(stmt)
+                bind(stmt, 1, isRead ? 1 : 0)
+                bind(stmt, 2, Int64(rowid))
+                try stepDone(stmt)
+            }
+        }
     }
 
     /// Returns the *effective* thread id for a message: the real thread id
@@ -557,7 +570,8 @@ actor IndexDB {
             let total = Int(sqlite3_column_int64(stmt, 5))
             let unread = Int(sqlite3_column_int64(stmt, 6))
             let hidden = sqlite3_column_int(stmt, 4) != 0
-            let kind = sqlite3_column_text(stmt, 7).map { String(cString: $0) } ?? "other"
+            let kindStr = sqlite3_column_text(stmt, 7).map { String(cString: $0) }
+            let kind = kindStr.flatMap(MailboxKind.init(rawValue:)) ?? .other
             out.append(Mailbox(
                 rowId: rowid,
                 accountUUID: acctUUID,
@@ -1084,16 +1098,16 @@ actor IndexDB {
         try stepDone(stmt)
     }
 
-    private func mailboxKind(for m: Mailbox) -> String {
+    private func mailboxKind(for m: Mailbox) -> MailboxKind {
         switch m.displayName {
-        case "INBOX": return "inbox"
-        case "Sent Messages", "Sent Mail": return "sent"
-        case "Drafts": return "drafts"
-        case "Junk", "Spam": return "junk"
-        case "Deleted Messages", "Trash": return "trash"
-        case "Archive": return "archive"
-        case "All Mail": return "all"
-        default: return "other"
+        case "INBOX": return .inbox
+        case "Sent Messages", "Sent Mail": return .sent
+        case "Drafts": return .drafts
+        case "Junk", "Spam": return .junk
+        case "Deleted Messages", "Trash": return .trash
+        case "Archive": return .archive
+        case "All Mail": return .all
+        default: return .other
         }
     }
 

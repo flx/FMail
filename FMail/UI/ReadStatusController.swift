@@ -95,12 +95,12 @@ final class ReadStatusController {
         let entries = mailScripterEntries(for: messages)
         guard !entries.isEmpty else { return }
 
-        model.skipSyncsUntil = Date().addingTimeInterval(120)
+        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
 
         Task.detached { [weak model] in
             let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
             await MainActor.run {
-                model?.skipSyncsUntil = Date().addingTimeInterval(180)
+                model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
             }
             switch result {
             case .ok:
@@ -117,17 +117,11 @@ final class ReadStatusController {
         }
     }
 
-    /// View scope for currently-selected mailbox / All Mailboxes view.
-    /// Hides drafts (and trash/junk in All Mailboxes) unless the user is
-    /// browsing one of those mailboxes directly.
     private func currentViewScope() -> IndexDB.ThreadViewScope {
-        if model.isAllMailboxesScope {
-            return .excludeAllSystem
-        }
-        if let kind = model.selectedMailbox?.kind, ["drafts", "trash", "junk"].contains(kind) {
-            return .includeAll
-        }
-        return .excludeDrafts
+        MailboxKind.viewScope(
+            forSelectedKind: model.selectedMailbox?.kind,
+            allMailboxesScope: model.isAllMailboxesScope
+        )
     }
 
     /// Build AppleScript entries from messages, looking up each message's
@@ -250,11 +244,7 @@ final class ReadStatusController {
         // Persist to DB.
         if let db = model.indexDB {
             let ids = allMessages.map(\.rowId)
-            Task {
-                for id in ids {
-                    try? await db.setIsRead(rowid: id, isRead: isRead)
-                }
-            }
+            persistIsRead(rowids: ids, isRead: isRead, db: db)
         }
     }
 
@@ -362,10 +352,22 @@ final class ReadStatusController {
         model.updateDockBadge()
 
         if let db = model.indexDB, !flippedRowIds.isEmpty {
-            let ids = flippedRowIds
-            Task {
-                for id in ids {
-                    try? await db.setIsRead(rowid: id, isRead: isRead)
+            persistIsRead(rowids: flippedRowIds, isRead: isRead, db: db)
+        }
+    }
+
+    /// One-transaction batch write of `is_read`. Failures show up as a
+    /// `bulkActionError` alert — without surfacing, the optimistic in-memory
+    /// flip would silently revert on the next sync, leaving the user with
+    /// no idea what happened.
+    private func persistIsRead(rowids: [Int], isRead: Bool, db: IndexDB) {
+        Task { [weak model] in
+            do {
+                try await db.setIsReadBatch(rowids: rowids, isRead: isRead)
+            } catch {
+                Log.db.error("setIsReadBatch failed for \(rowids.count) rows: \(String(describing: error), privacy: .public)")
+                await MainActor.run {
+                    model?.bulkActionError = "Couldn't update read status in the local index — your change may not stick after the next sync. (\(error.localizedDescription))"
                 }
             }
         }

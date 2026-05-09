@@ -144,7 +144,7 @@ final class EnvelopeReadOnly {
                 totalCount: 0,
                 unreadCount: 0,
                 hidden: hidden,
-                kind: "other"
+                kind: .other
             ))
         }
         return out

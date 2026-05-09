@@ -13,6 +13,20 @@ struct ComposeRequest: Sendable {
 
 enum ReplyKind: Sendable {
     case reply, replyAll, forward
+
+    /// Pre-build the subject the user will see in the compose-confirmation
+    /// sheet — adds "Re: " or "Fwd: " unless the original already starts
+    /// with one. Mirrors `ReplyBuilder.ensureSubjectPrefix` so the preview
+    /// matches what eventually goes to Mail.app.
+    static func subjectPreview(forKind kind: ReplyKind, originalSubject: String) -> String {
+        let prefix: String
+        switch kind {
+        case .reply, .replyAll: prefix = "Re: "
+        case .forward: prefix = "Fwd: "
+        }
+        if originalSubject.lowercased().hasPrefix(prefix.lowercased()) { return originalSubject }
+        return prefix + originalSubject
+    }
 }
 
 /// Converts a MessageHeader + parsed MessageBody into a ComposeRequest.

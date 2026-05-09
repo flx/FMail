@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ReaderView: View {
-    @Bindable var model: MailModel
+    var model: MailModel
 
     var body: some View {
         Group {
@@ -43,7 +43,8 @@ struct ReaderView: View {
                             onTap: { model.selectMessage(msg) },
                             onReply: { model.startReply(kind: .reply, message: msg, body: model.bodyForSelectedMessage) },
                             onReplyAll: { model.startReply(kind: .replyAll, message: msg, body: model.bodyForSelectedMessage) },
-                            onForward: { model.startReply(kind: .forward, message: msg, body: model.bodyForSelectedMessage) }
+                            onForward: { model.startReply(kind: .forward, message: msg, body: model.bodyForSelectedMessage) },
+                            onOpenInMailApp: { model.openInMailApp(msg) }
                         )
                     }
                 }
@@ -72,6 +73,14 @@ struct ReaderView: View {
     }
 
     private func formatDelta(_ seconds: TimeInterval) -> String {
+        TimeDeltaFormatter.format(seconds)
+    }
+}
+
+/// Bucketed "+Ns / +Nm / +Nh / +Nd / +Nmo / +Ny" delta string used between
+/// adjacent messages in the reader. Largest unit that fits, no fractions.
+enum TimeDeltaFormatter {
+    static func format(_ seconds: TimeInterval) -> String {
         if seconds < 60 { return "+\(Int(seconds))s" }
         if seconds < 3600 { return "+\(Int(seconds / 60))m" }
         if seconds < 86400 { return "+\(Int(seconds / 3600))h" }
@@ -91,6 +100,7 @@ private struct MessageBlock: View {
     let onReply: () -> Void
     let onReplyAll: () -> Void
     let onForward: () -> Void
+    let onOpenInMailApp: () -> Void
 
     @State private var htmlMeasuredHeight: CGFloat = 200
     /// Per-message opt-in: load external `<img src="http://…">` references
@@ -350,9 +360,7 @@ private struct MessageBlock: View {
             }
             .keyboardShortcut("f", modifiers: [.command, .option])
             if let rfcId = message.rfcMessageId, !rfcId.isEmpty {
-                Button {
-                    _ = MailAppOpener.openMessage(rfcMessageId: rfcId)
-                } label: {
+                Button(action: onOpenInMailApp) {
                     Label("Open in Mail.app", systemImage: "arrow.up.right.square")
                 }
                 .help("Opens Mail.app at this message — useful when the body hasn't downloaded yet")
@@ -383,9 +391,7 @@ private struct MessageBlock: View {
                 .controlSize(.small)
             }
             if let rfcId = self.message.rfcMessageId, !rfcId.isEmpty {
-                Button {
-                    _ = MailAppOpener.openMessage(rfcMessageId: rfcId)
-                } label: {
+                Button(action: onOpenInMailApp) {
                     Label("Open in Mail.app to download", systemImage: "arrow.down.circle")
                 }
                 .controlSize(.small)

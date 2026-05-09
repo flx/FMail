@@ -74,11 +74,15 @@ struct HTMLBodyView: NSViewRepresentable {
             measureHeight(webView)
             // Re-measure after a beat — gives external images time to load
             // and reflow the document so we don't clip them.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak webView] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.imageReflowDelaySeconds) { [weak self, weak webView] in
                 guard let webView else { return }
                 self?.measureHeight(webView)
             }
         }
+
+        /// Empirically tuned: long enough that most newsletter graphics finish
+        /// loading, short enough that the user doesn't see a noticeable jump.
+        private static let imageReflowDelaySeconds: TimeInterval = 1.5
 
         private func measureHeight(_ webView: WKWebView) {
             webView.evaluateJavaScript("document.documentElement.scrollHeight") { [weak self] result, _ in

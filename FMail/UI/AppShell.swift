@@ -45,7 +45,6 @@ struct AppShell: View {
                 .overlay(alignment: .bottom) {
                     footerStatus
                 }
-                .focusedSceneValue(\.mailModel, model)
             }
         }
         .task {
@@ -166,8 +165,4 @@ private struct BodyIndexFooterView: View {
                 .foregroundStyle(.secondary)
         }
     }
-}
-
-extension FocusedValues {
-    @Entry var mailModel: MailModel?
 }

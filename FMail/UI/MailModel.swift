@@ -66,18 +66,11 @@ final class MailModel {
     /// not reach into the index directly.
     var indexDB: IndexDB?
     private var bodyLoader: BodyLoader?
-    private var indexer: Indexer?
-    private var bodyIndexer: BodyIndexer?
-    private var watcher: FileWatcher?
     private(set) var contactsService = ContactsService()
-    private var syncInFlight = false
-    private var syncRequestedWhileBusy = false
-    /// When set in the future, FSEvents-triggered syncs are skipped until then.
-    /// Used by our own write-backs (Mark as Read etc.) to suppress the
-    /// follow-up sync that'd otherwise fire from Mail.app's `.emlx` flag-plist
-    /// modification — we've already updated our index optimistically, so the
-    /// re-mirror is wasted work. Mutated by ReadStatusController.
-    var skipSyncsUntil: Date?
+    /// Sync orchestration — file watcher, body indexer, runIncrementalSync,
+    /// post-sync body pre-fetch, skip-window after our own write-backs.
+    @ObservationIgnored
+    var syncCoordinator: SyncCoordinator?
 
     /// Owns Mark Read / Unread for messages, threads, and search results.
     /// `@ObservationIgnored` keeps it out of @Observable's tracking so we
@@ -86,7 +79,6 @@ final class MailModel {
     @ObservationIgnored
     private(set) lazy var readStatus = ReadStatusController(model: self)
     private var searchTask: Task<Void, Never>?
-    private var bodyIndexerTask: Task<Void, Never>?
 
     // Reply flow state
     var replyDraft: ReplyDraft?
@@ -152,13 +144,14 @@ final class MailModel {
 
         do {
             let dbPath = try IndexDB.defaultPath()
-            let db = try await IndexDB(path: dbPath)
+            let db = try IndexDB(path: dbPath)
             self.indexDB = db
             let bodyLoader = BodyLoader(mailVersionDir: versionDir)
             self.bodyLoader = bodyLoader
             let indexer = Indexer(envelopePath: envelopePath, indexDB: db, mailVersionDir: versionDir)
-            self.indexer = indexer
-            self.bodyIndexer = BodyIndexer(indexDB: db, bodyLoader: bodyLoader)
+            let bodyIndexer = BodyIndexer(indexDB: db, bodyLoader: bodyLoader)
+            let coordinator = SyncCoordinator(model: self, indexer: indexer, bodyIndexer: bodyIndexer, mailVersionDir: versionDir)
+            self.syncCoordinator = coordinator
 
             let lastSync = try await db.getMeta("last_full_sync_at")
             if lastSync == nil {
@@ -179,42 +172,17 @@ final class MailModel {
             }
 
             // Background: refresh sync to catch anything new since last run.
-            Task.detached { [weak self] in
-                guard let self else { return }
-                await self.runIncrementalSync()
+            Task { [weak coordinator] in
+                await coordinator?.runIncrementalSync()
             }
 
             // Background: body content indexing for search.
-            startBodyIndexer()
+            coordinator.startBodyIndexer()
 
             // File watcher: trigger refresh on change.
-            let watcher = FileWatcher(rootPath: versionDir.path) { [weak self] in
-                Task { @MainActor [weak self] in
-                    await self?.runIncrementalSync()
-                }
-            }
-            watcher.start()
-            self.watcher = watcher
+            coordinator.startFileWatcher()
         } catch {
             loadState = .failed(String(describing: error))
-        }
-    }
-
-    // MARK: — Body indexing
-
-    func startBodyIndexer() {
-        guard let bodyIndexer else { return }
-        if bodyIndexerTask != nil { return }
-        let snapshotMailboxes = mailboxes
-        bodyIndexerTask = Task.detached { [weak self] in
-            await bodyIndexer.runUntilDone(mailboxes: snapshotMailboxes) { snapshot in
-                Task { @MainActor [weak self] in
-                    self?.bodyIndexProgress = snapshot
-                }
-            }
-            await MainActor.run { [weak self] in
-                self?.bodyIndexerTask = nil
-            }
         }
     }
 
@@ -290,81 +258,53 @@ final class MailModel {
         selectedSearchResultIds = [message.rowId]
 
         Task { @MainActor in
-            guard let threadId = try? await db.threadId(forMessage: message.rowId) else { return }
-            let viewScope: IndexDB.ThreadViewScope = ["drafts", "trash", "junk"].contains(mb.kind) ? .includeAll : .excludeDrafts
-            let msgs = (try? await db.loadThreadMessages(threadId: threadId, scope: viewScope)) ?? []
+            do {
+                guard let threadId = try await db.threadId(forMessage: message.rowId) else {
+                    Log.db.error("openFromSearch: no thread for rowid \(message.rowId)")
+                    threadsError = "No thread found for this message."
+                    return
+                }
+                let viewScope = MailboxKind.viewScope(forSelectedKind: mb.kind, allMailboxesScope: false)
+                let msgs = try await db.loadThreadMessages(threadId: threadId, scope: viewScope)
 
-            // Update reader state without clearing the search list.
-            selection = .mailbox(mb.rowId)
-            selectedThreadId = threadId
-            messagesInSelectedThread = msgs
-            isLoadingThreadMessages = false
-            if let m = msgs.first(where: { $0.rowId == message.rowId }) {
-                selectMessage(m)
+                // Update reader state without clearing the search list.
+                selection = .mailbox(mb.rowId)
+                selectedThreadId = threadId
+                messagesInSelectedThread = msgs
+                isLoadingThreadMessages = false
+                if let m = msgs.first(where: { $0.rowId == message.rowId }) {
+                    selectMessage(m)
+                }
+
+                // Background: warm the mailbox's thread list for when search clears.
+                Task { await loadThreadsForSelected() }
+            } catch {
+                Log.db.error("openFromSearch failed for rowid \(message.rowId): \(String(describing: error), privacy: .public)")
+                threadsError = "Couldn't open this thread: \(error.localizedDescription)"
             }
-
-            // Background: warm the mailbox's thread list for when search clears.
-            Task { await loadThreadsForSelected() }
         }
     }
 
-    func runIncrementalSync() async {
-        guard let indexer else { return }
-        if let until = skipSyncsUntil, until > Date() {
-            // Our own writeback fired this. Skip — we've already updated locally.
-            return
-        }
-        skipSyncsUntil = nil
-        if syncInFlight {
-            syncRequestedWhileBusy = true
-            return
-        }
-        syncInFlight = true
-        defer { syncInFlight = false }
-
-        // Pause body indexing during sync so writes don't race the indexer's
-        // bulk transactions over the same SQLite connection.
-        await bodyIndexer?.cancel()
-        bodyIndexerTask = nil
-
-        do {
-            try await indexer.runFullSync { [weak self] snapshot in
-                self?.indexProgress = snapshot
-            }
-            try await refreshFromIndexDB()
-            // After the metadata pass, ask Mail.app to fetch bodies for any
-            // unread messages whose .emlx we don't have yet — fire-and-forget,
-            // body indexer picks them up via FSEventStream once Mail.app
-            // writes them to disk.
-            await fetchMissingUnreadBodies()
-            indexProgress = .idle
-        } catch {
-            Log.sync.error("Incremental sync failed: \(String(describing: error), privacy: .public)")
-        }
-
-        // Restart body indexing now that sync is done.
-        startBodyIndexer()
-
-        if syncRequestedWhileBusy {
-            syncRequestedWhileBusy = false
-            Task { await self.runIncrementalSync() }
-        }
-    }
-
-    private func refreshFromIndexDB() async throws {
+    func refreshFromIndexDB() async throws {
         guard let db = indexDB else { return }
         let mboxes = try await db.loadMailboxes()
         let accts = try await db.loadAccounts()
         // Ensure mailboxes have an account row (in case of out-of-order load).
         let acctMap = Dictionary(uniqueKeysWithValues: accts.map { ($0.uuid, $0) })
         let allUUIDs = Set(mboxes.map(\.accountUUID))
-        _ = acctMap
         let finalAccounts = allUUIDs.sorted().map { uuid in
             acctMap[uuid] ?? MailAccount(uuid: uuid, displayName: "Account \(uuid.prefix(8))", emailAddress: nil)
         }
         self.mailboxes = mboxes
         self.accounts = finalAccounts
-        self.allUnreadCount = (try? await db.countAllUnreadExcludingDrafts()) ?? 0
+        do {
+            self.allUnreadCount = try await db.countAllUnreadExcludingDrafts()
+        } catch {
+            // Keep the previous count rather than zeroing the badge — a
+            // transient SQLite error shouldn't make the user think their
+            // inbox cleared itself.
+            Log.db.error("countAllUnreadExcludingDrafts failed: \(String(describing: error), privacy: .public)")
+        }
         updateDockBadge()
 
         // Refresh threads if the current scope still resolves.
@@ -380,52 +320,23 @@ final class MailModel {
         }
     }
 
-    /// After each sync, ask Mail.app to fetch bodies for ALL unread
-    /// messages we don't have on disk yet. Fires the AppleScript and
-    /// returns — Mail.app does the IMAP grunt work in the background,
-    /// FSEventStream picks up the resulting `.emlx` files, BodyIndexer
-    /// indexes them, and the user sees fully-rendered bodies as they
-    /// appear in the list. No limit: a fresh-install or post-vacation
-    /// backlog of N messages costs N/5 chunks × ~5s each in Mail.app
-    /// time (background — FMail's UI stays responsive).
-    private func fetchMissingUnreadBodies() async {
-        guard let db = indexDB else { return }
-        guard let candidates = try? await db.fetchUnreadMissingBody(limit: nil),
-              !candidates.isEmpty else { return }
-
-        let entries: [MailScripter.BatchEntry] = candidates.compactMap { c -> MailScripter.BatchEntry? in
-            guard let mb = mailboxes.first(where: { $0.rowId == c.mailboxRowId }),
-                  let acct = accounts.first(where: { $0.uuid == mb.accountUUID }),
-                  let email = acct.emailAddress
-            else { return nil }
-            return MailScripter.BatchEntry(
-                rfcMessageId: c.rfcMessageId ?? "",
-                appleRowId: c.rowid,
-                accountEmail: email,
-                mailboxPathComponents: mb.pathComponents
-            )
-        }
-        guard !entries.isEmpty else { return }
-
-        Task.detached {
-            await MailScripter.fetchBodies(entries)
-        }
-    }
-
     /// Pushes `allUnreadCount` to the Dock tile. Empty string clears the badge.
-    /// Numbers ≥ 1000 are shown as "999+" to keep the badge legible.
+    /// Counts above the cutoff render as "<cutoff>+" so the badge stays legible.
     /// Internal so ReadStatusController can call it after optimistic flips.
     func updateDockBadge() {
+        let cutoff = Self.dockBadgeMaxDisplay
         let label: String
         if allUnreadCount <= 0 {
             label = ""
-        } else if allUnreadCount > 999 {
-            label = "999+"
+        } else if allUnreadCount > cutoff {
+            label = "\(cutoff)+"
         } else {
             label = "\(allUnreadCount)"
         }
         NSApplication.shared.dockTile.badgeLabel = label.isEmpty ? nil : label
     }
+
+    private static let dockBadgeMaxDisplay = 999
 
     func selectAllMailboxes() {
         select(.allMailboxes)
@@ -536,18 +447,10 @@ final class MailModel {
             isLoadingThreadMessages = false
             return
         }
-        // Pick the right view scope:
-        //  - All Mailboxes → hide drafts + trash + junk
-        //  - Drafts/Trash/Junk mailbox → show everything including those
-        //  - Other mailboxes → hide drafts (default)
-        let viewScope: IndexDB.ThreadViewScope
-        if isAllMailboxesScope {
-            viewScope = .excludeAllSystem
-        } else if let kind = selectedMailbox?.kind, ["drafts", "trash", "junk"].contains(kind) {
-            viewScope = .includeAll
-        } else {
-            viewScope = .excludeDrafts
-        }
+        let viewScope = MailboxKind.viewScope(
+            forSelectedKind: selectedMailbox?.kind,
+            allMailboxesScope: isAllMailboxesScope
+        )
         do {
             let msgs = try await db.loadThreadMessages(threadId: tid, scope: viewScope)
             if selectedThreadId == tid {
@@ -628,29 +531,25 @@ final class MailModel {
         await MailScripter.fetchBodies([entry])
 
         // The AppleScript returned, meaning Mail.app's `source of msg` read
-        // resolved. Now invalidate the .emlx cache for this mailbox and
-        // re-read. Mail.app may need a beat to flush the new file to disk.
+        // resolved. Mail.app may still need a beat to flush the new file to
+        // disk — BodyFetchPoller invalidates the cache and retries.
         guard selectedMessageId == message.rowId, let bodyLoader else { return }
-        await bodyLoader.invalidate(mailboxRowId: homeMailbox.rowId)
+        let body = await BodyFetchPoller.waitForBody(
+            messageRowId: message.rowId,
+            mailbox: homeMailbox,
+            bodyLoader: bodyLoader,
+            isStillNeeded: { [weak self] in self?.selectedMessageId == message.rowId }
+        )
 
-        let pollDeadline = Date().addingTimeInterval(8)
-        while Date() < pollDeadline {
-            if selectedMessageId != message.rowId { return }
-            if let body = try? await bodyLoader.loadBody(messageRowId: message.rowId, mailbox: homeMailbox),
-               body != nil {
-                bodyForSelectedMessage = body
-                isLoadingBody = false
-                return
-            }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            await bodyLoader.invalidate(mailboxRowId: homeMailbox.rowId)
-        }
-
-        // Still nothing on disk — surface the error so the user can fall
-        // back to "Open in Mail.app". This usually means Mail.app couldn't
-        // find the message via apple_rowid OR the IMAP fetch is still in
-        // flight (slow network).
-        if selectedMessageId == message.rowId {
+        guard selectedMessageId == message.rowId else { return }
+        if let body {
+            bodyForSelectedMessage = body
+            isLoadingBody = false
+        } else {
+            // Still nothing on disk — surface the error so the user can fall
+            // back to "Open in Mail.app". This usually means Mail.app couldn't
+            // find the message via apple_rowid OR the IMAP fetch is still in
+            // flight (slow network).
             bodyError = "Mail.app didn't deliver the body for rowid \(message.rowId) within 8s — try again or use Open in Mail.app."
             isLoadingBody = false
         }
@@ -716,11 +615,19 @@ final class MailModel {
         Task { @MainActor in
             if let contact = draft.resolvedContact, let db = indexDB {
                 if makePreferred {
-                    try? await db.setPreferredAddress(contactId: contact.id, address: toAddress)
+                    do {
+                        try await db.setPreferredAddress(contactId: contact.id, address: toAddress)
+                    } catch {
+                        Log.db.error("setPreferredAddress failed for \(contact.id, privacy: .private): \(String(describing: error), privacy: .public)")
+                    }
                 }
                 if blockOriginal,
                    draft.originalMessage.senderAddress.lowercased() != toAddress.lowercased() {
-                    try? await db.addBlockedAddress(contactId: contact.id, address: draft.originalMessage.senderAddress)
+                    do {
+                        try await db.addBlockedAddress(contactId: contact.id, address: draft.originalMessage.senderAddress)
+                    } catch {
+                        Log.db.error("addBlockedAddress failed for \(contact.id, privacy: .private): \(String(describing: error), privacy: .public)")
+                    }
                 }
             }
 
@@ -739,6 +646,14 @@ final class MailModel {
     func startNewMail() {
         let req = ComposeRequest(to: [], cc: [], subject: "", body: "", inReplyTo: nil, references: [])
         _ = MailComposer.handOff(req)
+    }
+
+    /// Open `message` in Mail.app via the `message://` URL scheme. Returns
+    /// false when the message has no Message-ID or macOS refuses to open it.
+    @discardableResult
+    func openInMailApp(_ message: MessageHeader) -> Bool {
+        guard let rfcId = message.rfcMessageId, !rfcId.isEmpty else { return false }
+        return MailAppOpener.openMessage(rfcMessageId: rfcId)
     }
 
 }

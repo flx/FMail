@@ -4,7 +4,7 @@ import SwiftUI
 /// confirm (or correct) the recipient address — the wrong-address-catching
 /// mechanic from the spec.
 struct ReplyConfirmationSheet: View {
-    @Bindable var model: MailModel
+    var model: MailModel
     let draft: ReplyDraft
     @Environment(\.dismiss) private var dismiss
 
@@ -79,14 +79,7 @@ struct ReplyConfirmationSheet: View {
     }
 
     private var subjectPreview: String {
-        let prefix: String
-        switch draft.kind {
-        case .reply, .replyAll: prefix = "Re: "
-        case .forward: prefix = "Fwd: "
-        }
-        let s = draft.originalMessage.subject
-        if s.lowercased().hasPrefix(prefix.lowercased()) { return s }
-        return prefix + s
+        ReplyKind.subjectPreview(forKind: draft.kind, originalSubject: draft.originalMessage.subject)
     }
 
     @ViewBuilder

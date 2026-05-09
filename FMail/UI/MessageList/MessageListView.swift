@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct MessageListView: View {
-    @Bindable var model: MailModel
+    var model: MailModel
     @FocusState.Binding var searchFocused: Bool
 
     var body: some View {
@@ -119,67 +119,33 @@ struct MessageListView: View {
     }
 
     private func handleThreadTap(_ thread: ThreadSummary) {
-        let mods = NSEvent.modifierFlags
-        if mods.contains(.command) {
-            // ⌘-click: toggle without opening.
+        switch ListSelectionGesture.action() {
+        case .toggle:
             model.toggleThreadSelection(thread)
-        } else if mods.contains(.shift) {
-            // ⇧-click: range-select from anchor (first selected) to here.
+        case .rangeFromAnchor:
             if let anchor = model.selectedThreadIds.first {
                 model.selectThreadRange(anchorThreadId: anchor, to: thread.threadId)
             } else {
                 model.selectThread(thread)
             }
-        } else {
-            // Plain click: replace and open in reader.
+        case .open:
             model.selectThread(thread)
         }
     }
 }
 
-/// Always-visible header above the threads list. Shows thread count, the
-/// multi-selection count when > 1, and the Mark Read / Unread buttons
-/// (greyed out when nothing is selected). Keeps the list from jumping when
-/// the user starts/stops a multi-selection.
 private struct ThreadListHeader: View {
-    @Bindable var model: MailModel
+    var model: MailModel
 
     var body: some View {
-        let selectedCount = model.selectedThreadIds.count
-        let totalCount = model.threadsForSelectedMailbox.count
-        HStack(spacing: 8) {
-            Text("\(totalCount) thread\(totalCount == 1 ? "" : "s")")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            if selectedCount > 1 {
-                Text("·").foregroundStyle(.tertiary)
-                Text("\(selectedCount) selected")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button {
-                Task { await model.markSelectedThreadsAsRead(true) }
-            } label: {
-                Label("Mark Read", systemImage: "envelope.open")
-            }
-            .disabled(selectedCount == 0)
-            Button {
-                Task { await model.markSelectedThreadsAsRead(false) }
-            } label: {
-                Label("Mark Unread", systemImage: "envelope.badge")
-            }
-            .disabled(selectedCount == 0)
-            if selectedCount > 1 {
-                Button("Clear") {
-                    model.selectedThreadIds = []
-                }
-            }
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Color.secondary.opacity(0.06))
+        BulkActionHeader(
+            totalCount: model.threadsForSelectedMailbox.count,
+            totalLabel: { "\($0) thread\($0 == 1 ? "" : "s")" },
+            selectedCount: model.selectedThreadIds.count,
+            onMarkRead: { Task { await model.markSelectedThreadsAsRead(true) } },
+            onMarkUnread: { Task { await model.markSelectedThreadsAsRead(false) } },
+            onClearSelection: { model.selectedThreadIds = [] }
+        )
     }
 }
 
@@ -220,7 +186,7 @@ private struct ThreadRow: View {
                     }
                     Spacer()
                     if let date = thread.latestDateReceived {
-                        Text(date, format: dateFormat(for: date))
+                        Text(date, format: date.listFormat())
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -237,16 +203,5 @@ private struct ThreadRow: View {
             }
         }
         .padding(.vertical, 2)
-    }
-
-    private func dateFormat(for date: Date) -> Date.FormatStyle {
-        let cal = Calendar.current
-        if cal.isDateInToday(date) {
-            return .dateTime.hour().minute()
-        }
-        if cal.isDate(date, equalTo: .now, toGranularity: .year) {
-            return .dateTime.month(.abbreviated).day()
-        }
-        return .dateTime.year().month(.abbreviated).day()
     }
 }

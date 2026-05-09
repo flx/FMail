@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SearchBar: View {
-    @Bindable var model: MailModel
+    var model: MailModel
     @FocusState.Binding var focused: Bool
 
     var body: some View {
