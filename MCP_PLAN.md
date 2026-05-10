@@ -1,6 +1,6 @@
 # FMail MCP server — implementation plan
 
-Status: **planned, not started.** Pick this up by working through the phases below.
+Status: **plan validated against the codebase; ready to implement.** Pick this up by working through the phases below. Validation pass added the "Reality corrections" section (after Locked decisions) — read it before touching code.
 
 Goal: when FMail.app is running, expose an MCP server on `127.0.0.1:8765` so Claude Code (or any MCP-compatible LLM client) can query the FMail index and mark messages read. The point is to leverage the existing index/threading/DSL so the LLM can triage email without loading everything into context. Standalone daemon (LaunchAgent) is **not** in scope for v1; we accept the lifecycle constraint that FMail must be open. See `FMailSpec.md` §10/§12 for the wider context.
 
@@ -37,6 +37,30 @@ Move-to-trash / move-to-spam / archive are **not** in v1 — they need new `Mail
 | Body-index freshness | **Accepted limitation.** `search_emails` matches FTS body content as it gets indexed; if a recent message hasn't been body-indexed yet, the LLM won't find it via body text. Document; don't paper over. |
 | Search interface | **Single DSL string** (`search_emails(query: String, …)`). The LLM learns the grammar from the tool description (paste `FMailSpec.md` §6.2 in). No `search_emails_simple(from:, to:, …)` second tool in v1. |
 | Write surface | **Only `mark_read`** in v1. Routes through existing `ReadStatusController` pipeline. |
+| Long `mark_read` runs | **Document the bound; no SSE in v1.** AppleScript dispatch is synchronous and can take 5–30 s for big batches across multiple Gmail accounts. Tool description tells the LLM to keep batches ≤ ~50. SSE/streaming progress would dodge client timeouts but adds a parser, a writer, and a per-tool decision — defer until usage demands it. |
+| Snippets in `search_emails` | **Omit in v1.** The LLM can call `get_email` for body context. FTS5 `snippet()` is an optional A4 polish. |
+
+---
+
+## Reality corrections from validation
+
+Validation pass against the actual code surfaced six deltas the original draft of this document got wrong. They become preflight work folded into Phase A2:
+
+1. **`MessageHeader` is leaner than the DTOs need.** `IndexDB.search()` (`IndexDB.swift:506`) returns `[MessageHeader]` with `rowId, mailboxRowId, subject, senderAddress, senderDisplay, dateSent, dateReceived, isRead, isFlagged, rfcMessageId, imapUID` — no `mailbox_path`, no `thread_id`, no `has_attachment`. The MCP `EmailRef` DTO needs these, so a side-fetch `enrichForMCP(rowids:) -> [Int: (mailboxPath, threadId, hasAttachment)]` is required.
+
+2. **`is_outgoing` is NOT a stored column.** The original plan claimed it was populated by the indexer. Reality: it's computed at query-time via `outgoingFlagExpr` (`IndexDB.swift:970`) — `LOWER(m.sender_address) IN (SELECT LOWER(email_address) FROM accounts WHERE email_address IS NOT NULL)`. `find_unanswered_threads` SQL must use the same expression.
+
+3. **`loadMessage(rowid:)` does not exist.** Both `get_email` and `mark_read` need it. Add as a single-row SELECT mirroring the column list of `search()`.
+
+4. **`BodyLoader.loadBody(messageRowId:mailbox:)` requires a `Mailbox`, not just a rowid.** So `get_email` and `get_thread` body fetches need `IndexDB.loadMailbox(rowid:)` first. (Alternative: hop to `@MainActor` and use `model.mailboxes` — uglier.)
+
+5. **`recipients` table lacks a read helper.** Schema is `(message_rowid, kind, position, address, display)` with `kind 0=to, 1=cc, 2=bcc, 3=from`. `get_email`'s `to`/`cc` fields need `loadRecipients(messageRowId:)`.
+
+6. **`ReadStatusController.setReadStatus(messages:isRead:)` is fire-and-forget** (`ReadStatusController.swift:23`). The MCP `mark_read` handler needs to await the AppleScript dispatch result so it can return `{applied, errors}`. Add a `setReadStatus(rowids: [Int], isRead: Bool) async -> (applied: Int, error: String?)` variant that resolves rowids → `MessageHeader` via `IndexDB.loadMessage` and runs the same pipeline but awaits the `MailScripter.Result` instead of dispatching detached.
+
+These are folded into the phasing below.
+
+Other reality checks that came back **fine** as the plan described them: actor model on `IndexDB` and `BodyLoader`; `MailModel.boot()` plug-in point at line 154 right after `syncCoordinator` is created; `xcodegen` auto-discovers any `.swift` under `FMail/`; no existing Settings scene in `FMailApp.swift`; footer location in `AppShell.swift`; `MailScripter.setReadStatusBatch` returns a structured `Result`. None of those need changes.
 
 ---
 
@@ -173,7 +197,7 @@ Reuses: `loadThreadMessages` (with `MailboxKind.viewScope(forSelectedKind: nil, 
 }
 ```
 
-**New SQL needed.** Sketch: for each thread that has at least one outgoing message from `our_address` (or any account address) after `since`, the latest message in the thread is outgoing AND its `date_sent` is older than today. `m.is_outgoing` is already populated by the indexer. Add as a method on `IndexDB`. Tests for this go in Phase A4.
+**New SQL needed.** Sketch: for each thread that has at least one outgoing message from `our_address` (or any account address) after `since`, the latest message in the thread is outgoing AND its `date_received` is older than today. **`is_outgoing` is computed, not stored**: use the existing `outgoingFlagExpr` pattern (`LOWER(m.sender_address) IN (SELECT LOWER(email_address) FROM accounts WHERE email_address IS NOT NULL)`). When `our_address` is supplied, restrict to that one address; otherwise match any account email. Add as a method on `IndexDB`. Tests for this go in Phase A4 against an in-memory fixture DB.
 
 ### `mark_read`
 
@@ -184,12 +208,15 @@ Reuses: `loadThreadMessages` (with `MailboxKind.viewScope(forSelectedKind: nil, 
 { "applied": 3, "errors": [] }   // errors[] populated if any rowid fails AppleScript dispatch
 ```
 
-Routes through `ReadStatusController.setReadStatus(messages:isRead:)`. The controller currently takes `[MessageHeader]`, not `[Int]`. Pick one:
+Routes through `ReadStatusController` but needs a new awaitable variant. The existing `setReadStatus(messages:isRead:)` is fire-and-forget — it `Task { ... }`s and returns. For MCP we want to await the `MailScripter.Result` and report it back.
 
-- **Option α (preferred):** Add `setReadStatus(rowids: [Int], isRead: Bool)` that resolves rowids → `MessageHeader` via `IndexDB` first, then calls existing path. Self-contained.
-- Option β: refactor `ReadStatusController` to take rowids natively. Bigger blast radius.
+**Adopted approach (Option α):** Add `setReadStatus(rowids: [Int], isRead: Bool) async -> (applied: Int, error: String?)`:
+1. Resolve rowids → `MessageHeader`s via `IndexDB.loadMessage` (skipping any that don't resolve).
+2. Run the existing optimistic-flip pipeline on the resolved headers.
+3. **Await** `MailScripter.setReadStatusBatch` instead of `Task.detached`.
+4. Return `(applied: matchedCount, error: errorMessage)`. The existing `bulkActionError` plumbing still fires for UI consistency.
 
-Failures still surface via the existing `bulkActionError` plumbing in FMail's UI; the MCP response also reports them so the LLM knows.
+Tool description tells the LLM: keep batches ≤ ~50; bigger batches risk client timeouts because `osascript` linearly scans Mail.app's per-mailbox messages.
 
 ---
 
@@ -284,36 +311,35 @@ FMailTests/
 
 ### A1 — Skeleton + transport (1 evening)
 
-1. `MCPSettings.swift` — `@AppStorage("mcp_enabled")` Bool, `@AppStorage("mcp_port")` Int (default 8765).
-2. `MCPTransport.swift` — JSON-RPC 2.0 framing over HTTP. Hand-write the minimal HTTP server: parse request line + Content-Length + body, write `200 OK` + JSON. ~150 LOC.
-3. `MCPServer.swift` — actor wrapping `NWListener`. `start(port:)` / `stop()`. Empty tool registry. Handles `initialize` / `initialized` / `tools/list` (returns []) / `tools/call` (returns method-not-found).
-4. Wire start/stop into `MailModel.boot()` gated on `MCPSettings.enabled` and `loadState == .ready`. Reactive on settings change (observe via Combine or `@AppStorage` notification).
-5. **Done when:** with toggle on, `curl -X POST localhost:8765/mcp -d '{"jsonrpc":"2.0","id":1,"method":"initialize",…}'` returns server info; Claude Code MCP client connects and lists zero tools.
+1. `FMail/MCP/MCPSettings.swift` — singleton-ish wrapper around `UserDefaults.standard` for `mcp_enabled: Bool` (default false) and `mcp_port: Int` (default 8765). **NOT `@AppStorage`** — `MailModel` is `@Observable`, not a SwiftUI View; `@AppStorage` only works in views. The Settings *view* can use `@AppStorage` for two-way binding; the model side reads/writes raw UserDefaults and the view explicitly calls `model.applyMCPSettings()` on toggle change.
+2. `FMail/MCP/MCPTransport.swift` — JSON-RPC 2.0 framing over HTTP/1.1. Read until `\r\n\r\n`, parse request line + `Content-Length`, read body, write `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: N\r\nConnection: close\r\n\r\n<body>`. Single endpoint `POST /mcp`. ~150 LOC.
+3. `FMail/MCP/MCPServer.swift` — actor wrapping `NWListener` bound to `NWEndpoint.Host("127.0.0.1")` only with `parameters.allowLocalEndpointReuse = true`. `start()` / `stop()`. Empty tool registry. Handles `initialize` / `notifications/initialized` (notification, no response) / `tools/list` (returns []) / `tools/call` (returns method-not-found). Surfaces `lastError: String?` for the eventual SettingsView.
+4. Wire start/stop into `MailModel.boot()` after `syncCoordinator` is set (`MailModel.swift:154`). Add `@ObservationIgnored var mcpServer: MCPServer?`. Gate on `MCPSettings.shared.enabled && loadState == .ready`. Add a `func applyMCPSettings()` on MailModel that the SettingsView calls on toggle change.
+5. **Done when:** with toggle on, `curl -X POST localhost:8765/mcp -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'` returns server info; Claude Code's MCP client connects and lists zero tools.
 
-### A2 — Read tools (1 evening)
+### A2 — IndexDB helpers + DTOs + 4 read tools (1 long evening)
 
-6. `MCPModels.swift` — define `EmailRef`, `EmailFull`, `ThreadRef`, `AttachmentRef` as Sendable Codable structs.
-7. `MCPHandlers.swift` — implement `search_emails`, `list_threads`, `get_thread`, `get_email`. Each is one async function:
-   - Validate input (throw `invalid_params` on bad shape).
-   - Await `IndexDB.search` / `loadAllThreadSummaries` / `loadThreadMessages` / `BodyLoader.loadBody`.
-   - Map internal types → DTOs.
-8. Body truncation: `String.prefix(maxBodyChars)` with a `"\n[…truncated, full message has X chars…]"` sentinel when truncated.
-9. `MCPTools.swift` — register the four tools with their JSON Schemas. **The `search_emails` tool description must include the DSL grammar table from `FMailSpec.md` §6.2.**
-10. **Done when:** in Claude Code, "find emails from Anna last March" returns sensible results.
+6. **IndexDB additions** in a new `FMail/Core/Index/IndexDB+MCP.swift` extension to keep MCP plumbing isolated from the rest of the read API:
+    - `loadMessage(rowid: Int) -> MessageHeader?` — single-row SELECT mirroring the column list in `search()` (`IndexDB.swift:506`).
+    - `loadMailbox(rowid: Int) -> Mailbox?`.
+    - `loadRecipients(messageRowId: Int) -> [(kind: Int, address: String, display: String?)]`.
+    - `enrichForMCP(rowids: [Int]) -> [Int: (mailboxPath: String, threadId: Int, hasAttachment: Bool)]` — one SQL with `apple_rowid IN (...)` joining `mailboxes`. Honors the `effectiveThreadIdExpr` so unthreaded messages get a synthetic thread id.
+7. `FMail/MCP/MCPModels.swift` — Sendable Codable DTOs: `EmailRef`, `EmailFull`, `ThreadRef`, `AttachmentRef`, `UnansweredThread`. ISO-8601 dates as strings.
+8. `FMail/MCP/MCPHandlers.swift` (read half) — `search_emails`, `list_threads`, `get_thread`, `get_email`. Pattern per handler:
+    - Validate input (throw `invalidParams` on bad shape).
+    - Await `IndexDB.search` / `loadAllThreadSummaries` / `loadThreadMessages` / `BodyLoader.loadBody`.
+    - For body fetch: `IndexDB.loadMailbox(rowid:)` → `BodyLoader.loadBody(messageRowId:mailbox:)`. Truncate plain text via `String.prefix(maxBodyChars)`.
+    - Map internal types → DTOs. **Skip snippets in v1.**
+9. `FMail/MCP/MCPTools.swift` — register 4 tools with JSON Schemas. **`search_emails` description includes the DSL grammar table from `FMailSpec.md` §6.2 verbatim** so the LLM can compose queries.
+10. **Done when:** in Claude Code, `search_emails {query: "from:anna last 30 days school"}` returns sensible results; `get_thread {thread_id: …}` returns full bodies.
 
 ### A3 — `find_unanswered_threads` + `mark_read` + Settings UI (1 evening)
 
-11. `IndexDB.findUnansweredThreads(since:ourAddresses:limit:)` — new method. Pure SQL — no FTS. Sketch:
-    ```sql
-    -- For each thread, find its latest message and the latest outgoing message.
-    -- Filter to threads where the latest message is outgoing from one of our addresses,
-    -- it was sent after :since, and there's no later incoming reply.
-    ```
-    Test with a small fixture DB (in-memory) before wiring in.
-12. `MCPHandlers.swift` — `find_unanswered_threads` handler.
-13. `ReadStatusController.swift` — add `setReadStatus(rowids: [Int], isRead: Bool)` overload that resolves rowids via `IndexDB`, then forwards to existing `setReadStatus(messages:isRead:)`. Result returned to MCP layer.
-14. `mark_read` handler.
-15. `Settings/SettingsView.swift` — toggle + port + status + privacy banner + "Copy Claude Code config" button. The snippet to copy:
+11. `IndexDB.findUnansweredThreads(since:ourAddress:limit:)` — pure SQL, no FTS. Uses the same `outgoingFlagExpr` pattern as `representativeSelectList`. Algorithm: for each thread containing at least one outgoing message after `:since`, find the latest message in the thread; emit if that message is outgoing AND no later incoming reply exists. Bind `our_address` (lowercased) when supplied; otherwise match against any account email.
+12. `MCPHandlers.findUnansweredThreads` handler.
+13. `ReadStatusController.setReadStatus(rowids: [Int], isRead: Bool) async -> (applied: Int, error: String?)` — resolves rowids via `IndexDB.loadMessage`, runs the existing `applyOptimisticThreadBulkRead` / `persistIsRead` path, then **awaits** `MailScripter.setReadStatusBatch` (no `Task.detached`). Maps the `Result` to `(applied, error)`. Existing `bulkActionError` still fires for UI consistency.
+14. `MCPHandlers.markRead` handler.
+15. `FMail/UI/Settings/SettingsView.swift` — toggle + port `TextField` + status (Running on :PORT / Stopped / Error: …) + privacy banner + "Copy Claude Code config" button:
     ```json
     {
       "mcpServers": {
@@ -324,17 +350,18 @@ FMailTests/
       }
     }
     ```
-16. Add `Settings…` command (`⌘,`) in `FMailApp.swift` `CommandMenu` (alongside the Tools menu).
+    Toggle/port changes call `model.applyMCPSettings()` to start/stop the listener.
+16. `FMailApp.swift` — add `Settings { SettingsView(model: model) }` scene (gives `⌘,` for free) and route the model in via `@FocusedValue` or accept a singleton hook. Tools menu can stay as-is.
 17. **Done when:** flipping the toggle on/off cleanly starts/stops the listener; Claude Code can mark messages read and the change appears in FMail's UI immediately (optimistic flip via existing pipeline).
 
 ### A4 — Tests + footer status + docs (1 evening)
 
 18. `FMailTests/MCPTests.swift`:
     - DTO encode/decode round-trip for each of the 5 DTO types.
-    - JSON-RPC envelope edge cases (missing `id`, batch requests if we choose to support, malformed JSON).
-    - `findUnansweredThreads` against a fixture DB with hand-built rows (use an in-memory `IndexDB` if feasible; if not, document why and skip).
-    - Integration test: bind on random port, full handshake + one call to each of the 6 tools, assert response shape.
-19. `AppShell.swift` — small status pill in the footer: "MCP :8765" badge when `mcpServer?.isRunning == true`. Hidden otherwise.
+    - JSON-RPC envelope edge cases (missing `id`, malformed JSON, unknown method).
+    - `findUnansweredThreads` against an in-memory fixture (`IndexDB` opened on a temporary file path; in-memory `:memory:` doesn't survive actor hops but a tmp file works fine).
+    - Integration test: bind on **port 0** (kernel picks free port), full handshake (`initialize` + `notifications/initialized` + `tools/list`) + one call per tool against the fixture DB.
+19. `AppShell.swift` — small "MCP :8765" pill in `footerStatus` when `model.mcpServer?.isRunning == true`. Hidden otherwise.
 20. Update `IMPLEMENTATION.md` — new Phase 5 entry describing the MCP server.
 21. Add a one-paragraph blurb to `FMailSpec.md` (probably as a new §15 or as a note in §12 Phase 5).
 
@@ -361,8 +388,9 @@ FMailTests/
 - `Connection: close` is fine for v1 — one request per connection. Keep-alive can come later.
 
 ### 4. ReadStatusController integration
-- The existing `setReadStatus(messages:isRead:)` is already async + idempotent + handles AppleScript failures. Don't reinvent. Just resolve rowids → `MessageHeader` via `IndexDB.loadMessage(rowid:)` (add this if it doesn't exist) and forward.
-- The MCP response for `mark_read` should wait for the AppleScript dispatch to complete. The existing pipeline runs AppleScript on a `Task.detached` — for MCP, we want to await it. May need a new variant of `setReadStatus` that returns a result instead of fire-and-forget.
+- `setReadStatus(messages:isRead:)` (`ReadStatusController.swift:23`) is fire-and-forget — wraps the work in `Task { @MainActor in ... }` and returns. The MCP `mark_read` handler can't reuse it directly: we need to await the AppleScript dispatch and get a result back.
+- New `setReadStatus(rowids: [Int], isRead: Bool) async -> (applied: Int, error: String?)`: same optimistic-flip + DB persist + AppleScript dispatch as the existing pipeline, but **awaits** `MailScripter.setReadStatusBatch` directly (no `Task.detached`). The existing `bulkActionError` plumbing still fires for UI consistency.
+- Document the bound to the LLM: keep batches ≤ ~50. Mail.app linearly scans per-mailbox messages by `whose id is N`; 100+ messages across multiple Gmail accounts can hit 30s+. The MCP transport is plain HTTP request/response — no SSE in v1 — so the call blocks until the AppleScript returns. If the LLM client times out, the work may still complete on Mail.app's side; the user can re-call to verify state.
 
 ### 5. DSL exposure
 - Description goes in `tools/list` output. Paste the full DSL grammar from `FMailSpec.md` §6.2 into the `description` field of `search_emails`'s tool definition. The LLM reads it once and uses it.
@@ -373,8 +401,9 @@ FMailTests/
 - Set `html_body_present: true` if the message had an HTML part, so the LLM knows it's a marketing email vs. plain text.
 
 ### 7. Settings persistence
-- `@AppStorage("mcp_enabled")` and `@AppStorage("mcp_port")` are enough. UserDefaults is fine — nothing sensitive.
-- React to changes: SwiftUI `@AppStorage` triggers view updates; for `MCPServer` lifecycle, observe the underlying `UserDefaults.didChangeNotification` or check on view-update (settings view is the only place that mutates these).
+- Bare `UserDefaults.standard` for `mcp_enabled: Bool` and `mcp_port: Int`. UserDefaults is fine — nothing sensitive.
+- React to changes the simple way: SettingsView is the only place that mutates these. On a toggle/port change, the view explicitly calls `model.applyMCPSettings()` which decides whether to start, stop, or restart the listener. We don't need to subscribe to `UserDefaults.didChangeNotification` from the model; that subscription has cross-actor headaches with `@Observable`. Direct call site is cheaper and clearer.
+- `@AppStorage` *can* be used inside the SettingsView itself for two-way binding to the toggle/port controls — but the model side reads raw UserDefaults via `MCPSettings.shared`.
 
 ### 8. Stop conditions for v1
 - Keep this scoped. Don't add `move_to_trash`, `propose_reply`, `summarize_thread`, etc. The whole point is that the LLM does the reasoning.

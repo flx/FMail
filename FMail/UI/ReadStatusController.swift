@@ -26,6 +26,64 @@ final class ReadStatusController {
         }
     }
 
+    /// Mark a list of messages by rowid; resolves rowids via `IndexDB`,
+    /// runs the optimistic-flip pipeline, AWAITS the AppleScript dispatch,
+    /// and returns the matched count. Used by the MCP `mark_read` tool —
+    /// regular UI callers should use `setReadStatus(messages:isRead:)`.
+    @MainActor
+    func setReadStatus(rowids: [Int], isRead: Bool) async -> (applied: Int, error: String?) {
+        guard let db = model.indexDB else {
+            return (0, "Index not loaded")
+        }
+        var resolved: [MessageHeader] = []
+        for rowid in rowids {
+            if let m = try? await db.loadMessage(rowid: rowid) {
+                resolved.append(m)
+            }
+        }
+        guard !resolved.isEmpty else {
+            return (0, "No messages matched the given rowids")
+        }
+
+        // Optimistic flip — same path as the existing fire-and-forget API,
+        // inlined so we can interleave the awaitable AppleScript step.
+        let perThread: [(threadId: Int, messages: [MessageHeader])]
+        if let map = try? await db.threadIds(forMessages: resolved.map(\.rowId)) {
+            var byThread: [Int: [MessageHeader]] = [:]
+            for msg in resolved {
+                if let tid = map[msg.rowId] {
+                    byThread[tid, default: []].append(msg)
+                }
+            }
+            perThread = byThread.map { (threadId: $0.key, messages: $0.value) }
+        } else {
+            perThread = []
+        }
+        if !perThread.isEmpty {
+            applyOptimisticThreadBulkRead(perThread: perThread, isRead: isRead)
+        } else {
+            applyOptimisticReadFlags(messageRowIds: resolved.map(\.rowId), isRead: isRead)
+        }
+
+        // AppleScript dispatch — awaited, not Task.detached.
+        let entries = mailScripterEntries(for: resolved)
+        guard !entries.isEmpty else {
+            return (0, "Couldn't build AppleScript entries (mailbox/account info missing)")
+        }
+        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        let result = await MailScripter.setReadStatusBatch(entries, isRead: isRead)
+        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+
+        switch result {
+        case .ok(let matched):
+            return (matched, nil)
+        case .notFound:
+            return (0, "Mail.app couldn't find any of the selected messages — apple_rowid may be stale.")
+        case .failed(let m):
+            return (resolved.count, "AppleScript failed: \(m)")
+        }
+    }
+
     /// Mark every multi-selected search result.
     func markSelectedSearchResults(asRead isRead: Bool) {
         let messages = model.searchResults.filter {

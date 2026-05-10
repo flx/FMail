@@ -379,3 +379,15 @@ Treated as a separate, optional phase **after** Mac v1 has proved itself for 1+ 
 - **iOS-Phase 4 (1 evening)**: `mailto:` reply handoff to iOS Mail.
 
 If Mac v1 isn't hitting daily-use bar, do not start the iOS phases.
+
+---
+
+## 15. MCP server (Phase 5 polish)
+
+When FMail is running, an opt-in HTTP/JSON-RPC server on `127.0.0.1:8765` exposes the index to MCP clients (Claude Code, etc.). The point is to leverage what FMail already builds — schema-versioned SQLite, FTS5, the DSL, threading, contact prefs — so an LLM can triage email without parsing `.emlx` itself or pulling the whole index into context. See [MCP_PLAN.md](MCP_PLAN.md) for the full design.
+
+Six tools, one write: `search_emails`, `list_threads`, `get_thread`, `get_email`, `find_unanswered_threads`, `mark_read`. The `search_emails` description embeds the full DSL grammar from §6.2 so the LLM can compose queries without external knowledge. `mark_read` routes through `ReadStatusController` so the optimistic flip + AppleScript dispatch matches what the UI does — failures still surface as a `bulkActionError` alert in FMail.
+
+Locked decisions: hand-rolled JSON-RPC + minimal HTTP framing on `Network.framework` (no SDK dep); off by default with an explicit privacy banner; loopback only (`requiredInterfaceType = .loopback`); a single bundled DSL string for `search_emails` rather than a structured-params second tool. `mark_read` synchronously waits for Mail.app's AppleScript dispatch — the tool description tells the LLM to keep batches ≤ ~50 to avoid client timeouts; SSE/streaming progress is deferred until usage demands it.
+
+Standalone daemon mode (so FMail doesn't have to be open) is **not** v1 — see MCP_PLAN.md "Stopping condition" for when to pivot to a `FMailCore` Swift package + LaunchAgent.

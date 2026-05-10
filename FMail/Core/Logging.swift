@@ -10,4 +10,5 @@ enum Log {
     static let fileWatcher = Logger(subsystem: subsystem, category: "FileWatcher")
     static let bodyIndexer = Logger(subsystem: subsystem, category: "BodyIndexer")
     static let db = Logger(subsystem: subsystem, category: "db")
+    static let mcp = Logger(subsystem: subsystem, category: "mcp")
 }

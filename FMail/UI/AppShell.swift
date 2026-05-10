@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct AppShell: View {
-    @State private var model = MailModel()
+    let model: MailModel
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -77,13 +77,25 @@ struct AppShell: View {
         let showBody = model.bodyIndexProgress.total > 0 &&
                        model.bodyIndexProgress.done < model.bodyIndexProgress.total &&
                        model.bodyIndexProgress.stage != "Idle"
-        if showSync || showBody {
+        let mcpRunning: UInt16? = {
+            if case .running(let p) = model.mcpServerStatus { return p } else { return nil }
+        }()
+
+        if showSync || showBody || mcpRunning != nil {
             VStack(alignment: .leading, spacing: 4) {
                 if showSync {
                     IndexingFooterView(progress: model.indexProgress, label: "Syncing")
                 }
                 if showBody {
                     BodyIndexFooterView(progress: model.bodyIndexProgress)
+                }
+                if let port = mcpRunning {
+                    HStack(spacing: 6) {
+                        Circle().fill(.green).frame(width: 6, height: 6)
+                        Text("MCP :\(port, format: .number.grouping(.never))")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .padding(8)

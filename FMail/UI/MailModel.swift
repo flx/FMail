@@ -65,12 +65,24 @@ final class MailModel {
     /// flips) and other in-module collaborators. External callers should
     /// not reach into the index directly.
     var indexDB: IndexDB?
-    private var bodyLoader: BodyLoader?
+    /// Internal so the MCP layer can hand it to read tools. UI consumers
+    /// still go through the high-level model APIs.
+    private(set) var bodyLoader: BodyLoader?
     private(set) var contactsService = ContactsService()
     /// Sync orchestration — file watcher, body indexer, runIncrementalSync,
     /// post-sync body pre-fetch, skip-window after our own write-backs.
     @ObservationIgnored
     var syncCoordinator: SyncCoordinator?
+
+    /// Loopback HTTP/JSON-RPC server for MCP clients. Off by default; gated
+    /// by `MCPSettings.enabled`. Started after `boot()` reaches `.ready` so
+    /// handlers always have an `indexDB` to read from.
+    @ObservationIgnored
+    var mcpServer: MCPServer?
+    /// Mirrors `mcpServer?.isRunning` on the main actor so SwiftUI can
+    /// re-render footer/status without hopping into the actor on every
+    /// observation. Updated by `applyMCPSettings()`.
+    var mcpServerStatus: MCPServerStatus = .stopped
 
     /// Owns Mark Read / Unread for messages, threads, and search results.
     /// `@ObservationIgnored` keeps it out of @Observable's tracking so we
@@ -185,8 +197,78 @@ final class MailModel {
             // Periodic safety-net sync — catches anything FSEvents missed or
             // the post-write skip window suppressed.
             coordinator.startPeriodicSync()
+
+            // MCP server: opt-in via Settings. Reads the index built above.
+            applyMCPSettings()
         } catch {
             loadState = .failed(String(describing: error))
+        }
+    }
+
+    /// Start, stop, or restart the MCP server to match `MCPSettings`.
+    /// Called from `boot()` and from the SettingsView whenever the toggle
+    /// or port changes.
+    func applyMCPSettings() {
+        let enabled = MCPSettings.enabled
+        let desiredPort = MCPSettings.port
+
+        if !enabled {
+            if let server = mcpServer {
+                Task { @MainActor [weak self] in
+                    await server.stop()
+                    self?.mcpServer = nil
+                    self?.mcpServerStatus = .stopped
+                }
+            } else {
+                mcpServerStatus = .stopped
+            }
+            return
+        }
+
+        guard let indexDB = self.indexDB, let bodyLoader = self.bodyLoader else {
+            // boot() hasn't reached `.ready` yet — nothing to register against.
+            // boot() calls applyMCPSettings() again at the end.
+            mcpServerStatus = .starting
+            return
+        }
+
+        // Build (or reuse) the server and its dispatcher.
+        let server: MCPServer
+        if let existing = mcpServer {
+            server = existing
+        } else {
+            server = MCPServer()
+            mcpServer = server
+        }
+        mcpServerStatus = .starting
+        // Build the write thunk so the MCP `mark_read` handler can dispatch
+        // through ReadStatusController without reaching across the actor
+        // boundary itself.
+        let markReadHandler: MCPMarkReadHandler = { [weak self] rowids, isRead in
+            guard let self else { return (0, "MailModel deallocated") }
+            return await self.readStatus.setReadStatus(rowids: rowids, isRead: isRead)
+        }
+        let context = MCPContext(
+            indexDB: indexDB,
+            bodyLoader: bodyLoader,
+            markReadHandler: markReadHandler
+        )
+        Task { @MainActor [weak self] in
+            // If a previous run is still listening on a different port, stop first.
+            if await server.isRunning, await server.port != UInt16(desiredPort) {
+                await server.stop()
+            }
+            do {
+                let dispatcher = await server.dispatcherForRegistration()
+                await MCPTools.registerReadTools(on: dispatcher, context: context)
+                await MCPTools.registerUnansweredAndMarkReadTools(on: dispatcher, context: context)
+                try await server.start(port: desiredPort)
+                let p = await server.port
+                self?.mcpServerStatus = .running(port: p)
+            } catch {
+                Log.mcp.error("MCP start failed: \(String(describing: error), privacy: .public)")
+                self?.mcpServerStatus = .error(String(describing: error))
+            }
         }
     }
 
@@ -672,6 +754,14 @@ final class MailModel {
 enum SidebarSelection: Hashable, Sendable {
     case allMailboxes
     case mailbox(Int)
+}
+
+/// MainActor-side view of the MCP server's lifecycle state.
+enum MCPServerStatus: Sendable, Equatable {
+    case stopped
+    case starting
+    case running(port: UInt16)
+    case error(String)
 }
 
 struct ReplyDraft: Equatable, Sendable {

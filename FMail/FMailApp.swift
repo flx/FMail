@@ -3,9 +3,14 @@ import SwiftUI
 
 @main
 struct FMailApp: App {
+    /// One model instance shared by `WindowGroup` and `Settings`. Created
+    /// here so a Settings window can read MCP server status without
+    /// re-bootstrapping the index.
+    @State private var model = MailModel()
+
     var body: some Scene {
         WindowGroup {
-            AppShell()
+            AppShell(model: model)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .windowResizability(.contentSize)
@@ -34,6 +39,10 @@ struct FMailApp: App {
                     }
                 }
             }
+        }
+
+        Settings {
+            SettingsView(model: model)
         }
     }
 }
