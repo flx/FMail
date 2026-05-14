@@ -4,7 +4,7 @@ import SQLite3
 /// FMail's own SQLite schema. Versioned via `schema_version` so future
 /// migrations can detect prior state and upgrade in place.
 enum Schema {
-    static let currentVersion: Int = 6
+    static let currentVersion: Int = 7
 
     /// Apply migrations to bring the DB up to `currentVersion`. Idempotent.
     static func apply(to db: OpaquePointer) throws {
@@ -28,6 +28,7 @@ enum Schema {
         if v < 4 { try migrateTo4(db) }
         if v < 5 { try migrateTo5(db) }
         if v < 6 { try migrateTo6(db) }
+        if v < 7 { try migrateTo7(db) }
     }
 
     static func currentSchemaVersion(_ db: OpaquePointer) -> Int {
@@ -159,6 +160,38 @@ enum Schema {
         case cc = 1
         case bcc = 2
         case from = 3
+    }
+
+    /// v7: per-account writeback service preference. Lets the user route
+    /// move/delete/mark-read either through AppleScript (the default,
+    /// existing behaviour) or — once authorized — through a server-direct
+    /// backend (Gmail API for Gmail accounts, IMAP for the rest). Tahoe's
+    /// AppleScript bridge is unreliable for mailbox-resolution operations;
+    /// the server-direct path bypasses it entirely. See WRITEBACK_PLAN.md
+    /// for the full plan. `service` is one of: 'applescript' (default),
+    /// 'gmail_api', 'imap'. `keychain_label` points to the entry holding
+    /// the relevant secret (OAuth refresh token / app-specific password);
+    /// nil for 'applescript' rows.
+    private static func migrateTo7(_ db: OpaquePointer) throws {
+        let statements = [
+            """
+            CREATE TABLE account_writeback (
+                account_uuid TEXT PRIMARY KEY,
+                service TEXT NOT NULL DEFAULT 'applescript',
+                keychain_label TEXT,
+                settings_json TEXT NOT NULL DEFAULT '{}'
+            );
+            """,
+            "INSERT INTO schema_version(version, applied_at) VALUES (7, strftime('%s','now'));"
+        ]
+        try exec(db, "BEGIN TRANSACTION;")
+        do {
+            for s in statements { try exec(db, s) }
+            try exec(db, "COMMIT;")
+        } catch {
+            try? exec(db, "ROLLBACK;")
+            throw error
+        }
     }
 
     /// v6: mirror Apple's `messages.remote_id` (IMAP UID per canonical

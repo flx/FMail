@@ -179,9 +179,12 @@ final class ReadStatusController {
     }
 
     private func runMoveByRowids(rowids: [Int], kind: MoveKind) async -> (applied: Int, error: String?) {
-        guard let db = model.indexDB else {
+        guard let db = model.indexDB, let router = model.writebackRouter else {
             return (0, "Index not loaded")
         }
+        // Optimistic UI removal first — resolve to MessageHeader for the
+        // view-state updates (`messagesInSelectedThread` etc. still key by
+        // MessageHeader). The router below handles the actual dispatch.
         var resolved: [MessageHeader] = []
         for rowid in rowids {
             if let m = try? await db.loadMessage(rowid: rowid) { resolved.append(m) }
@@ -191,12 +194,12 @@ final class ReadStatusController {
         }
         applyOptimisticRemoval(messages: resolved)
 
-        let entries = mailScripterEntries(for: resolved)
-        guard !entries.isEmpty else {
-            return (0, "Couldn't build AppleScript entries (mailbox/account info missing)")
-        }
         model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
-        let result = await dispatchMove(entries: entries, kind: kind)
+        let result: WritebackResult
+        switch kind {
+        case .delete: result = await router.delete(rowids: resolved.map(\.rowId))
+        case .junk:   result = await router.moveToJunk(rowids: resolved.map(\.rowId))
+        }
 
         // For successful moves: Gmail (and IMAP generally) reassigns the
         // message's apple_rowid when it changes mailboxes — the old rowid
@@ -206,31 +209,33 @@ final class ReadStatusController {
         // an immediate sync so MCP queries (and the UI) see the new state
         // promptly. For failures: keep the suppress window so we don't
         // re-import data that's about to be re-tried.
-        switch result {
-        case .ok(let matched):
+        if result.applied > 0 {
             model.syncCoordinator?.skipSyncsUntil = nil
             await model.syncCoordinator?.runIncrementalSync()
-            return (matched, nil)
-        case .notFound:
+        } else {
             model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
-            return (0, "Mail.app couldn't find any of the messages — apple_rowid may be stale.")
-        case .failed(let m):
-            model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
-            return (resolved.count, "AppleScript failed: \(m)")
         }
+        return result.legacyTuple()
     }
 
     private func applyAndDispatchMove(messages: [MessageHeader], kind: MoveKind) async {
         applyOptimisticRemoval(messages: messages)
 
-        let entries = mailScripterEntries(for: messages)
-        guard !entries.isEmpty else { return }
+        let rowids = messages.map(\.rowId)
+        guard !rowids.isEmpty else { return }
+        let verbForError = kind.verbForError
 
         model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
         Task.detached { [weak model] in
-            let result = await Self.dispatchMove(entries: entries, kind: kind)
-            switch result {
-            case .ok:
+            // Fetch the router on MainActor (it lives on @MainActor MailModel).
+            guard let router = await MainActor.run(body: { model?.writebackRouter }) else { return }
+            let result: WritebackResult
+            switch kind {
+            case .delete: result = await router.delete(rowids: rowids)
+            case .junk:   result = await router.moveToJunk(rowids: rowids)
+            }
+
+            if result.applied > 0 {
                 // Force an immediate sync so the index picks up the new
                 // post-move rowids (Gmail reassigns on label changes).
                 // Otherwise the optimistic UI removal hides the messages
@@ -241,28 +246,17 @@ final class ReadStatusController {
                 if let sc = await MainActor.run(body: { model?.syncCoordinator }) {
                     await sc.runIncrementalSync()
                 }
-            case .notFound:
+            } else {
+                let errMsg = result.error
                 await MainActor.run {
                     model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
-                    model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
-                }
-            case .failed(let msg):
-                await MainActor.run {
-                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
-                    model?.bulkActionError = "\(kind.verbForError) failed: \(msg)"
+                    if let errMsg {
+                        model?.bulkActionError = "\(verbForError) failed: \(errMsg)"
+                    } else {
+                        model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
+                    }
                 }
             }
-        }
-    }
-
-    private func dispatchMove(entries: [MailScripter.BatchEntry], kind: MoveKind) async -> MailScripter.Result {
-        await Self.dispatchMove(entries: entries, kind: kind)
-    }
-
-    nonisolated private static func dispatchMove(entries: [MailScripter.BatchEntry], kind: MoveKind) async -> MailScripter.Result {
-        switch kind {
-        case .delete: return await MailScripter.deleteBatch(entries)
-        case .junk:   return await MailScripter.moveToJunkBatch(entries)
         }
     }
 

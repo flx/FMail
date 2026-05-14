@@ -79,6 +79,14 @@ final class MailModel {
     /// handlers always have an `indexDB` to read from.
     @ObservationIgnored
     var mcpServer: MCPServer?
+
+    /// Per-account dispatcher for move/delete/mark-read. Routes each call
+    /// to AppleScript / Gmail API / IMAP per `account_writeback` config.
+    /// Phase B0 just adds the plumbing — default routing stays
+    /// AppleScript for every account, so behaviour is unchanged. Phase B1+
+    /// adds the alternative backends.
+    @ObservationIgnored
+    var writebackRouter: WritebackRouter?
     /// Mirrors `mcpServer?.isRunning` on the main actor so SwiftUI can
     /// re-render footer/status without hopping into the actor on every
     /// observation. Updated by `applyMCPSettings()`.
@@ -160,6 +168,7 @@ final class MailModel {
             self.indexDB = db
             let bodyLoader = BodyLoader(mailVersionDir: versionDir)
             self.bodyLoader = bodyLoader
+            self.writebackRouter = WritebackRouter(indexDB: db)
             let indexer = Indexer(envelopePath: envelopePath, indexDB: db, mailVersionDir: versionDir)
             let bodyIndexer = BodyIndexer(indexDB: db, bodyLoader: bodyLoader)
             let coordinator = SyncCoordinator(model: self, indexer: indexer, bodyIndexer: bodyIndexer, mailVersionDir: versionDir)
