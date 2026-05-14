@@ -20,7 +20,14 @@ import Foundation
 enum GmailOAuthConfig {
     /// REPLACE with your Google Cloud OAuth 2.0 client ID. Looks like
     /// `<long-number>-<random>.apps.googleusercontent.com`.
-    static let clientID: String = ""
+    static let clientID: String = "REDACTED_GOOGLE_OAUTH_CLIENT_ID"
+
+    /// REPLACE with the matching OAuth client secret. Google requires
+    /// this even for Desktop apps using PKCE — their docs say "the secret
+    /// is not actually secret for installed apps" but the token endpoint
+    /// rejects requests without it (`invalid_request`).
+    /// Looks like `GOCSPX-…`.
+    static let clientSecret: String = "REDACTED_GOOGLE_OAUTH_CLIENT_SECRET"
 
     /// Google's authorization endpoint.
     static let authEndpoint = URL(string: "https://accounts.google.com/o/oauth2/v2/auth")!
@@ -34,9 +41,9 @@ enum GmailOAuthConfig {
         "https://www.googleapis.com/auth/gmail.modify"
     ]
 
-    /// True when we have a non-empty client ID. The Settings UI uses this
-    /// to decide whether to show the "Authorize…" button.
+    /// True when we have both client ID and secret. The Settings UI uses
+    /// this to decide whether to show the "Authorize…" button.
     static var isConfigured: Bool {
-        !clientID.isEmpty
+        !clientID.isEmpty && !clientSecret.isEmpty
     }
 }

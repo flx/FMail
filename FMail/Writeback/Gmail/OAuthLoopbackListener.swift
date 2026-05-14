@@ -24,15 +24,38 @@ enum OAuthLoopbackListener {
     ) async throws -> (code: String, verifier: String, redirectURI: String) {
         guard !clientID.isEmpty else { throw OAuthFlowError.notConfigured }
 
-        // Bind first so we know our port before building the auth URL.
-        let listener = try NWListener(using: .tcp, on: .any)
-        let bindStart = Date()
-        let port = try await waitForReady(listener: listener, deadline: bindStart.addingTimeInterval(10))
+        // Bind a loopback listener on an OS-assigned port. We need both
+        // handlers (newConnectionHandler AND stateUpdateHandler) set
+        // BEFORE start(queue:) — Apple's docs require it, and macOS Tahoe
+        // rejects with POSIX EINVAL (22) when newConnectionHandler isn't
+        // configured at start time. So: generate PKCE + state FIRST, wire
+        // up the connection handler with them, THEN start and await ready.
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        parameters.requiredInterfaceType = .loopback
+        let port0 = NWEndpoint.Port(rawValue: 0)!
+        let listener: NWListener
+        do {
+            listener = try NWListener(using: parameters, on: port0)
+        } catch {
+            throw OAuthFlowError.tokenExchangeFailed("couldn't bind loopback listener: \(error)")
+        }
+
+        // PKCE + state up front so the connection handler can capture
+        // `state` for CSRF validation.
+        let pkce = PKCE.generate()
+        let state = PKCE.makeVerifier(length: 43)
+        let codePromise = AsyncSinglePromise<String>()
+
+        // Both handlers must be set BEFORE start(queue:).
+        listener.newConnectionHandler = { conn in
+            Task {
+                await Self.handleCallback(conn, expectedState: state, promise: codePromise)
+            }
+        }
+        let port = try await waitForReady(listener: listener, deadline: Date().addingTimeInterval(10))
         let redirectURI = "http://127.0.0.1:\(port)/oauth-callback"
 
-        // Build PKCE + state + auth URL.
-        let pkce = PKCE.generate()
-        let state = PKCE.makeVerifier(length: 43)  // any URL-safe random
         let request = AuthorizationRequest(
             clientID: clientID,
             redirectURI: redirectURI,
@@ -43,17 +66,10 @@ enum OAuthLoopbackListener {
         )
         let authURL = request.authorizationURL()
 
-        // Set up the callback handler before opening the browser.
-        let codePromise = AsyncSinglePromise<String>()
-        listener.newConnectionHandler = { conn in
-            Task {
-                await Self.handleCallback(conn, expectedState: state, promise: codePromise)
-            }
-        }
-
-        // Open the user's browser.
+        // Open the user's browser. `.open(_:)` returns a Bool — explicit
+        // discard so we don't warn about the unused result of MainActor.run.
         await MainActor.run {
-            NSWorkspace.shared.open(authURL)
+            _ = NSWorkspace.shared.open(authURL)
         }
 
         // Wait for the callback (or timeout).

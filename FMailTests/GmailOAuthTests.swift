@@ -134,6 +134,7 @@ final class GmailOAuthTests: XCTestCase {
         let exchange = OAuthTokenExchange(session: recordingSession)
         let creds = try await exchange.exchangeCode(
             clientID: "test-client",
+            clientSecret: "test-secret",
             code: "the-code",
             verifier: "the-verifier",
             redirectURI: "http://127.0.0.1:5000/oauth-callback"
@@ -150,6 +151,8 @@ final class GmailOAuthTests: XCTestCase {
         XCTAssertEqual(req.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
         let bodyStr = String(data: req.httpBody ?? Data(), encoding: .utf8) ?? ""
         XCTAssertTrue(bodyStr.contains("client_id=test-client"))
+        XCTAssertTrue(bodyStr.contains("client_secret=test-secret"),
+                      "Google's Desktop OAuth requires client_secret even with PKCE")
         XCTAssertTrue(bodyStr.contains("code=the-code"))
         XCTAssertTrue(bodyStr.contains("code_verifier=the-verifier"))
         XCTAssertTrue(bodyStr.contains("grant_type=authorization_code"))
@@ -174,7 +177,7 @@ final class GmailOAuthTests: XCTestCase {
             expiresAt: Date().addingTimeInterval(-1)  // already expired
         )
         let exchange = OAuthTokenExchange(session: recordingSession)
-        try await exchange.refresh(clientID: "test-client", credentials: &creds)
+        try await exchange.refresh(clientID: "test-client", clientSecret: "test-secret", credentials: &creds)
         XCTAssertEqual(creds.accessToken, "new-access")
         XCTAssertEqual(creds.refreshToken, "refresh-token-value")  // unchanged
         XCTAssertGreaterThan(creds.expiresAt.timeIntervalSinceNow, 3500)
@@ -182,6 +185,8 @@ final class GmailOAuthTests: XCTestCase {
         let req = try XCTUnwrap(recordingSession.lastRequest)
         let bodyStr = String(data: req.httpBody ?? Data(), encoding: .utf8) ?? ""
         XCTAssertTrue(bodyStr.contains("client_id=test-client"))
+        XCTAssertTrue(bodyStr.contains("client_secret=test-secret"),
+                      "refresh also requires client_secret for Google Desktop OAuth")
         XCTAssertTrue(bodyStr.contains("grant_type=refresh_token"))
         XCTAssertTrue(bodyStr.contains("refresh_token=refresh-token-value"))
     }
@@ -194,7 +199,7 @@ final class GmailOAuthTests: XCTestCase {
         let exchange = OAuthTokenExchange(session: session)
         do {
             _ = try await exchange.exchangeCode(
-                clientID: "test", code: "bad", verifier: "x", redirectURI: "http://127.0.0.1:5000/cb"
+                clientID: "test", clientSecret: "secret", code: "bad", verifier: "x", redirectURI: "http://127.0.0.1:5000/cb"
             )
             XCTFail("expected tokenExchangeFailed")
         } catch OAuthFlowError.tokenExchangeFailed {

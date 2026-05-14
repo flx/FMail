@@ -29,12 +29,14 @@ struct OAuthTokenExchange: Sendable {
     /// `OAuthFlowError.noRefreshTokenReturned`.
     func exchangeCode(
         clientID: String,
+        clientSecret: String,
         code: String,
         verifier: String,
         redirectURI: String
     ) async throws -> StoredCredentials {
         let body = formURLEncode([
             "client_id": clientID,
+            "client_secret": clientSecret,
             "code": code,
             "code_verifier": verifier,
             "grant_type": "authorization_code",
@@ -49,9 +51,10 @@ struct OAuthTokenExchange: Sendable {
 
     /// Refresh-token flow. Mutates the passed-in credentials in place so
     /// the caller can persist back to Keychain in one step.
-    func refresh(clientID: String, credentials: inout StoredCredentials) async throws {
+    func refresh(clientID: String, clientSecret: String, credentials: inout StoredCredentials) async throws {
         let body = formURLEncode([
             "client_id": clientID,
+            "client_secret": clientSecret,
             "refresh_token": credentials.refreshToken,
             "grant_type": "refresh_token"
         ])

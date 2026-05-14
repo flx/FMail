@@ -19,6 +19,10 @@ Package.resolved
 # macOS
 .DS_Store
 
+# Google Cloud Console OAuth downloads — secret lives in
+# FMail/Writeback/Gmail/GmailOAuthConfig.swift; the JSON is redundant.
+client_secret_*.json
+
 # Local prefs
 *.pbxuser
 !default.pbxuser

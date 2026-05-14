@@ -149,14 +149,15 @@ The OAuth client is per-fork — Google's terms expect each redistribution to re
 1. Go to [console.cloud.google.com](https://console.cloud.google.com/) → create or pick a project.
 2. **APIs & Services → Library** → enable **Gmail API**.
 3. **APIs & Services → OAuth consent screen** → User Type: External. Add yourself as a Test User. Scopes: `https://www.googleapis.com/auth/gmail.modify`.
-4. **APIs & Services → Credentials** → Create Credentials → OAuth Client ID → Application type: **Desktop app**. Copy the **Client ID** (looks like `REDACTED_GOOGLE_OAUTH_CLIENT_ID`).
-5. Paste the Client ID into `FMail/Writeback/Gmail/GmailOAuthConfig.swift`:
+4. **APIs & Services → Credentials** → Create Credentials → OAuth Client ID → Application type: **Desktop app**. Copy both the **Client ID** (`REDACTED_GOOGLE_OAUTH_CLIENT_ID`) and the **Client Secret** (`GOCSPX-…`).
+5. Paste both into `FMail/Writeback/Gmail/GmailOAuthConfig.swift`:
    ```swift
    static let clientID = "YOUR-CLIENT-ID.apps.googleusercontent.com"
+   static let clientSecret = "REDACTED_GOOGLE_OAUTH_CLIENT_SECRET"
    ```
 6. Rebuild. Settings → "Gmail accounts" now lists each detected Gmail address with an "Authorize…" button.
 
-PKCE (RFC 7636) handles auth-code interception, so committing the Client ID to a public fork is fine — that's the modern best practice for installed apps. There is no client secret to keep out of the binary. Each fork's OAuth project is independently rate-limited, so misuse of your fork's Client ID is your problem, not upstream's.
+Why the secret in source for a public fork? Google's own [OAuth 2.0 for installed apps](https://developers.google.com/identity/protocols/oauth2/native-app) docs say: *"The client secret is not actually secret for installed apps. Anyone who can decompile your application can extract it."* They still require it on the token endpoint as a client-identifier; PKCE (RFC 7636) is what actually protects against code interception. Each fork's OAuth project is independently rate-limited, so misuse of your fork's credentials is your problem, not upstream's. If you'd rather not commit the secret, move it to a gitignored helper file — the field just needs to be readable as `GmailOAuthConfig.clientSecret`.
 
 If you skip this step, FMail still works — Gmail accounts just fall back to AppleScript for writebacks (with the Tahoe-flakiness caveats above).
 

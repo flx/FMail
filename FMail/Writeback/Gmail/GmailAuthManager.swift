@@ -36,6 +36,7 @@ actor GmailAuthManager {
         )
         let creds = try await exchange.exchangeCode(
             clientID: GmailOAuthConfig.clientID,
+            clientSecret: GmailOAuthConfig.clientSecret,
             code: code, verifier: verifier, redirectURI: redirectURI
         )
         let label = Self.keychainLabel(for: email)
@@ -49,7 +50,11 @@ actor GmailAuthManager {
     func currentAccessToken(label: String) async throws -> String {
         var creds = try loadCredentials(label: label)
         if creds.isExpiring() {
-            try await exchange.refresh(clientID: GmailOAuthConfig.clientID, credentials: &creds)
+            try await exchange.refresh(
+                clientID: GmailOAuthConfig.clientID,
+                clientSecret: GmailOAuthConfig.clientSecret,
+                credentials: &creds
+            )
             try persist(label: label, creds: creds)
         }
         return creds.accessToken
