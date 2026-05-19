@@ -178,6 +178,9 @@ struct JSONRPCResponse: Sendable, Encodable {
 struct HTTPRequestLine: Sendable {
     let method: String
     let path: String
+    /// Lowercased keys, last-wins on duplicates. Sufficient for the headers
+    /// we care about (`Authorization`, `Content-Length`).
+    let headers: [String: String]
     let body: Data
 }
 
@@ -214,11 +217,13 @@ enum HTTPParser {
         let method = parts[0]
         let path = parts[1]
 
+        var headers: [String: String] = [:]
         var contentLength = 0
         for line in lines.dropFirst() where !line.isEmpty {
             guard let colonIdx = line.firstIndex(of: ":") else { continue }
             let key = String(line[..<colonIdx]).lowercased()
             let value = line[line.index(after: colonIdx)...].trimmingCharacters(in: .whitespaces)
+            headers[key] = String(value)
             if key == "content-length" {
                 contentLength = Int(value) ?? 0
             }
@@ -228,27 +233,38 @@ enum HTTPParser {
         let bodyEnd = bodyStart + contentLength
         if data.count < bodyEnd { return nil }
         let body = data.subdata(in: bodyStart..<bodyEnd)
-        return (HTTPRequestLine(method: method, path: path, body: body), bodyEnd)
+        return (HTTPRequestLine(method: method, path: path, headers: headers, body: body), bodyEnd)
     }
 
     /// Format an HTTP/1.1 response with a JSON body and `Connection: close`.
-    static func formatResponse(status: Int = 200, body: Data) -> Data {
+    /// `extraHeaders` adds key/value pairs verbatim (e.g.
+    /// `["WWW-Authenticate": "Bearer"]` on 401 responses).
+    static func formatResponse(
+        status: Int = 200,
+        body: Data,
+        extraHeaders: [(String, String)] = []
+    ) -> Data {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
+        case 202: statusText = "Accepted"
         case 204: statusText = "No Content"
         case 400: statusText = "Bad Request"
+        case 401: statusText = "Unauthorized"
         case 404: statusText = "Not Found"
         case 405: statusText = "Method Not Allowed"
         case 500: statusText = "Internal Server Error"
         default: statusText = "OK"
         }
-        let header =
+        var header =
             "HTTP/1.1 \(status) \(statusText)\r\n" +
             "Content-Type: application/json\r\n" +
             "Content-Length: \(body.count)\r\n" +
-            "Connection: close\r\n" +
-            "\r\n"
+            "Connection: close\r\n"
+        for (k, v) in extraHeaders {
+            header += "\(k): \(v)\r\n"
+        }
+        header += "\r\n"
         var out = Data(header.utf8)
         out.append(body)
         return out

@@ -128,6 +128,8 @@ actor MCPServer {
         let method = request.method.uppercased()
 
         // GET /mcp → small server-info probe (handy for `curl localhost:8765/mcp`).
+        // No auth required: the only thing this leaks is "an MCP server is
+        // here", which the bearer-protected endpoints would confirm anyway.
         if method == "GET" {
             let info: [String: JSONValue] = [
                 "server": .string(MCPProtocol.serverName),
@@ -146,6 +148,15 @@ actor MCPServer {
             return HTTPParser.formatResponse(status: 404, body: Data("{}".utf8))
         }
 
+        // Bearer-token check. When `MCPSettings.authToken` is empty, the
+        // server is in local-loopback-only mode (no auth) — matches the
+        // historical behaviour. When non-empty, every POST must include
+        // `Authorization: Bearer <token>` or it's rejected at 401 before
+        // the dispatcher sees the body.
+        if let denial = denyIfMissingAuth(request) {
+            return denial
+        }
+
         let result = await dispatcher.dispatch(rawBody: request.body)
         switch result {
         case .response(let body):
@@ -154,6 +165,45 @@ actor MCPServer {
             // Notifications: per MCP Streamable HTTP, return 202 with empty body.
             return HTTPParser.formatResponse(status: 202, body: Data())
         }
+    }
+
+    /// Returns a 401 response when the required bearer token is missing or
+    /// wrong. Returns nil when auth is disabled (token empty) or the
+    /// request carries the right token.
+    private func denyIfMissingAuth(_ request: HTTPRequestLine) -> Data? {
+        let required = MCPSettings.authToken
+        guard !required.isEmpty else { return nil }
+        let presented = bearerToken(in: request.headers["authorization"] ?? "")
+        if constantTimeEqual(presented, required) { return nil }
+        Log.mcp.info("MCP rejected request: missing/invalid bearer token")
+        let body = Data(#"{"error":"unauthorized"}"#.utf8)
+        return HTTPParser.formatResponse(
+            status: 401,
+            body: body,
+            extraHeaders: [("WWW-Authenticate", #"Bearer realm="fmail""#)]
+        )
+    }
+
+    /// Extracts the token from a `Bearer <token>` header value. Tolerates
+    /// extra surrounding whitespace and mixed case on the scheme name.
+    private func bearerToken(in header: String) -> String {
+        let trimmed = header.trimmingCharacters(in: .whitespaces)
+        guard trimmed.lowercased().hasPrefix("bearer ") else { return "" }
+        let after = trimmed.index(trimmed.startIndex, offsetBy: 7)
+        return String(trimmed[after...]).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Constant-time string compare to keep timing attacks from learning
+    /// the token a byte at a time.
+    private func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        if aBytes.count != bBytes.count { return false }
+        var diff: UInt8 = 0
+        for i in 0..<aBytes.count {
+            diff |= aBytes[i] ^ bBytes[i]
+        }
+        return diff == 0
     }
 
     private func readHTTPRequest(_ conn: NWConnection) async -> (HTTPRequestLine, Data)? {

@@ -5,7 +5,13 @@ struct AppShell: View {
     @FocusState private var searchFocused: Bool
 
     var body: some View {
-        Group {
+        VStack(spacing: 0) {
+            // Loud red bar at top whenever tunnel state ≠ .off. Lives
+            // outside the loadState switch so it's visible even during
+            // bootstrap / index-rebuild paths.
+            TunnelBanner(model: model)
+
+            Group {
             switch model.loadState {
             case .idle, .bootstrapping:
                 ProgressView("Opening index…")
@@ -46,6 +52,7 @@ struct AppShell: View {
                     footerStatus
                 }
             }
+            }
         }
         .task {
             await model.boot()
@@ -80,8 +87,9 @@ struct AppShell: View {
         let mcpRunning: UInt16? = {
             if case .running(let p) = model.mcpServerStatus { return p } else { return nil }
         }()
+        let tunnelLive: Bool = model.tunnel.state.isLive
 
-        if showSync || showBody || mcpRunning != nil {
+        if showSync || showBody || mcpRunning != nil || tunnelLive {
             VStack(alignment: .leading, spacing: 4) {
                 if showSync {
                     IndexingFooterView(progress: model.indexProgress, label: "Syncing")
@@ -95,6 +103,14 @@ struct AppShell: View {
                         Text("MCP :\(port, format: .number.grouping(.never))")
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
+                    }
+                }
+                if tunnelLive {
+                    HStack(spacing: 6) {
+                        Circle().fill(.red).frame(width: 6, height: 6)
+                        Text("Tunnel open")
+                            .font(.caption.bold())
+                            .foregroundStyle(.red)
                     }
                 }
             }

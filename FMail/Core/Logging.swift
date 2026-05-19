@@ -11,4 +11,5 @@ enum Log {
     static let bodyIndexer = Logger(subsystem: subsystem, category: "BodyIndexer")
     static let db = Logger(subsystem: subsystem, category: "db")
     static let mcp = Logger(subsystem: subsystem, category: "mcp")
+    static let tunnel = Logger(subsystem: subsystem, category: "tunnel")
 }

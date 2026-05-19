@@ -91,6 +91,26 @@ final class MailModel {
     /// be created until self is fully initialized).
     @ObservationIgnored
     private(set) lazy var readStatus = ReadStatusController(model: self)
+
+    /// Manages the `cloudflared` child process when the user toggles the
+    /// Cloudflare tunnel on/off. `@ObservationIgnored` keeps the macro out
+    /// of this property (`@Observable` + `lazy` is incompatible). SwiftUI
+    /// still observes transitions because `TunnelCoordinator` itself is
+    /// `@Observable` — anything reading `model.tunnel.state` is tracked.
+    @ObservationIgnored
+    private(set) lazy var tunnel = TunnelCoordinator(
+        mcpPort: { MCPSettings.port },
+        mcpIsRunning: { [weak self] in
+            guard let self else { return false }
+            if case .running = self.mcpServerStatus { return true }
+            return false
+        }
+    )
+
+    /// Set to true once `boot()` has registered the willTerminate observer
+    /// so re-boots (e.g. after an FDA grant) don't double-register.
+    @ObservationIgnored
+    private var willTerminateObserverRegistered = false
     private var searchTask: Task<Void, Never>?
 
     // Reply flow state
@@ -137,6 +157,22 @@ final class MailModel {
         switch loadState {
         case .ready, .bootstrapping, .indexing: return
         default: break
+        }
+
+        // Best-effort cleanup so cmd-Q never leaves a public tunnel
+        // running after FMail exits. Register once; the observer fires
+        // on .main, so `stopBlockingForQuit` (MainActor) runs synchronously.
+        if !willTerminateObserverRegistered {
+            willTerminateObserverRegistered = true
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.tunnel.stopBlockingForQuit()
+                }
+            }
         }
 
         loadState = .bootstrapping
