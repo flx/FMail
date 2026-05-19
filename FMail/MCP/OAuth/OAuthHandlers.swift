@@ -27,18 +27,45 @@ enum OAuthHandlers {
 
     // MARK: — Dynamic client registration (`POST /register`)
 
+    /// RFC 7591 dynamic client registration. The MCP authorization spec
+    /// expects the response to echo back the fields the client sent
+    /// (especially `redirect_uris`) so the client knows the server has
+    /// accepted them — without that, clients bail before the
+    /// authorization request. We're a single-user public-client server,
+    /// so we issue a fresh `client_id` for every registration and
+    /// accept whatever redirect URI is supplied (the user still has to
+    /// click Approve on `/authorize`, so the redirect URI is a UX hint
+    /// rather than a trust boundary).
     @MainActor
     static func register(body: Data) -> Data {
         let parsed = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
         let name = parsed["client_name"] as? String
         let (clientID, _) = OAuthStore.shared.registerClient(name: name)
-        let payload: [String: JSONValue] = [
+
+        var payload: [String: JSONValue] = [
             "client_id": .string(clientID),
             "client_id_issued_at": .int(Int64(Date().timeIntervalSince1970)),
             "token_endpoint_auth_method": .string("none"),
             "grant_types": .array([.string("authorization_code")]),
             "response_types": .array([.string("code")])
         ]
+
+        // Echo back the client's metadata so it knows we accepted it.
+        // RFC 7591 §3.2.1: the response is "essentially the metadata the
+        // client sent" plus the issued `client_id`.
+        if let redirects = parsed["redirect_uris"] as? [String] {
+            payload["redirect_uris"] = .array(redirects.map { .string($0) })
+        }
+        if let scope = parsed["scope"] as? String, !scope.isEmpty {
+            payload["scope"] = .string(scope)
+        }
+        if let clientName = name, !clientName.isEmpty {
+            payload["client_name"] = .string(clientName)
+        }
+        if let clientURI = parsed["client_uri"] as? String, !clientURI.isEmpty {
+            payload["client_uri"] = .string(clientURI)
+        }
+
         let jsonBody = (try? JSONEncoder().encode(JSONValue.object(payload))) ?? Data("{}".utf8)
         return HTTPParser.formatResponse(status: 201, body: jsonBody)
     }
