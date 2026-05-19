@@ -45,15 +45,16 @@ struct AppShell: View {
                 .overlay(alignment: .bottom) {
                     footerStatus
                 }
-                // Loud red bar above the split view's content when the
-                // tunnel is active. Applied directly to the
-                // NavigationSplitView so its safe-area inset actually
-                // takes effect — applying it to the surrounding Group
-                // doesn't propagate down through SwiftUI's split-view
-                // chrome on macOS. When the tunnel is off the banner
-                // renders EmptyView and the inset takes zero space.
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    TunnelBanner(model: model)
+                // Tunnel-active indicator sits in the toolbar (top-right,
+                // in the same row as the column title). Replaces the
+                // earlier safe-area banner which fought the macOS
+                // window chrome and ended up overlapping content.
+                .toolbar {
+                    if model.tunnel.state.isLive {
+                        ToolbarItem(placement: .primaryAction) {
+                            tunnelToolbarButton
+                        }
+                    }
                 }
             }
         }
@@ -78,6 +79,40 @@ struct AppShell: View {
                 .keyboardShortcut("f", modifiers: .command)
                 .opacity(0)
                 .frame(width: 0, height: 0)
+        }
+    }
+
+    /// Top-right toolbar button shown whenever the tunnel is in any
+    /// non-`.off` state. Red while the tunnel is actually `.running`
+    /// (public-internet exposure), orange while it's transitioning.
+    /// Click → stop the tunnel. Hovering shows the public URL.
+    @ViewBuilder
+    private var tunnelToolbarButton: some View {
+        switch model.tunnel.state {
+        case .running(let url):
+            Button {
+                Task { await model.tunnel.stop() }
+            } label: {
+                Label("Tunnel open", systemImage: "network")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .help("Cloudflare tunnel exposing this server at \(url.absoluteString). Click to close.")
+        case .starting:
+            Button {
+                Task { await model.tunnel.stop() }
+            } label: {
+                Label("Tunnel starting…", systemImage: "network")
+            }
+            .buttonStyle(.bordered)
+            .tint(.orange)
+            .help("Cloudflare tunnel is starting. Click to cancel.")
+        case .stopping:
+            Label("Tunnel closing…", systemImage: "network")
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(.orange)
+        case .off, .error:
+            EmptyView()
         }
     }
 
