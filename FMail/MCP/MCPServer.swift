@@ -235,12 +235,15 @@ actor MCPServer {
     /// metadata + 401 hints. When the tunnel is up, this is the public
     /// hostname the user typed in Settings; otherwise the loopback URL.
     /// Read on each request so a Settings edit takes effect without a
-    /// server restart.
+    /// server restart. Trailing slashes are stripped so concatenating
+    /// `\(currentIssuer)/path` never produces a `//path`.
     nonisolated private var currentIssuer: String {
-        let public_ = MCPSettings.tunnelPublicURL.trimmingCharacters(in: .whitespaces)
-        return public_.isEmpty
+        let raw = MCPSettings.tunnelPublicURL.trimmingCharacters(in: .whitespaces)
+        var base = raw.isEmpty
             ? "http://127.0.0.1:\(MCPSettings.port)"
-            : public_
+            : raw
+        while base.hasSuffix("/") { base.removeLast() }
+        return base
     }
 
     /// Extracts the token from a `Bearer <token>` header value. Tolerates
