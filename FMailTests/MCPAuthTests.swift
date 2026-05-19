@@ -14,10 +14,21 @@ final class MCPAuthTests: XCTestCase {
         super.setUp()
         savedToken = MCPSettings.authToken
         MCPSettings.authToken = ""
+        // Tests share UserDefaults with the host app, so OAuth sessions
+        // persisted by another test (or a real local run) would flip
+        // the no-auth path off. Wipe to a known state.
+        MainActor.assumeIsolated {
+            OAuthStore.shared.revokeAllSessions()
+            OAuthStore.shared.closeApprovalWindow()
+        }
     }
 
     override func tearDown() {
         MCPSettings.authToken = savedToken
+        MainActor.assumeIsolated {
+            OAuthStore.shared.revokeAllSessions()
+            OAuthStore.shared.closeApprovalWindow()
+        }
         super.tearDown()
     }
 

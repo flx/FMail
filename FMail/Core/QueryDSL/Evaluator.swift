@@ -131,6 +131,14 @@ enum Evaluator {
                 fragment: "m.account_uuid IN (SELECT uuid FROM accounts WHERE email_address = ? OR uuid LIKE ?)",
                 bindings: [.text(acc), .text("\(acc)%")]
             )
+        case .thread(let id):
+            // Match both real and synthetic-singleton thread IDs (a
+            // not-yet-grouped message has thread_id = 0 and is keyed by
+            // its own apple_rowid in `effectiveThreadIdExpr` / MCP results).
+            return .sql(
+                fragment: "(m.thread_id = ? OR (m.thread_id = 0 AND m.apple_rowid = ?))",
+                bindings: [.int(Int64(id)), .int(Int64(id))]
+            )
         case .unknownField(_, let value):
             // Surface unknown fields as bag-of-words so the user still gets
             // results — matches the original behavior.
@@ -143,7 +151,25 @@ enum Evaluator {
     private static func ftsField(_ column: String, _ value: String) -> Compiled {
         let safe = sanitize(value)
         guard !safe.isEmpty else { return .empty }
-        return .text("{\(column)}: \(safe)*")
+        // Split on non-alphanumerics so addresses / domains tokenise the
+        // same way FTS5's unicode61 tokeniser broke them apart at index
+        // time. Without this, `from:savills.com` searches for the
+        // single token "savills.com" — which doesn't exist, because
+        // `felix@savills.com` was indexed as ["felix", "savills",
+        // "com"]. With this split, the search becomes
+        // `{sender}: (savills* AND com*)` and hits any savills.com
+        // sender. Same for `from:james@savills.com` → tokens
+        // [james, savills, com] all AND-prefixed.
+        let tokens = safe
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return .empty }
+        if tokens.count == 1 {
+            return .text("{\(column)}: \(tokens[0])*")
+        }
+        let inner = tokens.map { "\($0)*" }.joined(separator: " AND ")
+        return .text("{\(column)}: (\(inner))")
     }
 
     // MARK: — Combinators
@@ -311,6 +337,7 @@ enum Evaluator {
         case .noAttachment:  return "\(pre)has:no attachment"
         case .mailboxKind(let kind): return "\(pre)in:\(kind)"
         case .account(let acc):      return "\(pre)account:\(quoteIfNeeded(acc))"
+        case .thread(let id):        return "\(pre)thread:\(id)"
         case .unknownField(let name, let value): return "\(pre)\(name)?:\(quoteIfNeeded(value))"
         }
     }

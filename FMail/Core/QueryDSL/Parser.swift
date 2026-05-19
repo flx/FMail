@@ -121,17 +121,22 @@ struct QueryParser {
         case "attachment", "filename": return .attachmentName(v)
         case "in": return .mailboxKind(v.lowercased())
         case "account": return .account(v)
+        case "thread":
+            if let id = Int(v) { return .thread(id) }
         case "before":
             // `before:2026` → < start of 2026.    (exclusive of 2026)
             // `before:2024-03-15` → < that day.   (exclusive of that day)
             if let p = DateExpression.parse(v) { return .dateBefore(p.date) }
         case "after", "since":
-            // `after:2024`     → >= start of 2025      (after the period)
-            // `after:2024-03`  → >= start of Apr 2024  (after the period)
-            // `after:2024-03-15` → >= start of that day (Gmail-style inclusive)
+            // Inclusive of the period start. Gmail-style:
+            //   `after:2024-03-15` → >= 2024-03-15
+            //   `after:2024-03`    → >= 2024-03-01
+            //   `after:2024`       → >= 2024-01-01
+            // (Previously partial dates were exclusive of the period —
+            // `after:2024` meant `>= 2025-01-01` — which surprised every
+            // LLM and human who's used Gmail's search.)
             if let p = DateExpression.parse(v) {
-                let bound: Date = (p.granularity == .day) ? p.date : p.startOfNextPeriod()
-                return .dateAfter(bound)
+                return .dateAfter(p.date)
             }
         case "on", "during":
             // Granular range. Width = the precision the user typed at:

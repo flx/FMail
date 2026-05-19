@@ -121,6 +121,97 @@ final class QueryDSLTests: XCTestCase {
         XCTAssertTrue(q.interpretation.contains("-homework"))
     }
 
+    // MARK: — `after:` semantics (inclusive of period start)
+
+    /// All three flavors should bind the epoch corresponding to the
+    /// *start* of the named period (in the user's local timezone — the
+    /// parser uses `Calendar.current`). Expected values are computed
+    /// dynamically so the tests work in any tz.
+    func testAfterFullDateIsInclusive() {
+        let q = compile("after:2024-03-15")
+        assertDateBinding(q, expected: makeLocalDate(2024, 3, 15))
+    }
+
+    func testAfterPartialYearIsInclusive() {
+        // Previously: `after:2024` meant `>= 2025-01-01`. Now: `>= 2024-01-01`.
+        let q = compile("after:2024")
+        assertDateBinding(q, expected: makeLocalDate(2024, 1, 1))
+    }
+
+    func testAfterPartialMonthIsInclusive() {
+        let q = compile("after:2024-03")
+        assertDateBinding(q, expected: makeLocalDate(2024, 3, 1))
+    }
+
+    private func makeLocalDate(_ y: Int, _ m: Int, _ d: Int) -> Date {
+        var c = DateComponents()
+        c.year = y; c.month = m; c.day = d
+        return Calendar.current.date(from: c)!
+    }
+
+    private func assertDateBinding(_ q: CompiledQuery, expected: Date) {
+        XCTAssertEqual(q.bindings.count, 1)
+        guard case .int(let epoch) = q.bindings[0] else {
+            XCTFail("date predicate must bind as int epoch seconds")
+            return
+        }
+        XCTAssertEqual(epoch, Int64(expected.timeIntervalSince1970))
+    }
+
+    // MARK: — `thread:` field operator
+
+    func testThreadFieldCompilesToSQLPredicate() {
+        let q = compile("thread:42")
+        XCTAssertTrue(q.whereClause.contains("thread_id"))
+        // Two bindings: the synthetic-vs-real match emits the rowid twice.
+        XCTAssertEqual(q.bindings.count, 2)
+        for b in q.bindings {
+            guard case .int(let v) = b else {
+                XCTFail()
+                return
+            }
+            XCTAssertEqual(v, 42)
+        }
+    }
+
+    func testThreadCombinesWithBodySearch() {
+        // The whole point of the operator: "find the message in this
+        // thread where N is mentioned." Compiles to a mixed SQL/FTS shape.
+        let q = compile("thread:42 body:invoice")
+        XCTAssertTrue(q.whereClause.contains("thread_id"))
+        XCTAssertTrue(q.whereClause.contains("messages_fts MATCH"))
+    }
+
+    // MARK: — Address / domain tokenisation
+
+    func testFromDomainStyleSplitsOnDot() {
+        // `from:savills.com` should AND tokens [savills, com] against the
+        // sender column so it hits any @savills.com address.
+        let q = compile("from:savills.com")
+        let expr = ftsExpression(q)
+        XCTAssertTrue(expr.contains("{sender}"))
+        XCTAssertTrue(expr.contains("savills*"))
+        XCTAssertTrue(expr.contains("com*"))
+        XCTAssertTrue(expr.contains(" AND "))
+    }
+
+    func testFromFullAddressSplitsOnAt() {
+        let q = compile("from:james@savills.com")
+        let expr = ftsExpression(q)
+        XCTAssertTrue(expr.contains("james*"))
+        XCTAssertTrue(expr.contains("savills*"))
+        XCTAssertTrue(expr.contains("com*"))
+    }
+
+    func testFromSingleWordKeepsPrefixForm() {
+        // Single-token values stay as the pre-fix `{col}: token*` shape
+        // (no parens, no AND) — matches the documented "prefix match" behaviour.
+        let q = compile("from:james")
+        let expr = ftsExpression(q)
+        XCTAssertTrue(expr.contains("{sender}: james*"))
+        XCTAssertFalse(expr.contains(" AND "))
+    }
+
     // MARK: — Integration: compiled query actually runs
 
     /// Same shape as the regression query but executed against a real

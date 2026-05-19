@@ -113,7 +113,8 @@ extension IndexDB {
         SELECT m.apple_rowid,
                COALESCE(mb.path, '') AS mailbox_path,
                CASE WHEN m.thread_id = 0 THEN m.apple_rowid ELSE m.thread_id END AS thread_id,
-               m.has_attachment
+               m.has_attachment,
+               m.body_indexed
         FROM messages m
         LEFT JOIN mailboxes mb ON mb.apple_rowid = m.mailbox_rowid
         WHERE m.apple_rowid IN (\(placeholders))
@@ -130,7 +131,17 @@ extension IndexDB {
             let path = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
             let tid = Int(sqlite3_column_int64(stmt, 2))
             let hasA = sqlite3_column_int(stmt, 3) != 0
-            out[rowid] = MCPMessageEnrichment(mailboxPath: path, threadId: tid, hasAttachment: hasA)
+            // `body_indexed` is set to 1 by BodyIndexer once the `.emlx`
+            // has been parsed. Used as a proxy for "body fetch will
+            // succeed without a Mail.app IMAP round-trip" — surfaced as
+            // `body_on_disk` in MCP result shapes.
+            let bodyOnDisk = sqlite3_column_int(stmt, 4) != 0
+            out[rowid] = MCPMessageEnrichment(
+                mailboxPath: path,
+                threadId: tid,
+                hasAttachment: hasA,
+                bodyOnDisk: bodyOnDisk
+            )
         }
         return out
     }
@@ -256,4 +267,5 @@ struct MCPMessageEnrichment: Sendable, Hashable {
     let mailboxPath: String
     let threadId: Int
     let hasAttachment: Bool
+    let bodyOnDisk: Bool
 }

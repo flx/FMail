@@ -180,7 +180,7 @@ final class MCPTests: XCTestCase {
     func testFindUnansweredThreadsReturnsSchoolThread() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         // Two-day window covers both messages.
         let result = try await MCPHandlers.findUnansweredThreads(
@@ -200,7 +200,7 @@ final class MCPTests: XCTestCase {
     func testFindUnansweredThreadsHonorsSinceFilter() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         // Tomorrow as `since` → nothing is unanswered yet (the latest outgoing
         // message is yesterday, < tomorrow).
@@ -216,7 +216,7 @@ final class MCPTests: XCTestCase {
     func testFindUnansweredThreadsOurAddressMustMatchAccountSender() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         // anna isn't one of our outgoing senders.
         let result = try await MCPHandlers.findUnansweredThreads(
@@ -231,115 +231,14 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(threads.count, 0)
     }
 
-    func testMarkReadHandlerInvokesThunk() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-
-        actor Recorder {
-            var calls: [(rowids: [Int], isRead: Bool)] = []
-            func record(_ rowids: [Int], _ isRead: Bool) { calls.append((rowids, isRead)) }
-            func count() -> Int { calls.count }
-            func first() -> (rowids: [Int], isRead: Bool)? { calls.first }
-        }
-        let recorder = Recorder()
-        let thunk: MCPMarkReadHandler = { rowids, isRead in
-            await recorder.record(rowids, isRead)
-            return (applied: rowids.count, error: nil)
-        }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: thunk)
-
-        let result = try await MCPHandlers.markRead(
-            .object([
-                "rowids": .array([.int(Int64(fixture.schoolReplyRowId))]),
-                "is_read": .bool(true)
-            ]),
-            context: context
-        )
-        let payload = try roundTrip(result)
-        XCTAssertEqual(payload["applied"] as? Int, 1)
-        XCTAssertNil(payload["error"] as? String)
-        let captured = await recorder.first()
-        XCTAssertEqual(captured?.rowids, [fixture.schoolReplyRowId])
-        XCTAssertEqual(captured?.isRead, true)
-    }
-
-    func testMarkReadWithoutThunkReturnsIndexNotReady() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
-
-        do {
-            _ = try await MCPHandlers.markRead(
-                .object(["rowids": .array([.int(123)])]),
-                context: context
-            )
-            XCTFail("expected error")
-        } catch let payload as JSONRPCErrorPayload {
-            XCTAssertEqual(payload.code, JSONRPCErrorCode.indexNotReady)
-        } catch {
-            XCTFail("wrong error type: \(error)")
-        }
-    }
-
-    func testMarkReadEmptyRowidsReturnsZero() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let thunk: MCPMarkReadHandler = { _, _ in (0, nil) }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: thunk)
-
-        let result = try await MCPHandlers.markRead(
-            .object(["rowids": .array([])]),
-            context: context
-        )
-        let payload = try roundTrip(result)
-        XCTAssertEqual(payload["applied"] as? Int, 0)
-    }
-
     // MARK: — End-to-end: tools/list registration
 
-    /// `delete_messages` must warn the LLM that Gmail reassigns rowids on
-    /// move, so original rowids are stale after success. Verifying by
-    /// querying the old rowid is wrong; query by sender+subject instead.
-    /// (Regression guard: we discovered this the hard way after the LLM
-    /// kept reporting "delete didn't take" when it actually had.)
-    func testDeleteMessagesDescriptionWarnsAboutRowidReassignment() async throws {
+    func testToolsListReturnsAllReadToolsAfterRegistration() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
         let dispatcher = MCPDispatcher()
-        let context = MCPContext(
-            indexDB: fixture.db, bodyLoader: fixture.bodyLoader,
-            deleteHandler: { _ in (0, nil) }
-        )
-        await MCPTools.registerMoveTools(on: dispatcher, context: context)
-
-        let body = Data(#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.utf8)
-        let result = await dispatcher.dispatch(rawBody: body)
-        guard case .response(let data) = result else {
-            return XCTFail("expected response, got \(result)")
-        }
-        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let tools = try XCTUnwrap(((json["result"] as? [String: Any])?["tools"]) as? [[String: Any]])
-        let deleteDesc = try XCTUnwrap(tools.first(where: { ($0["name"] as? String) == "delete_messages" })?["description"] as? String)
-
-        XCTAssertTrue(deleteDesc.lowercased().contains("reassign"), "must warn the LLM about Gmail rowid reassignment on delete-to-Trash")
-        XCTAssertTrue(deleteDesc.contains("search_emails"), "must steer the LLM toward search_emails for verification")
-    }
-
-    func testToolsListReturnsAllToolsAfterFullRegistration() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let dispatcher = MCPDispatcher()
-        let markRead: MCPMarkReadHandler = { _, _ in (0, nil) }
-        let move: MCPMoveHandler = { _ in (0, nil) }
-        let context = MCPContext(
-            indexDB: fixture.db,
-            bodyLoader: fixture.bodyLoader,
-            markReadHandler: markRead,
-            deleteHandler: move
-        )
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
         await MCPTools.registerReadTools(on: dispatcher, context: context)
-        await MCPTools.registerUnansweredAndMarkReadTools(on: dispatcher, context: context)
-        await MCPTools.registerMoveTools(on: dispatcher, context: context)
 
         let names = await dispatcher.registeredToolNames()
         XCTAssertEqual(Set(names), [
@@ -348,95 +247,9 @@ final class MCPTests: XCTestCase {
             "get_thread",
             "get_email",
             "get_attachment",
-            "find_unanswered_threads",
-            "mark_read",
-            "delete_messages"
+            "get_attachments_for_rowids",
+            "find_unanswered_threads"
         ])
-    }
-
-    // MARK: — Phase Move: delete_messages
-
-    func testDeleteMessagesInvokesThunk() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        actor Recorder {
-            var rowids: [Int] = []
-            func record(_ ids: [Int]) { rowids = ids }
-            func get() -> [Int] { rowids }
-        }
-        let recorder = Recorder()
-        let thunk: MCPMoveHandler = { rowids in
-            await recorder.record(rowids)
-            return (rowids.count, nil)
-        }
-        let context = MCPContext(
-            indexDB: fixture.db, bodyLoader: fixture.bodyLoader,
-            deleteHandler: thunk
-        )
-        let result = try await MCPHandlers.deleteMessages(
-            .object(["rowids": .array([.int(Int64(fixture.lunchMessageRowId))])]),
-            context: context
-        )
-        let payload = try roundTrip(result)
-        XCTAssertEqual(payload["applied"] as? Int, 1)
-        XCTAssertNil(payload["error"] as? String)
-        let captured = await recorder.get()
-        XCTAssertEqual(captured, [fixture.lunchMessageRowId])
-    }
-
-    func testDeleteMessagesWithoutThunkThrowsIndexNotReady() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
-
-        do {
-            _ = try await MCPHandlers.deleteMessages(
-                .object(["rowids": .array([.int(1)])]),
-                context: context
-            )
-            XCTFail("expected indexNotReady error")
-        } catch let payload as JSONRPCErrorPayload {
-            XCTAssertEqual(payload.code, JSONRPCErrorCode.indexNotReady)
-        } catch {
-            XCTFail("wrong error type: \(error)")
-        }
-    }
-
-    func testDeleteMessagesEmptyRowidsReturnsZero() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let thunk: MCPMoveHandler = { _ in (99, nil) }  // shouldn't be called
-        let context = MCPContext(
-            indexDB: fixture.db, bodyLoader: fixture.bodyLoader,
-            deleteHandler: thunk
-        )
-        let result = try await MCPHandlers.deleteMessages(
-            .object(["rowids": .array([])]),
-            context: context
-        )
-        let payload = try roundTrip(result)
-        XCTAssertEqual(payload["applied"] as? Int, 0)
-    }
-
-    func testDeleteMessagesRejectsNonIntegerRowids() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let thunk: MCPMoveHandler = { _ in (0, nil) }
-        let context = MCPContext(
-            indexDB: fixture.db, bodyLoader: fixture.bodyLoader,
-            deleteHandler: thunk
-        )
-        do {
-            _ = try await MCPHandlers.deleteMessages(
-                .object(["rowids": .array([.int(1), .string("not-an-int")])]),
-                context: context
-            )
-            XCTFail("expected invalidParams")
-        } catch let payload as JSONRPCErrorPayload {
-            XCTAssertEqual(payload.code, JSONRPCErrorCode.invalidParams)
-        } catch {
-            XCTFail("wrong error type: \(error)")
-        }
     }
 
     // MARK: — End-to-end: bind on port 0, full handshake
@@ -476,7 +289,7 @@ final class MCPTests: XCTestCase {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
 
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
         let result = try await MCPHandlers.searchEmails(
             .object(["query": .string("school")]),
             context: context
@@ -496,7 +309,7 @@ final class MCPTests: XCTestCase {
     func testSearchEmailsHonorsLimit() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         // Match anything from anna; we have 2 such messages in the fixture.
         let result = try await MCPHandlers.searchEmails(
@@ -514,7 +327,7 @@ final class MCPTests: XCTestCase {
     func testSearchEmailsRejectsEmptyQuery() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         do {
             _ = try await MCPHandlers.searchEmails(.object(["query": .string("")]), context: context)
@@ -529,7 +342,7 @@ final class MCPTests: XCTestCase {
     func testListThreadsAllMailboxes() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         let result = try await MCPHandlers.listThreads(.object([:]), context: context)
         let payload = try roundTrip(result)
@@ -540,7 +353,7 @@ final class MCPTests: XCTestCase {
     func testListThreadsUnreadOnly() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         let result = try await MCPHandlers.listThreads(
             .object(["unread_only": .bool(true)]),
@@ -558,7 +371,7 @@ final class MCPTests: XCTestCase {
     func testGetEmailReturnsFullShape() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         let result = try await MCPHandlers.getEmail(
             .object([
@@ -579,7 +392,7 @@ final class MCPTests: XCTestCase {
     func testGetEmailUnknownRowidThrows() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         do {
             _ = try await MCPHandlers.getEmail(.object(["rowid": .int(999999)]), context: context)
@@ -594,7 +407,7 @@ final class MCPTests: XCTestCase {
     func testGetThreadReturnsAllMessages() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader, markReadHandler: nil)
+        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
 
         let result = try await MCPHandlers.getThread(
             .object([

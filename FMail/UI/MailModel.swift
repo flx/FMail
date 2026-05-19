@@ -278,23 +278,10 @@ final class MailModel {
             mcpServer = server
         }
         mcpServerStatus = .starting
-        // Write thunks — each routes through ReadStatusController on
-        // MainActor so the MCP layer doesn't reach across actor boundaries
-        // itself.
-        let markReadHandler: MCPMarkReadHandler = { [weak self] rowids, isRead in
-            guard let self else { return (0, "MailModel deallocated") }
-            return await self.readStatus.setReadStatus(rowids: rowids, isRead: isRead)
-        }
-        let deleteHandler: MCPMoveHandler = { [weak self] rowids in
-            guard let self else { return (0, "MailModel deallocated") }
-            return await self.readStatus.deleteMessages(rowids: rowids)
-        }
-        let context = MCPContext(
-            indexDB: indexDB,
-            bodyLoader: bodyLoader,
-            markReadHandler: markReadHandler,
-            deleteHandler: deleteHandler
-        )
+        // Read-only context — MCP intentionally has no write surface, so
+        // there are no thunks to wire. Mail state changes happen via
+        // FMail's UI or Mail.app directly.
+        let context = MCPContext(indexDB: indexDB, bodyLoader: bodyLoader)
         Task { @MainActor [weak self] in
             // If a previous run is still listening on a different port, stop first.
             if await server.isRunning, await server.port != UInt16(desiredPort) {
@@ -303,8 +290,6 @@ final class MailModel {
             do {
                 let dispatcher = await server.dispatcherForRegistration()
                 await MCPTools.registerReadTools(on: dispatcher, context: context)
-                await MCPTools.registerUnansweredAndMarkReadTools(on: dispatcher, context: context)
-                await MCPTools.registerMoveTools(on: dispatcher, context: context)
                 try await server.start(port: desiredPort)
                 let p = await server.port
                 self?.mcpServerStatus = .running(port: p)

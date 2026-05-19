@@ -8,28 +8,19 @@ import Foundation
 /// pragmatic, not poetic. The `search_emails` description embeds the FMail
 /// DSL grammar so the LLM can compose queries without external knowledge.
 enum MCPTools {
-    /// Register Phase A2 read tools. Phase A3 also calls
-    /// `registerUnansweredAndMarkReadTools`.
+    /// Register the read-only MCP tools. By design the surface is
+    /// non-destructive — Mail state changes happen through FMail's UI
+    /// (or Mail.app directly), never through MCP. That makes it safe to
+    /// expose the connector over a public tunnel: the worst an attacker
+    /// who got past the bearer token could do is read mail.
     static func registerReadTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
         await dispatcher.register(searchEmailsTool(context: context))
         await dispatcher.register(listThreadsTool(context: context))
         await dispatcher.register(getThreadTool(context: context))
         await dispatcher.register(getEmailTool(context: context))
         await dispatcher.register(getAttachmentTool(context: context))
-    }
-
-    /// Register `find_unanswered_threads` and `mark_read`. Call this only
-    /// after the context has its `markReadHandler` set; otherwise `mark_read`
-    /// will return an error to every caller.
-    static func registerUnansweredAndMarkReadTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
+        await dispatcher.register(getAttachmentsForRowidsTool(context: context))
         await dispatcher.register(findUnansweredTool(context: context))
-        await dispatcher.register(markReadTool(context: context))
-    }
-
-    /// Register `delete_messages`. Invokes AppleScript on Mail.app, so the
-    /// same timeout caveat as `mark_read` applies — keep batches small.
-    static func registerMoveTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
-        await dispatcher.register(deleteMessagesTool(context: context))
     }
 
     // MARK: — search_emails
@@ -176,20 +167,28 @@ enum MCPTools {
             name: "get_attachment",
             description: """
             Fetch one attachment's bytes by message rowid + 0-based index.
-            Returns `name`, `content_type`, `byte_count`, `data_base64`
-            (post-MIME-decode raw bytes, base64-encoded), and `truncated`
-            (true if `max_bytes` was below `byte_count` — re-call with a
-            larger cap if you need the rest).
+            Two output modes:
 
-            Get the index from `get_email` / `get_thread`'s `attachments`
-            array (same order). PDFs, images, and other binary types come
-            back exactly as the sender attached them — decode the base64 to
-            recover the original file.
+            **`save_to_path` (recommended for binary)** — the server writes
+            the decoded bytes directly to that filesystem path and the
+            response contains only `{rowid, attachment_index, name,
+            content_type, byte_count, saved_path}`. No base64 round-trip,
+            no per-call size cap, no truncation. Use this for any PDF /
+            image / archive — base64-in-JSON tends to push anything
+            above ~150 KB past MCP-client result-size caps. The path may
+            start with `~` (expanded to your home) or be relative
+            (resolved against your home). Missing parent directories are
+            created.
 
-            Default cap is 10 MB (raw); base64 inflates payload ~33%. The
-            body must be on disk (Mail.app must have downloaded the message
-            at least once). If not, the call errors — opening the message
-            in Mail.app once triggers the IMAP fetch.
+            **No `save_to_path`** — bytes returned in `data_base64`, capped
+            by `max_bytes` (default 10 MB). Convenient for small text /
+            JSON attachments; awkward for binaries.
+
+            Get the attachment index from `get_email` / `get_thread`'s
+            `attachments` array (same order). The body must be on disk
+            (check `body_on_disk` on the search result row); if not, the
+            call errors and the user has to open the message in Mail.app
+            once to trigger an IMAP fetch.
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -200,16 +199,61 @@ enum MCPTools {
                         "minimum": .int(0),
                         "description": .string("0-based index into the attachments array returned by get_email / get_thread.")
                     ]),
+                    "save_to_path": .object([
+                        "type": .string("string"),
+                        "description": .string("Filesystem path to write the decoded bytes to. Tilde-expanded; relative paths are resolved against $HOME. When set, the response omits data_base64 and includes saved_path. Recommended for any non-trivial binary.")
+                    ]),
                     "max_bytes": .object([
                         "type": .string("integer"),
                         "minimum": .int(0),
                         "default": .int(10_000_000),
-                        "description": .string("Cap on raw (pre-base64) bytes returned. Larger attachments come back with truncated=true.")
+                        "description": .string("Only used when save_to_path is unset. Cap on raw (pre-base64) bytes returned. Larger attachments come back with truncated=true.")
                     ])
                 ]),
                 "required": .array([.string("rowid"), .string("attachment_index")])
             ]),
             handler: { args in try await MCPHandlers.getAttachment(args, context: context) }
+        )
+    }
+
+    // MARK: — get_attachments_for_rowids (bulk)
+
+    private static func getAttachmentsForRowidsTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "get_attachments_for_rowids",
+            description: """
+            Bulk variant of `get_attachment` for fan-out workflows
+            (e.g. "pull every invoice attachment from these 8 messages").
+            Writes every attachment of every supplied rowid into
+            `save_dir`, one subdirectory per rowid:
+
+              <save_dir>/<rowid>/<original_filename>
+
+            Returns `{saved: [...], errors: [...]}`. Each `saved` row has
+            `{rowid, attachment_index, name, content_type, byte_count,
+            saved_path}`. Each `errors` row has `{rowid, attachment_index,
+            error}` and means *that message* (or that one attachment)
+            couldn't be fetched — the rest of the batch keeps going.
+
+            `save_dir` may start with `~` (expanded to your home) or be
+            relative (resolved against $HOME). Created if missing.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "rowids": .object([
+                        "type": .string("array"),
+                        "items": .object(["type": .string("integer")]),
+                        "description": .string("Apple Mail rowids — usually the output of `search_emails`. Messages without attachments contribute nothing to the result.")
+                    ]),
+                    "save_dir": .object([
+                        "type": .string("string"),
+                        "description": .string("Directory under which the per-rowid subdirectories will be created.")
+                    ])
+                ]),
+                "required": .array([.string("rowids"), .string("save_dir")])
+            ]),
+            handler: { args in try await MCPHandlers.getAttachmentsForRowids(args, context: context) }
         )
     }
 
@@ -251,88 +295,6 @@ enum MCPTools {
         )
     }
 
-    // MARK: — mark_read
-
-    private static func markReadTool(context: MCPContext) -> MCPTool {
-        MCPTool(
-            name: "mark_read",
-            description: """
-            Mark messages read or unread by rowid. Routes through the same
-            pipeline FMail's UI uses: optimistic flip + DB persist + AppleScript
-            dispatch to Mail.app.
-
-            Bound: keep batches ≤ ~50 messages. Mail.app linearly scans
-            per-mailbox messages by `whose id is N`; 100+ messages across
-            multiple Gmail accounts can take 30s+ and may exceed your client's
-            HTTP timeout. The work may still complete on Mail.app's side even
-            if the call times out — re-call with the same rowids to confirm.
-
-            Returns `applied` (count Mail.app matched) and `error` (string when
-            the AppleScript dispatch failed).
-            """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "rowids": .object([
-                        "type": .string("array"),
-                        "items": .object(["type": .string("integer")]),
-                        "description": .string("Apple Mail rowids — get them from search_emails / get_thread results.")
-                    ]),
-                    "is_read": .object([
-                        "type": .string("boolean"),
-                        "default": .bool(true),
-                        "description": .string("true to mark read, false to mark unread.")
-                    ])
-                ]),
-                "required": .array([.string("rowids")])
-            ]),
-            handler: { args in try await MCPHandlers.markRead(args, context: context) }
-        )
-    }
-
-    // MARK: — delete_messages
-
-    private static func deleteMessagesTool(context: MCPContext) -> MCPTool {
-        MCPTool(
-            name: "delete_messages",
-            description: """
-            Delete messages by rowid — Mail.app moves them to the Trash
-            mailbox of the relevant account, matching the Delete key in
-            Mail.app's UI. Reversible from Trash.
-
-            **VERIFYING THE DELETE — IMPORTANT.** Gmail (and most IMAP
-            servers) reassigns the rowid when the message moves to Trash.
-            The original rowid is invalid after success.
-
-            ✗ Do NOT verify by `get_email {rowid: <original>}`.
-            ✓ DO verify by `search_emails {query: "from:<sender>
-              subject:<subj>"}` showing fewer matches in the source mailbox
-              after a 5–10s delay (FMail triggers an index sync immediately
-              after a successful delete).
-
-            Same time-bound caveat as `mark_read`: keep batches ≤ ~5 to
-            avoid client HTTP timeouts. The work may still complete on
-            Mail.app's side after a timeout — re-call is safe (no-op if
-            already deleted).
-
-            Returns `applied` (count Mail.app matched) and `error` (string
-            when AppleScript dispatch failed).
-            """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "rowids": .object([
-                        "type": .string("array"),
-                        "items": .object(["type": .string("integer")]),
-                        "description": .string("Apple Mail rowids — get them from search_emails / get_thread results.")
-                    ])
-                ]),
-                "required": .array([.string("rowids")])
-            ]),
-            handler: { args in try await MCPHandlers.deleteMessages(args, context: context) }
-        )
-    }
-
     // MARK: — search_emails description (the LLM-visible DSL grammar)
 
     private static let searchEmailsDescription: String = """
@@ -344,7 +306,7 @@ enum MCPTools {
     Operators: AND (implicit), OR, NOT or `-`, parentheses, "quoted phrases".
 
     Field operators (each takes a single value or a quoted phrase):
-      from:       sender address or display name
+      from:       sender address or display name (supports domain match)
       to:         recipient address or display name
       cc:         cc recipient
       subject:    subject line
@@ -352,6 +314,9 @@ enum MCPTools {
       attachment: attachment filename
       account:    account display name (e.g. "icloud", "gmail")
       in:         mailbox kind ("inbox", "sent", "archive", "all", or any path)
+      thread:     numeric thread_id (from previous search/get_thread results) —
+                  narrows to one conversation. Combine with body:/from:/etc. to
+                  grep within a thread.
       has:        "attachment" only
       is:         "read", "unread", "flagged"
       before:     date — see DATE FORMS
@@ -361,6 +326,14 @@ enum MCPTools {
     Bareword tokens match anywhere (subject + body + sender + recipients).
 
     No-colon shortcuts: hasattachment, isunread, isread, isflagged.
+
+    ADDRESS / DOMAIN MATCHING
+    -------------------------
+    Values for `from:`/`to:`/`cc:`/`attachment:` are split on non-alphanumeric
+    chars before searching, so `from:savills.com` matches any sender with
+    "savills" AND "com" in their address column (i.e. all @savills.com
+    addresses). `from:james@savills.com` ANDs four tokens. This catches
+    senders even though FTS5 tokenises email addresses by `@` and `.`.
 
     DATE FORMS
     ----------
@@ -373,9 +346,14 @@ enum MCPTools {
     DATE SEMANTICS
     --------------
       before:DATE    < start of period containing DATE
-      after:DATE     for partial dates: >= start of NEXT period (so after:2024 is >= 2025-01-01)
-                     for full dates: >= DATE (Gmail-style inclusive)
+                     (so `before:2025` is `< 2025-01-01`)
+      after:DATE     >= start of period containing DATE — INCLUSIVE
+      since:DATE     synonym for after:
+                     (so `after:2024` is `>= 2024-01-01`,
+                      `after:2024-03` is `>= 2024-03-01`,
+                      `after:2024-03-15` is `>= 2024-03-15`)
       during:/on:    [start, start of next period) — matches the precision of DATE
+                     (so `during:2024-03` is all of March 2024)
 
     Bareword search and field values match by token PREFIX
     (e.g. `subject:v` matches "vermont"). Quote for exact match: "vermont".
@@ -383,8 +361,10 @@ enum MCPTools {
     EXAMPLES
     --------
       from:anna school trip
+      from:savills.com (matches any savills.com sender)
       from:anna@gmail.com after:2024-01
       to:me from:bank invoice
+      thread:1234 body:"550k"            (grep within a conversation)
       (anna OR kyoko) school -homework
       "exact phrase" has:attachment
       isunread last 7d
@@ -401,7 +381,9 @@ enum MCPTools {
     - Body content is searchable as it gets indexed in the background; a
       very recent message may not match by body text yet, but always matches
       by subject/sender/recipient/attachment-name immediately.
-    - Returns subject, sender, dates, mailbox path, thread_id, has_attachment,
-      is_read, is_flagged. Call `get_email` to read body content.
+    - Each result row has `body_on_disk:true|false`. False means the .emlx
+      hasn't been fetched yet — `get_email` / `get_attachment` may fail
+      until the user opens the message in Mail.app once. Prefer rows with
+      body_on_disk:true when there's a choice.
     """
 }

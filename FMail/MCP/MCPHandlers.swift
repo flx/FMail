@@ -2,35 +2,17 @@ import Foundation
 
 /// Dependencies an MCP handler needs. The shape stays small so handlers
 /// don't reach into MainActor-only state — everything they touch is actor-
-/// isolated and Sendable.
+/// isolated and Sendable. The MCP surface is read-only by design; there
+/// are no write thunks here.
 struct MCPContext: Sendable {
     let indexDB: IndexDB
     let bodyLoader: BodyLoader
-    /// Optional write thunks. Nil means the matching tool is unavailable.
-    let markReadHandler: MCPMarkReadHandler?
-    let deleteHandler: MCPMoveHandler?
 
-    init(
-        indexDB: IndexDB,
-        bodyLoader: BodyLoader,
-        markReadHandler: MCPMarkReadHandler? = nil,
-        deleteHandler: MCPMoveHandler? = nil
-    ) {
+    init(indexDB: IndexDB, bodyLoader: BodyLoader) {
         self.indexDB = indexDB
         self.bodyLoader = bodyLoader
-        self.markReadHandler = markReadHandler
-        self.deleteHandler = deleteHandler
     }
 }
-
-/// `@Sendable` thunk that performs `mark_read` on behalf of the MCP handler,
-/// returning the count applied and an optional error string. Wired in
-/// MailModel.applyMCPSettings so the MCP layer doesn't need to know about
-/// MainActor / ReadStatusController directly.
-typealias MCPMarkReadHandler = @Sendable (_ rowids: [Int], _ isRead: Bool) async -> (applied: Int, error: String?)
-
-/// `@Sendable` thunk for `delete_messages`.
-typealias MCPMoveHandler = @Sendable (_ rowids: [Int]) async -> (applied: Int, error: String?)
 
 /// One async function per tool. Each validates input, calls into context,
 /// and returns a JSON tree that the dispatcher will JSON-encode into the
@@ -80,7 +62,8 @@ enum MCPHandlers {
                 is_read: m.isRead,
                 is_flagged: m.isFlagged,
                 has_attachment: e?.hasAttachment ?? false,
-                thread_id: e?.threadId ?? m.rowId
+                thread_id: e?.threadId ?? m.rowId,
+                body_on_disk: e?.bodyOnDisk ?? false
             )
         }
         return try JSONValue.encoding(SearchEmailsResult(results: refs))
@@ -179,15 +162,22 @@ enum MCPHandlers {
         return try JSONValue.encoding(one)
     }
 
-    // (find_unanswered_threads and mark_read live in MCPHandlers+A3.swift,
-    //  added in Phase A3 once the SQL helper and write thunk exist.)
+    // (find_unanswered_threads lives in MCPHandlers+A3.swift.)
 
     // MARK: — Internals
 
     /// Build `EmailFull` for each message, optionally fetching bodies.
     /// Looks up each message's home mailbox individually (Gmail labels can
     /// put thread members in different mailboxes).
-    private static func buildEmailFulls(
+    ///
+    /// `maxBodyChars` semantics:
+    ///   0  → headers + attachment list only, plain_text_body is empty
+    ///        (still triggers a body load to enumerate attachments)
+    ///   N  → truncate plain text to N chars; `plain_text_truncated`
+    ///        indicates whether content was cut
+    /// `includeBodies=false` skips body parsing entirely (no attachments
+    /// list, no plainText). Cheapest option for summary listings.
+    static func buildEmailFulls(
         for messages: [MessageHeader],
         includeBodies: Bool,
         maxBodyChars: Int,
@@ -226,7 +216,10 @@ enum MCPHandlers {
                     let displayText = body.displayText
                     fullChars = displayText.count
                     htmlPresent = body.html != nil && !(body.html ?? "").isEmpty
-                    if maxBodyChars > 0 && displayText.count > maxBodyChars {
+                    if maxBodyChars == 0 {
+                        plainText = ""
+                        truncated = displayText.count > 0
+                    } else if displayText.count > maxBodyChars {
                         plainText = String(displayText.prefix(maxBodyChars))
                         truncated = true
                     } else {
@@ -261,6 +254,7 @@ enum MCPHandlers {
                 is_read: m.isRead,
                 is_flagged: m.isFlagged,
                 rfc_message_id: m.rfcMessageId,
+                body_on_disk: e?.bodyOnDisk ?? false,
                 plain_text_body: plainText,
                 plain_text_truncated: truncated,
                 plain_text_full_chars: fullChars,

@@ -1,8 +1,7 @@
 import Foundation
 
-/// Phase A3 handlers — `find_unanswered_threads` (read-only) and `mark_read`
-/// (writes via `ReadStatusController`'s awaitable variant). Lives separately
-/// from `MCPHandlers.swift` so the read tools stay self-contained.
+/// `find_unanswered_threads` — threads where the user sent the latest
+/// message and hasn't heard back. Read-only.
 extension MCPHandlers {
 
     static func findUnansweredThreads(_ args: JSONValue, context: MCPContext) async throws -> JSONValue {
@@ -25,40 +24,9 @@ extension MCPHandlers {
         )
         return try JSONValue.encoding(FindUnansweredThreadsResult(threads: rows))
     }
-
-    static func markRead(_ args: JSONValue, context: MCPContext) async throws -> JSONValue {
-        guard let obj = args.objectValue,
-              let rowidsRaw = obj["rowids"]?.arrayValue
-        else {
-            throw JSONRPCErrorPayload(
-                code: JSONRPCErrorCode.invalidParams,
-                message: "mark_read: `rowids` (array of integers) is required"
-            )
-        }
-        let rowids = rowidsRaw.compactMap { $0.intValue }
-        guard rowids.count == rowidsRaw.count else {
-            throw JSONRPCErrorPayload(
-                code: JSONRPCErrorCode.invalidParams,
-                message: "mark_read: `rowids` must contain integers only"
-            )
-        }
-        guard !rowids.isEmpty else {
-            return try JSONValue.encoding(MarkReadResult(applied: 0, error: nil))
-        }
-        let isRead = obj["is_read"]?.boolValue ?? true
-
-        guard let handler = context.markReadHandler else {
-            throw JSONRPCErrorPayload(
-                code: JSONRPCErrorCode.indexNotReady,
-                message: "mark_read: write thunk not wired (FMail UI may not be loaded)"
-            )
-        }
-        let result = await handler(rowids, isRead)
-        return try JSONValue.encoding(MarkReadResult(applied: result.applied, error: result.error))
-    }
 }
 
-// Re-declared local so the A3 file doesn't need to widen visibility on
+// Re-declared local so this file doesn't need to widen visibility on
 // the helpers in MCPHandlers.swift. Tiny duplication is cheaper than a
 // public surface.
 

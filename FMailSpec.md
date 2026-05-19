@@ -394,24 +394,27 @@ If Mac v1 isn't hitting daily-use bar, do not start the iOS phases.
 
 When FMail is running, an opt-in HTTP/JSON-RPC server on `127.0.0.1:8765` exposes the index to MCP clients (Claude Code, etc.). The point is to leverage what FMail already builds — schema-versioned SQLite, FTS5, the DSL, threading, contact prefs — so an LLM can triage email without parsing `.emlx` itself or pulling the whole index into context. See [MCP_PLAN.md](MCP_PLAN.md) for the full design.
 
-Eight tools, two writes:
+**Seven tools, all read-only.** The MCP surface is deliberately non-destructive — Mail state changes happen via FMail's UI (or Mail.app directly), never through MCP. Makes the connector safe to expose over a public tunnel; worst-case an attacker who got past the bearer token can read mail, not delete or mark it.
 
-| Tool | Kind | Purpose |
-|---|---|---|
-| `search_emails` | read | DSL-driven search; description embeds the full §6.2 grammar so the LLM can compose queries without external knowledge. |
-| `list_threads` | read | Thread summaries (mailbox-scoped or All Mailboxes). |
-| `get_thread` | read | All messages in a thread, oldest-first, with body text and attachment metadata. |
-| `get_email` | read | One message by rowid; same shape as a `get_thread` row. |
-| `get_attachment` | read | Raw attachment bytes (base64-encoded, post-MIME-decode) by rowid + 0-based index. 10 MB default cap; `truncated=true` if the cap was exceeded. Resolves the on-disk `Attachments/<rowid>/<partIdx>/<filename>` store transparently (see §5.1). |
-| `find_unanswered_threads` | read | Threads where the user sent the latest message and hasn't heard back. |
-| `mark_read` | write | Mark / unmark by rowid via AppleScript; optimistic in-memory flip + DB write, then `MailScripter.setReadStatusBatch`. |
-| `delete_messages` | write | Move to Trash via AppleScript; optimistic removal from in-memory views + DB, then `MailScripter.deleteBatch`. Sync reconciles on AppleScript failure. |
+| Tool | Purpose |
+|---|---|
+| `search_emails` | DSL-driven search; description embeds the full §6.2 grammar so the LLM can compose queries without external knowledge. Returns `body_on_disk` per row so callers can avoid rows that would require an IMAP fetch. |
+| `list_threads` | Thread summaries (mailbox-scoped or All Mailboxes). |
+| `get_thread` | All messages in a thread, oldest-first, with body text and attachment metadata. `max_body_chars=0` skips body content and returns headers + attachments only — a workable "summaries first, drill down on the interesting messages" pattern. |
+| `get_email` | One message by rowid; same shape as a `get_thread` row. |
+| `get_attachment` | One attachment's bytes by rowid + 0-based index. Two modes: when `save_to_path` is supplied, the server writes the decoded bytes to disk and returns metadata + `saved_path` (no payload-size cap); otherwise returns `data_base64` (default 10 MB cap, base64 inflates ~33%). Resolves Mail.app's external `Attachments/<rowid>/<partIdx>/<filename>` store transparently (see §5.1). |
+| `get_attachments_for_rowids` | Bulk variant — fans out across `rowids[]`, writes every attachment to `save_dir/<rowid>/<filename>`. Returns `{saved: [...], errors: [...]}` so a single missing-on-disk body doesn't fail the batch. Designed for "pull every invoice attachment from these 12 messages" workflows. |
+| `find_unanswered_threads` | Threads where the user sent the latest message and hasn't heard back. |
 
-Both write tools route through `ReadStatusController`, which now performs **optimistic DB-level removal** (`IndexDB.deleteMessagesByRowid` for delete; `setIsReadBatch` for mark-read) in the same MainActor task as the in-memory updates. So a follow-up MCP read or a UI navigation reflects the post-delete state without waiting for the FSEvent-driven sync. If AppleScript fails, the next sync re-upserts the rows from Apple's still-intact index. `bulkActionError` still surfaces in the FMail UI on dispatch failure.
+Previously-shipped write tools (`mark_read`, `delete_messages`, `move_to_junk`, `diagnose_junk_mailboxes`) have all been removed. Mark-read functionality still works through FMail's UI; delete/junk are out of scope per §12 Phase 5.
 
-`move_to_junk` and the diagnostic `diagnose_junk_mailboxes` were previously exposed; both were removed when the writeback layer was dropped (see §12 Phase 5).
+DSL features pulled in from real-world MCP usage (see CLAUDE-MCP-FEEDBACK section in [MCP_PLAN.md](MCP_PLAN.md) if/when written up):
 
-Locked decisions: hand-rolled JSON-RPC + minimal HTTP framing on `Network.framework` (no SDK dep); off by default with an explicit privacy banner; loopback only (`requiredInterfaceType = .loopback`); a single bundled DSL string for `search_emails` rather than a structured-params second tool. `mark_read` and `delete_messages` synchronously wait for Mail.app's AppleScript dispatch — tool descriptions tell the LLM to keep batches small (~50 for mark_read, ≤5 for delete) to avoid client timeouts; SSE/streaming progress is deferred until usage demands it.
+- **`after:` is inclusive of the period start** for every granularity — `after:2024` is `>= 2024-01-01`, matching Gmail's behaviour. (Previously `after:2024` meant `>= 2025-01-01`, which surprised every user and LLM that came in expecting Gmail semantics.)
+- **`thread:<id>` field operator** — narrows to one conversation. Combine with `body:` to grep within a thread (`thread:1234 body:"550k"`).
+- **Address / domain matching** for `from:` / `to:` / `cc:` / `attachment:` values: FMail tokenises the value on non-alphanumerics so `from:savills.com` ANDs `[savills, com]` against the sender column — hits any `@savills.com` sender even though FTS5 indexed the address as separate tokens at `@` and `.` boundaries.
+
+Locked decisions: hand-rolled JSON-RPC + minimal HTTP framing on `Network.framework` (no SDK dep); off by default with an explicit privacy banner; loopback only (`requiredInterfaceType = .loopback`); a single bundled DSL string for `search_emails` rather than a structured-params second tool. No SSE/streaming progress; not needed once every tool is bounded and read-only.
 
 **Bearer-token auth (opt-in).** `MCPSettings.authToken` (32-byte random, base64url-encoded, persisted in `UserDefaults`). When non-empty, every `POST /mcp` must include `Authorization: Bearer <token>` or it's rejected at HTTP 401 before the dispatcher runs. Constant-time compare. `GET /mcp` (server-info probe) stays unauthenticated for `curl` sanity checks. When the token is empty, current behaviour is unchanged (loopback-only, no auth) — friction-free for local Claude Code on the same Mac. The token is the precondition for the Cloudflare tunnel toggle below: the UI refuses to open the tunnel until a token is set.
 
