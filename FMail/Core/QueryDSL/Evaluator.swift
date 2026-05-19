@@ -153,10 +153,12 @@ enum Evaluator {
         guard !nonEmpty.isEmpty else { return .empty }
         if nonEmpty.count == 1 { return nonEmpty[0] }
 
-        // Fast path: all-text → fuse into one FTS expression. FTS5 treats
-        // space-separated terms as implicit AND.
+        // Fast path: all-text → fuse into one FTS expression. Use explicit
+        // AND: FTS5's implicit-AND grammar breaks when an operand is a
+        // parenthesized subexpression (e.g. `(a OR b) {col}: c*` is a syntax
+        // error, but `(a OR b) AND {col}: c*` parses fine).
         if let texts = allText(nonEmpty) {
-            return .text(texts.joined(separator: " "))
+            return .text(texts.joined(separator: " AND "))
         }
 
         // Mixed: convert each branch to SQL form, AND them.

@@ -15,6 +15,7 @@ enum MCPTools {
         await dispatcher.register(listThreadsTool(context: context))
         await dispatcher.register(getThreadTool(context: context))
         await dispatcher.register(getEmailTool(context: context))
+        await dispatcher.register(getAttachmentTool(context: context))
     }
 
     /// Register `find_unanswered_threads` and `mark_read`. Call this only
@@ -25,19 +26,10 @@ enum MCPTools {
         await dispatcher.register(markReadTool(context: context))
     }
 
-    /// Register `delete_messages` and `move_to_junk`. Both invoke
-    /// AppleScript on Mail.app, so the same timeout caveat as `mark_read`
-    /// applies — keep batches small.
+    /// Register `delete_messages`. Invokes AppleScript on Mail.app, so the
+    /// same timeout caveat as `mark_read` applies — keep batches small.
     static func registerMoveTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
         await dispatcher.register(deleteMessagesTool(context: context))
-        await dispatcher.register(moveToJunkTool(context: context))
-    }
-
-    /// Register `diagnose_junk_mailboxes`. Read-only, no inputs — useful
-    /// when move_to_junk doesn't take effect, to confirm what Mail.app
-    /// reports as the junk mailbox per account.
-    static func registerDiagnosticTools(on dispatcher: MCPDispatcher, context: MCPContext) async {
-        await dispatcher.register(diagnoseJunkMailboxesTool(context: context))
     }
 
     // MARK: — search_emails
@@ -177,6 +169,50 @@ enum MCPTools {
         )
     }
 
+    // MARK: — get_attachment
+
+    private static func getAttachmentTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "get_attachment",
+            description: """
+            Fetch one attachment's bytes by message rowid + 0-based index.
+            Returns `name`, `content_type`, `byte_count`, `data_base64`
+            (post-MIME-decode raw bytes, base64-encoded), and `truncated`
+            (true if `max_bytes` was below `byte_count` — re-call with a
+            larger cap if you need the rest).
+
+            Get the index from `get_email` / `get_thread`'s `attachments`
+            array (same order). PDFs, images, and other binary types come
+            back exactly as the sender attached them — decode the base64 to
+            recover the original file.
+
+            Default cap is 10 MB (raw); base64 inflates payload ~33%. The
+            body must be on disk (Mail.app must have downloaded the message
+            at least once). If not, the call errors — opening the message
+            in Mail.app once triggers the IMAP fetch.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "rowid": .object(["type": .string("integer")]),
+                    "attachment_index": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(0),
+                        "description": .string("0-based index into the attachments array returned by get_email / get_thread.")
+                    ]),
+                    "max_bytes": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(0),
+                        "default": .int(10_000_000),
+                        "description": .string("Cap on raw (pre-base64) bytes returned. Larger attachments come back with truncated=true.")
+                    ])
+                ]),
+                "required": .array([.string("rowid"), .string("attachment_index")])
+            ]),
+            handler: { args in try await MCPHandlers.getAttachment(args, context: context) }
+        )
+    }
+
     // MARK: — find_unanswered_threads
 
     private static func findUnansweredTool(context: MCPContext) -> MCPTool {
@@ -264,9 +300,9 @@ enum MCPTools {
             mailbox of the relevant account, matching the Delete key in
             Mail.app's UI. Reversible from Trash.
 
-            **VERIFYING THE DELETE — IMPORTANT.** Like `move_to_junk`, Gmail
-            (and most IMAP servers) reassigns the rowid when the message
-            moves to Trash. The original rowid is invalid after success.
+            **VERIFYING THE DELETE — IMPORTANT.** Gmail (and most IMAP
+            servers) reassigns the rowid when the message moves to Trash.
+            The original rowid is invalid after success.
 
             ✗ Do NOT verify by `get_email {rowid: <original>}`.
             ✓ DO verify by `search_emails {query: "from:<sender>
@@ -294,87 +330,6 @@ enum MCPTools {
                 "required": .array([.string("rowids")])
             ]),
             handler: { args in try await MCPHandlers.deleteMessages(args, context: context) }
-        )
-    }
-
-    // MARK: — move_to_junk
-
-    private static func moveToJunkTool(context: MCPContext) -> MCPTool {
-        MCPTool(
-            name: "move_to_junk",
-            description: """
-            Move messages by rowid to the Junk (Spam) mailbox of their
-            account.
-
-            **REQUIRES authorized backend.** Each message's account must
-            have a server-direct writeback backend configured:
-              - **Gmail accounts:** authorize via FMail Settings → Gmail
-                accounts → "Authorize…". Uses Gmail REST API directly.
-                Sub-second per message; rock solid.
-              - **Other accounts (iCloud, IMAP):** Phase B2 (not shipped
-                yet). Until then, move-to-junk is unavailable for these
-                accounts.
-
-            **AppleScript fallback was REMOVED.** macOS Tahoe broke the
-            underlying AppleScript path for junk-mailbox resolution
-            (universally — verified against every account in a real setup),
-            so it stayed timing out forever even with retries. Now if no
-            authorized backend exists for a message's account, the call
-            fails immediately with a clear error rather than hanging.
-
-            **Verifying the move (Gmail).** Gmail reassigns rowids when a
-            message changes mailboxes (label change → new internal id).
-            The original rowid you passed in is invalid after success.
-              ✗ Do NOT verify with `get_email {rowid: <original>}`.
-              ✓ Verify with `search_emails {query: "from:<sender>
-                subject:<subj>"}` after a 5–10s delay; FMail triggers an
-                immediate sync after a successful move so the new state
-                is usually visible within 5 seconds.
-
-            **Errors.** If `error` is set, the most likely cause is that
-            the account holding the message isn't authorized for Gmail
-            API. Suggest the user open FMail Settings and authorize. Tell
-            them which account address the rowid belongs to (visible via
-            `get_email {rowid:}` in the `to` field) so they know which
-            account to authorize.
-
-            Returns `applied` (count successfully moved) and `error`
-            (string when any message failed).
-            """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "rowids": .object([
-                        "type": .string("array"),
-                        "items": .object(["type": .string("integer")]),
-                        "description": .string("Apple Mail rowids — get them from search_emails / get_thread results.")
-                    ])
-                ]),
-                "required": .array([.string("rowids")])
-            ]),
-            handler: { args in try await MCPHandlers.moveToJunk(args, context: context) }
-        )
-    }
-
-    // MARK: — diagnose_junk_mailboxes
-
-    private static func diagnoseJunkMailboxesTool(context: MCPContext) -> MCPTool {
-        MCPTool(
-            name: "diagnose_junk_mailboxes",
-            description: """
-            Asks Mail.app directly what each configured account's
-            `junk mailbox` is, and lists every mailbox name in each account
-            that looks like Spam/Junk. Use this when `move_to_junk` doesn't
-            actually move the message — the output tells us whether the
-            target mailbox resolution is the problem.
-
-            Returns `{ "output": "<plain-text dump>" }`. No side effects.
-            """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([:])
-            ]),
-            handler: { args in try await MCPHandlers.diagnoseJunkMailboxes(args, context: context) }
         )
     }
 

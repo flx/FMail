@@ -51,6 +51,12 @@ final class Indexer: Sendable {
             await self.report(progress, "Indexing messages", done: doneSoFar, total: total)
         }
 
+        // Drop any FMail rows for messages Apple's Envelope Index no longer
+        // exposes — covers deleted mail and rows filtered out by
+        // `fetchAllMessages` (currently: draft autosaves with type=5).
+        let keep = Set(allMessages.map(\.rowId))
+        try await indexDB.pruneMessagesNotIn(keep)
+
         await report(progress, "Reading recipients")
         let allRcpts = try env.fetchAllRecipients()
         await report(progress, "Indexing recipients", done: 0, total: allRcpts.count)

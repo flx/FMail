@@ -250,6 +250,13 @@ final class EnvelopeReadOnly {
         // The RFC 2822 Message-ID header lives in `message_global_data`. The FK
         // is `messages.global_message_id` → `message_global_data.ROWID` (NOT
         // `mgd.message_id`, which is some other internal hash).
+        //
+        // `m.type = 5` marks Gmail draft auto-saves. They live in `[Gmail]/
+        // All Mail` (so the kind-based drafts exclusion can't see them) and
+        // are not labeled `Drafts` (so the label-based exclusion can't either)
+        // — but Mail.app shows them as drafts via the type bit. Skip them
+        // here so FMail's index never carries draft autosaves at all
+        // (compose stays in Mail.app — drafts aren't an FMail surface).
         let sql = """
         SELECT m.ROWID, m.message_id, m.mailbox, mb.url, COALESCE(m.subject_prefix, ''),
                COALESCE(s.subject, ''),
@@ -265,7 +272,7 @@ final class EnvelopeReadOnly {
         LEFT JOIN subjects s ON s.ROWID = m.subject
         LEFT JOIN addresses a ON a.ROWID = m.sender
         LEFT JOIN message_global_data mgd ON mgd.ROWID = m.global_message_id
-        WHERE m.deleted = 0
+        WHERE m.deleted = 0 AND m.type != 5
         ORDER BY m.ROWID
         """
         var stmt: OpaquePointer?

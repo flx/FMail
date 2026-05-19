@@ -93,7 +93,7 @@ final class ReadStatusController {
         setReadStatus(messages: messages, isRead: isRead)
     }
 
-    // MARK: — Move actions (Delete / Move to Junk)
+    // MARK: — Delete actions
 
     /// Removes messages from their current mailbox via Mail.app — UI does
     /// the optimistic removal immediately, then the AppleScript dispatch
@@ -101,25 +101,22 @@ final class ReadStatusController {
     /// Apple's Envelope Index and reconciles the move.
     func deleteMessages(_ messages: [MessageHeader]) {
         Task { @MainActor in
-            await applyAndDispatchMove(messages: messages, kind: .delete)
-        }
-    }
-
-    /// Like `deleteMessages` but routes to the per-account Junk mailbox.
-    func moveMessagesToJunk(_ messages: [MessageHeader]) {
-        Task { @MainActor in
-            await applyAndDispatchMove(messages: messages, kind: .junk)
+            await applyAndDispatchDelete(messages: messages)
         }
     }
 
     /// Bulk delete from the current threads selection.
     func deleteSelectedThreads() async {
-        await markSelectedThreads(action: .delete)
-    }
-
-    /// Bulk Move to Junk from the current threads selection.
-    func moveSelectedThreadsToJunk() async {
-        await markSelectedThreads(action: .junk)
+        guard let db = model.indexDB else { return }
+        let viewScope = currentViewScope()
+        var allMessages: [MessageHeader] = []
+        for tid in model.selectedThreadIds {
+            if let msgs = try? await db.loadThreadMessages(threadId: tid, scope: viewScope) {
+                allMessages.append(contentsOf: msgs)
+            }
+        }
+        guard !allMessages.isEmpty else { return }
+        await applyAndDispatchDelete(messages: allMessages)
     }
 
     /// Bulk delete from the current search-results selection.
@@ -131,60 +128,12 @@ final class ReadStatusController {
         deleteMessages(messages)
     }
 
-    /// Bulk Move to Junk from the current search-results selection.
-    func moveSelectedSearchResultsToJunk() {
-        let messages = model.searchResults.filter {
-            model.selectedSearchResultIds.contains($0.rowId)
-        }
-        guard !messages.isEmpty else { return }
-        moveMessagesToJunk(messages)
-    }
-
     /// Awaitable variant for the MCP `delete_messages` tool.
     @MainActor
     func deleteMessages(rowids: [Int]) async -> (applied: Int, error: String?) {
-        await runMoveByRowids(rowids: rowids, kind: .delete)
-    }
-
-    /// Awaitable variant for the MCP `move_to_junk` tool.
-    @MainActor
-    func moveToJunk(rowids: [Int]) async -> (applied: Int, error: String?) {
-        await runMoveByRowids(rowids: rowids, kind: .junk)
-    }
-
-    // MARK: — Shared move/delete pipeline
-
-    enum MoveKind {
-        case delete, junk
-
-        var verbForError: String {
-            switch self {
-            case .delete: return "Delete"
-            case .junk:   return "Move to Junk"
-            }
-        }
-    }
-
-    private func markSelectedThreads(action kind: MoveKind) async {
-        guard let db = model.indexDB else { return }
-        let viewScope = currentViewScope()
-        var allMessages: [MessageHeader] = []
-        for tid in model.selectedThreadIds {
-            if let msgs = try? await db.loadThreadMessages(threadId: tid, scope: viewScope) {
-                allMessages.append(contentsOf: msgs)
-            }
-        }
-        guard !allMessages.isEmpty else { return }
-        await applyAndDispatchMove(messages: allMessages, kind: kind)
-    }
-
-    private func runMoveByRowids(rowids: [Int], kind: MoveKind) async -> (applied: Int, error: String?) {
-        guard let db = model.indexDB, let router = model.writebackRouter else {
+        guard let db = model.indexDB else {
             return (0, "Index not loaded")
         }
-        // Optimistic UI removal first — resolve to MessageHeader for the
-        // view-state updates (`messagesInSelectedThread` etc. still key by
-        // MessageHeader). The router below handles the actual dispatch.
         var resolved: [MessageHeader] = []
         for rowid in rowids {
             if let m = try? await db.loadMessage(rowid: rowid) { resolved.append(m) }
@@ -194,78 +143,76 @@ final class ReadStatusController {
         }
         applyOptimisticRemoval(messages: resolved)
 
-        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
-        let result: WritebackResult
-        switch kind {
-        case .delete: result = await router.delete(rowids: resolved.map(\.rowId))
-        case .junk:   result = await router.moveToJunk(rowids: resolved.map(\.rowId))
+        let entries = mailScripterEntries(for: resolved)
+        guard !entries.isEmpty else {
+            return (0, "Couldn't build AppleScript entries (mailbox/account info missing)")
         }
 
-        // For successful moves: Gmail (and IMAP generally) reassigns the
-        // message's apple_rowid when it changes mailboxes — the old rowid
-        // becomes invalid and a new rowid appears in the destination
-        // mailbox. FMail's index still has the OLD rowid pointing to the
-        // source mailbox until sync re-reads Apple's Envelope Index. Force
-        // an immediate sync so MCP queries (and the UI) see the new state
-        // promptly. For failures: keep the suppress window so we don't
-        // re-import data that's about to be re-tried.
-        if result.applied > 0 {
+        model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
+        let result = await MailScripter.deleteBatch(entries)
+
+        // On success: Gmail (and IMAP generally) reassigns apple_rowid when
+        // a message moves to Trash — force an immediate sync so MCP queries
+        // and the UI see the new state promptly. On failure: keep the
+        // suppress window so we don't re-import data that's about to be
+        // re-tried.
+        switch result {
+        case .ok(let matched):
             model.syncCoordinator?.skipSyncsUntil = nil
             await model.syncCoordinator?.runIncrementalSync()
-        } else {
+            return (matched, nil)
+        case .notFound:
             model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+            return (0, "Mail.app couldn't find any of the selected messages — apple_rowid may be stale.")
+        case .failed(let msg):
+            model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+            return (resolved.count, "AppleScript failed: \(msg)")
         }
-        return result.legacyTuple()
     }
 
-    private func applyAndDispatchMove(messages: [MessageHeader], kind: MoveKind) async {
+    private func applyAndDispatchDelete(messages: [MessageHeader]) async {
         applyOptimisticRemoval(messages: messages)
 
-        let rowids = messages.map(\.rowId)
-        guard !rowids.isEmpty else { return }
-        let verbForError = kind.verbForError
+        let entries = mailScripterEntries(for: messages)
+        guard !entries.isEmpty else { return }
 
         model.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(120)
         Task.detached { [weak model] in
-            // Fetch the router on MainActor (it lives on @MainActor MailModel).
-            guard let router = await MainActor.run(body: { model?.writebackRouter }) else { return }
-            let result: WritebackResult
-            switch kind {
-            case .delete: result = await router.delete(rowids: rowids)
-            case .junk:   result = await router.moveToJunk(rowids: rowids)
-            }
-
-            if result.applied > 0 {
-                // Force an immediate sync so the index picks up the new
-                // post-move rowids (Gmail reassigns on label changes).
-                // Otherwise the optimistic UI removal hides the messages
-                // but MCP / DB queries see stale state for ~3 minutes.
+            let result = await MailScripter.deleteBatch(entries)
+            switch result {
+            case .ok:
                 await MainActor.run {
                     model?.syncCoordinator?.skipSyncsUntil = nil
                 }
                 if let sc = await MainActor.run(body: { model?.syncCoordinator }) {
                     await sc.runIncrementalSync()
                 }
-            } else {
-                let errMsg = result.error
+            case .notFound:
                 await MainActor.run {
                     model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
-                    if let errMsg {
-                        model?.bulkActionError = "\(verbForError) failed: \(errMsg)"
-                    } else {
-                        model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
-                    }
+                    model?.bulkActionError = "Mail.app couldn't find some of the selected messages — they may have been moved or removed already (try Tools → Diagnose Mail.app structure)."
+                }
+            case .failed(let msg):
+                await MainActor.run {
+                    model?.syncCoordinator?.skipSyncsUntil = Date().addingTimeInterval(180)
+                    model?.bulkActionError = "Delete failed: \(msg)"
                 }
             }
         }
     }
 
-    /// Optimistic removal of `messages` from every visible array. Decrements
-    /// the unread/total counts on the source mailboxes and the global badge.
-    /// Threads with all members removed disappear; threads with some members
-    /// surviving have their `messageCount`/`unreadCount` reduced.
-    /// We do NOT update the DB — the next FSEvent-driven sync will re-mirror
-    /// Apple's Envelope Index and reconcile naturally.
+    /// Optimistic removal of `messages` from every visible array AND from
+    /// FMail's local index. Decrements the unread/total counts on the
+    /// source mailboxes and the global badge. Threads with all members
+    /// removed disappear; threads with some members surviving have their
+    /// `messageCount`/`unreadCount` reduced.
+    ///
+    /// The DB delete means any navigation or MCP read immediately after a
+    /// delete reflects the post-delete state, without waiting for the next
+    /// FSEvent-driven sync. If the underlying AppleScript dispatch fails,
+    /// the next full sync re-upserts the rows from Apple's Envelope Index
+    /// (which still has them), and the indexer's `pruneMessagesNotIn` pass
+    /// only drops rowids that are actually gone from Apple's side.
     private func applyOptimisticRemoval(messages: [MessageHeader]) {
         guard !messages.isEmpty else { return }
         let removedRowIds = Set(messages.map(\.rowId))
@@ -292,6 +239,16 @@ final class ReadStatusController {
             let map = (try? await db.threadIds(forMessages: messages.map(\.rowId))) ?? [:]
             for m in messages {
                 if let tid = map[m.rowId] { byThread[tid, default: []].append(m) }
+            }
+
+            // DB delete — has to happen AFTER the thread-id lookup above
+            // (which needs the rows still present). The thread-summary
+            // loaders aggregate counts live from `messages`, so the
+            // remaining queries naturally see the post-delete state.
+            do {
+                try await db.deleteMessagesByRowid(messages.map(\.rowId))
+            } catch {
+                Log.db.error("Optimistic DB delete failed for \(messages.count) rowids: \(String(describing: error), privacy: .public)")
             }
 
             // 1) messagesInSelectedThread — drop removed rowids.

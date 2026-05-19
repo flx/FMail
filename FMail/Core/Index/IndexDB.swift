@@ -191,6 +191,78 @@ actor IndexDB {
         }
     }
 
+    /// Optimistic delete from FMail's index after the UI / MCP layer has
+    /// dispatched an AppleScript delete to Mail.app. Removes the message
+    /// rows plus their dependents (recipients, labels, links, FTS) so any
+    /// subsequent UI navigation or MCP read reflects the post-delete state
+    /// immediately — without waiting for the FSEvent-driven sync to
+    /// re-mirror Apple's Envelope Index.
+    ///
+    /// Safe on AppleScript failure: the next full sync re-reads Apple's
+    /// Envelope Index and upserts any row that's still there, restoring
+    /// the deleted entries automatically (the indexer's `pruneMessagesNotIn`
+    /// pass only drops rowids no longer present in Apple's index).
+    func deleteMessagesByRowid(_ rowids: [Int]) throws {
+        guard !rowids.isEmpty else { return }
+        try inTransaction {
+            // Chunk to keep `?` placeholder count below SQLite's variable
+            // limit (default 32766). 500 leaves headroom for any future
+            // multi-bind columns.
+            var idx = 0
+            while idx < rowids.count {
+                let end = min(idx + 500, rowids.count)
+                let chunk = Array(rowids[idx..<end])
+                idx = end
+                let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
+                let tables: [(sql: String, _: Void)] = [
+                    ("DELETE FROM recipients WHERE message_rowid IN (\(placeholders))", ()),
+                    ("DELETE FROM message_labels WHERE message_rowid IN (\(placeholders))", ()),
+                    ("DELETE FROM message_links WHERE from_message_rowid IN (\(placeholders))", ()),
+                    ("DELETE FROM messages_fts WHERE rowid IN (\(placeholders))", ()),
+                    ("DELETE FROM messages WHERE apple_rowid IN (\(placeholders))", ())
+                ]
+                for (sql, _) in tables {
+                    var stmt: OpaquePointer?
+                    try prepare(sql, into: &stmt)
+                    for (i, rowid) in chunk.enumerated() {
+                        bind(stmt, Int32(i + 1), Int64(rowid))
+                    }
+                    try stepDone(stmt)
+                    sqlite3_finalize(stmt)
+                }
+            }
+        }
+    }
+
+    /// Remove every message (and its dependent rows) whose `apple_rowid`
+    /// is not in `keep`. Called by the indexer after a full upsert pass to
+    /// drop rows that Apple's Envelope Index no longer exposes — either
+    /// because the message was deleted, or because it's now filtered out
+    /// (e.g. draft autosaves with `type=5`, which the reader skips).
+    ///
+    /// Uses a TEMP table to avoid a 150k-element IN clause. One transaction
+    /// so the deletes across the four dependent tables stay consistent.
+    func pruneMessagesNotIn(_ keep: Set<Int>) throws {
+        try inTransaction {
+            try Schema.exec(db!, "CREATE TEMP TABLE IF NOT EXISTS _keep_rowids(apple_rowid INTEGER PRIMARY KEY)")
+            try Schema.exec(db!, "DELETE FROM _keep_rowids")
+            var ins: OpaquePointer?
+            try prepare("INSERT INTO _keep_rowids(apple_rowid) VALUES (?)", into: &ins)
+            defer { sqlite3_finalize(ins) }
+            for rowid in keep {
+                sqlite3_reset(ins)
+                bind(ins, 1, Int64(rowid))
+                try stepDone(ins)
+            }
+            let staleSubquery = "SELECT apple_rowid FROM messages WHERE apple_rowid NOT IN (SELECT apple_rowid FROM _keep_rowids)"
+            try Schema.exec(db!, "DELETE FROM recipients WHERE message_rowid IN (\(staleSubquery))")
+            try Schema.exec(db!, "DELETE FROM message_labels WHERE message_rowid IN (\(staleSubquery))")
+            try Schema.exec(db!, "DELETE FROM message_links WHERE from_message_rowid IN (\(staleSubquery))")
+            try Schema.exec(db!, "DELETE FROM messages WHERE apple_rowid NOT IN (SELECT apple_rowid FROM _keep_rowids)")
+            try Schema.exec(db!, "DELETE FROM _keep_rowids")
+        }
+    }
+
     /// Replace the message_labels rows. Caller passes ALL labels (we DELETE
     /// all then re-INSERT in one transaction). Cheap enough at our scale
     /// (~250k labels) and avoids drift on missed updates.

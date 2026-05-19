@@ -25,6 +25,20 @@ struct AttachmentRef: Codable, Sendable {
     let byte_count: Int
 }
 
+/// Attachment bytes returned by `get_attachment`. `data_base64` holds the
+/// decoded (post-MIME-decode) raw file contents, base64-encoded for safe
+/// JSON transport. `truncated` is true when the caller's `max_bytes` was
+/// below `byte_count` — the LLM can re-call with a larger cap.
+struct AttachmentContent: Codable, Sendable {
+    let rowid: Int
+    let attachment_index: Int
+    let name: String
+    let content_type: String
+    let byte_count: Int
+    let data_base64: String
+    let truncated: Bool
+}
+
 struct EmailFull: Codable, Sendable {
     let rowid: Int
     let thread_id: Int

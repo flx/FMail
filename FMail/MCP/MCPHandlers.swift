@@ -9,20 +9,17 @@ struct MCPContext: Sendable {
     /// Optional write thunks. Nil means the matching tool is unavailable.
     let markReadHandler: MCPMarkReadHandler?
     let deleteHandler: MCPMoveHandler?
-    let junkHandler: MCPMoveHandler?
 
     init(
         indexDB: IndexDB,
         bodyLoader: BodyLoader,
         markReadHandler: MCPMarkReadHandler? = nil,
-        deleteHandler: MCPMoveHandler? = nil,
-        junkHandler: MCPMoveHandler? = nil
+        deleteHandler: MCPMoveHandler? = nil
     ) {
         self.indexDB = indexDB
         self.bodyLoader = bodyLoader
         self.markReadHandler = markReadHandler
         self.deleteHandler = deleteHandler
-        self.junkHandler = junkHandler
     }
 }
 
@@ -32,8 +29,7 @@ struct MCPContext: Sendable {
 /// MainActor / ReadStatusController directly.
 typealias MCPMarkReadHandler = @Sendable (_ rowids: [Int], _ isRead: Bool) async -> (applied: Int, error: String?)
 
-/// `@Sendable` thunk for `delete_messages` and `move_to_junk` — same shape,
-/// only the underlying AppleScript action differs.
+/// `@Sendable` thunk for `delete_messages`.
 typealias MCPMoveHandler = @Sendable (_ rowids: [Int]) async -> (applied: Int, error: String?)
 
 /// One async function per tool. Each validates input, calls into context,

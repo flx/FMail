@@ -269,39 +269,13 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(payload["applied"] as? Int, 0)
     }
 
-    // MARK: — End-to-end: tools/list shows all 9 tools after registration
+    // MARK: — End-to-end: tools/list registration
 
-    /// `move_to_junk` and `delete_messages` must warn the LLM that Gmail
-    /// reassigns rowids on move, so original rowids are stale after success.
-    /// Verifying by querying the old rowid is wrong; query by sender+subject
-    /// instead. (Regression guard: we discovered this the hard way after
-    /// the LLM kept reporting "move didn't take" when it actually had.)
-    func testMoveToJunkDescriptionWarnsAboutRowidReassignment() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let dispatcher = MCPDispatcher()
-        let context = MCPContext(
-            indexDB: fixture.db, bodyLoader: fixture.bodyLoader,
-            junkHandler: { _ in (0, nil) }
-        )
-        await MCPTools.registerMoveTools(on: dispatcher, context: context)
-
-        // tools/list returns the description in inputSchema's neighbor —
-        // round-trip through the dispatcher to grab it.
-        let body = Data(#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.utf8)
-        let result = await dispatcher.dispatch(rawBody: body)
-        guard case .response(let data) = result else {
-            return XCTFail("expected response, got \(result)")
-        }
-        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let tools = try XCTUnwrap(((json["result"] as? [String: Any])?["tools"]) as? [[String: Any]])
-        let junkDesc = try XCTUnwrap(tools.first(where: { ($0["name"] as? String) == "move_to_junk" })?["description"] as? String)
-
-        XCTAssertTrue(junkDesc.lowercased().contains("reassign"), "must warn the LLM about Gmail rowid reassignment")
-        XCTAssertTrue(junkDesc.lowercased().contains("verify"), "must tell the LLM how to verify")
-        XCTAssertTrue(junkDesc.contains("search_emails"), "must steer the LLM toward search_emails for verification")
-    }
-
+    /// `delete_messages` must warn the LLM that Gmail reassigns rowids on
+    /// move, so original rowids are stale after success. Verifying by
+    /// querying the old rowid is wrong; query by sender+subject instead.
+    /// (Regression guard: we discovered this the hard way after the LLM
+    /// kept reporting "delete didn't take" when it actually had.)
     func testDeleteMessagesDescriptionWarnsAboutRowidReassignment() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
@@ -335,13 +309,11 @@ final class MCPTests: XCTestCase {
             indexDB: fixture.db,
             bodyLoader: fixture.bodyLoader,
             markReadHandler: markRead,
-            deleteHandler: move,
-            junkHandler: move
+            deleteHandler: move
         )
         await MCPTools.registerReadTools(on: dispatcher, context: context)
         await MCPTools.registerUnansweredAndMarkReadTools(on: dispatcher, context: context)
         await MCPTools.registerMoveTools(on: dispatcher, context: context)
-        await MCPTools.registerDiagnosticTools(on: dispatcher, context: context)
 
         let names = await dispatcher.registeredToolNames()
         XCTAssertEqual(Set(names), [
@@ -349,15 +321,14 @@ final class MCPTests: XCTestCase {
             "list_threads",
             "get_thread",
             "get_email",
+            "get_attachment",
             "find_unanswered_threads",
             "mark_read",
-            "delete_messages",
-            "move_to_junk",
-            "diagnose_junk_mailboxes"
+            "delete_messages"
         ])
     }
 
-    // MARK: — Phase Move: delete_messages + move_to_junk
+    // MARK: — Phase Move: delete_messages
 
     func testDeleteMessagesInvokesThunk() async throws {
         let fixture = try await Fixture.make()
@@ -387,33 +358,6 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(captured, [fixture.lunchMessageRowId])
     }
 
-    func testMoveToJunkInvokesThunk() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        actor Recorder {
-            var rowids: [Int] = []
-            func record(_ ids: [Int]) { rowids = ids }
-            func get() -> [Int] { rowids }
-        }
-        let recorder = Recorder()
-        let thunk: MCPMoveHandler = { rowids in
-            await recorder.record(rowids)
-            return (rowids.count, nil)
-        }
-        let context = MCPContext(
-            indexDB: fixture.db, bodyLoader: fixture.bodyLoader,
-            junkHandler: thunk
-        )
-        let result = try await MCPHandlers.moveToJunk(
-            .object(["rowids": .array([.int(42), .int(43)])]),
-            context: context
-        )
-        let payload = try roundTrip(result)
-        XCTAssertEqual(payload["applied"] as? Int, 2)
-        let captured = await recorder.get()
-        XCTAssertEqual(captured, [42, 43])
-    }
-
     func testDeleteMessagesWithoutThunkThrowsIndexNotReady() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
@@ -421,24 +365,6 @@ final class MCPTests: XCTestCase {
 
         do {
             _ = try await MCPHandlers.deleteMessages(
-                .object(["rowids": .array([.int(1)])]),
-                context: context
-            )
-            XCTFail("expected indexNotReady error")
-        } catch let payload as JSONRPCErrorPayload {
-            XCTAssertEqual(payload.code, JSONRPCErrorCode.indexNotReady)
-        } catch {
-            XCTFail("wrong error type: \(error)")
-        }
-    }
-
-    func testMoveToJunkWithoutThunkThrowsIndexNotReady() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? fixture.cleanup() }
-        let context = MCPContext(indexDB: fixture.db, bodyLoader: fixture.bodyLoader)
-
-        do {
-            _ = try await MCPHandlers.moveToJunk(
                 .object(["rowids": .array([.int(1)])]),
                 context: context
             )

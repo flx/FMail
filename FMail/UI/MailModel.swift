@@ -80,13 +80,6 @@ final class MailModel {
     @ObservationIgnored
     var mcpServer: MCPServer?
 
-    /// Per-account dispatcher for move/delete/mark-read. Routes each call
-    /// to AppleScript / Gmail API / IMAP per `account_writeback` config.
-    /// Phase B0 just adds the plumbing — default routing stays
-    /// AppleScript for every account, so behaviour is unchanged. Phase B1+
-    /// adds the alternative backends.
-    @ObservationIgnored
-    var writebackRouter: WritebackRouter?
     /// Mirrors `mcpServer?.isRunning` on the main actor so SwiftUI can
     /// re-render footer/status without hopping into the actor on every
     /// observation. Updated by `applyMCPSettings()`.
@@ -168,7 +161,6 @@ final class MailModel {
             self.indexDB = db
             let bodyLoader = BodyLoader(mailVersionDir: versionDir)
             self.bodyLoader = bodyLoader
-            self.writebackRouter = WritebackRouter(indexDB: db)
             let indexer = Indexer(envelopePath: envelopePath, indexDB: db, mailVersionDir: versionDir)
             let bodyIndexer = BodyIndexer(indexDB: db, bodyLoader: bodyLoader)
             let coordinator = SyncCoordinator(model: self, indexer: indexer, bodyIndexer: bodyIndexer, mailVersionDir: versionDir)
@@ -261,16 +253,11 @@ final class MailModel {
             guard let self else { return (0, "MailModel deallocated") }
             return await self.readStatus.deleteMessages(rowids: rowids)
         }
-        let junkHandler: MCPMoveHandler = { [weak self] rowids in
-            guard let self else { return (0, "MailModel deallocated") }
-            return await self.readStatus.moveToJunk(rowids: rowids)
-        }
         let context = MCPContext(
             indexDB: indexDB,
             bodyLoader: bodyLoader,
             markReadHandler: markReadHandler,
-            deleteHandler: deleteHandler,
-            junkHandler: junkHandler
+            deleteHandler: deleteHandler
         )
         Task { @MainActor [weak self] in
             // If a previous run is still listening on a different port, stop first.
@@ -282,7 +269,6 @@ final class MailModel {
                 await MCPTools.registerReadTools(on: dispatcher, context: context)
                 await MCPTools.registerUnansweredAndMarkReadTools(on: dispatcher, context: context)
                 await MCPTools.registerMoveTools(on: dispatcher, context: context)
-                await MCPTools.registerDiagnosticTools(on: dispatcher, context: context)
                 try await server.start(port: desiredPort)
                 let p = await server.port
                 self?.mcpServerStatus = .running(port: p)
@@ -523,19 +509,9 @@ final class MailModel {
         await readStatus.deleteSelectedThreads()
     }
 
-    /// Bulk Move to Junk from the threads selection.
-    func moveSelectedThreadsToJunk() async {
-        await readStatus.moveSelectedThreadsToJunk()
-    }
-
     /// Bulk Delete (move to Trash) from the search-results selection.
     func deleteSelectedSearchResults() {
         readStatus.deleteSelectedSearchResults()
-    }
-
-    /// Bulk Move to Junk from the search-results selection.
-    func moveSelectedSearchResultsToJunk() {
-        readStatus.moveSelectedSearchResultsToJunk()
     }
 
     func selectMessage(_ message: MessageHeader) {
@@ -788,55 +764,6 @@ final class MailModel {
     func openInMailApp(_ message: MessageHeader) -> Bool {
         guard let rfcId = message.rfcMessageId, !rfcId.isEmpty else { return false }
         return MailAppOpener.openMessage(rfcMessageId: rfcId)
-    }
-
-    // MARK: — Gmail OAuth (Phase B1)
-
-    /// Account email addresses that look like Gmail (`*.gmail.com` /
-    /// `*.googlemail.com`). Workspace custom-domain Gmail accounts aren't
-    /// detected automatically — those would need a manual "treat this as
-    /// Gmail" toggle in Settings (B3 polish).
-    var gmailDetectedAccounts: [MailAccount] {
-        accounts.filter { acc in
-            guard let email = acc.emailAddress?.lowercased() else { return false }
-            return email.hasSuffix("@gmail.com") || email.hasSuffix("@googlemail.com")
-        }
-    }
-
-    /// Drive the OAuth flow for `email`, persist credentials, and mark
-    /// the account as `.gmailApi` in `account_writeback`. After this
-    /// returns successfully, the writeback router will route moves/deletes
-    /// for this account through `GmailAPIWritebackService`.
-    func authorizeGmailAccount(email: String) async throws {
-        let label = try await GmailAuthManager.shared.authorize(email: email)
-        guard let acct = accounts.first(where: {
-            ($0.emailAddress ?? "").lowercased() == email.lowercased()
-        }), let db = indexDB else {
-            throw OAuthFlowError.malformedCallback("no FMail account matches \(email)")
-        }
-        try await db.setWritebackPreference(
-            accountUUID: acct.uuid,
-            service: .gmailApi,
-            keychainLabel: label
-        )
-    }
-
-    /// Remove the Keychain entry and revert the account to AppleScript
-    /// writeback. Doesn't revoke server-side — for that the user visits
-    /// myaccount.google.com → Security → Third-party access.
-    func revokeGmailAccount(email: String) async throws {
-        let label = GmailAuthManager.keychainLabel(for: email)
-        try await GmailAuthManager.shared.revoke(label: label)
-        guard let acct = accounts.first(where: {
-            ($0.emailAddress ?? "").lowercased() == email.lowercased()
-        }), let db = indexDB else { return }
-        try await db.clearWritebackPreference(accountUUID: acct.uuid)
-    }
-
-    /// True when `email` has stored Gmail OAuth credentials. Used by
-    /// SettingsView to pick "Authorize…" vs "Revoke".
-    func isGmailAuthorized(email: String) async -> Bool {
-        await GmailAuthManager.shared.isAuthorized(email: email)
     }
 
 }

@@ -103,15 +103,6 @@ enum MailScripter {
         )
     }
 
-    // moveToJunkBatch + moveToJunkAction were removed in commit <see git log>.
-    // After ~3 weeks of trying to make AppleScript-driven junk move work
-    // reliably on macOS Tahoe (`junk mailbox of <account>` errors
-    // universally; `move msg to <Spam mbox>` over Gmail IMAP wedges
-    // Mail.app's AppleEvent queue), we concluded it's unfixable at this
-    // layer. AppleScriptWritebackService.moveToJunk now returns an
-    // explicit "unsupported" instead of silently failing. Server-direct
-    // backends (Gmail API in B1, IMAP in B2) handle junk reliably.
-
     // MARK: — Shared scaffold
 
     /// Common AppleScript runner for any per-message action that follows
@@ -450,9 +441,9 @@ enum MailScripter {
         let uidChunks = uids.chunked(into: chunkSize)
         let rfcChunks = rfcIds.chunked(into: chunkSize)
 
-        // Multi-line actions (e.g. the junk script: set status + lookup +
-        // move) need every line indented to the same level as the surrounding
-        // `repeat with msg in matches` body, not just the first.
+        // Multi-line actions need every line indented to the same level as
+        // the surrounding `repeat with msg in matches` body, not just the
+        // first.
         let actionLines = action
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
@@ -546,67 +537,6 @@ enum MailScripter {
     }
 
     // MARK: — Diagnostics
-
-    /// For each Mail.app account, report: account name; what
-    /// `junk mailbox of acc` resolves to (or "missing value"); the names of
-    /// all mailboxes whose name suggests Spam/Junk. Useful when Move to
-    /// Junk silently fails — tells us whether the bug is in our script
-    /// (`junk mailbox` returned something we didn't expect) or in Mail.app
-    /// (no junk mailbox configured at all). No write side effects.
-    static func diagnoseJunkMailboxes() async -> String {
-        let source = """
-        with timeout of 60 seconds
-            tell application "Mail"
-                set output to ""
-                repeat with acc in accounts
-                    try
-                        set output to output & "Account: " & (name of acc) & return
-                    end try
-                    try
-                        set output to output & "  emails: " & ((email addresses of acc) as string) & return
-                    end try
-                    set junkName to "(missing value)"
-                    try
-                        set junkName to name of (junk mailbox of acc)
-                    on error errMsg
-                        set junkName to "(error: " & errMsg & ")"
-                    end try
-                    set output to output & "  junk mailbox of acc → " & junkName & return
-                    try
-                        repeat with m in (mailboxes of acc)
-                            try
-                                set nm to name of m
-                                if (nm is "Spam") or (nm is "Junk") or (nm is "Spam mail") or (nm is "Bulk Mail") or nm contains "Spam" or nm contains "Junk" then
-                                    set output to output & "  candidate mailbox: " & nm & return
-                                end if
-                            end try
-                        end repeat
-                    end try
-                    try
-                        repeat with m1 in (mailboxes of acc)
-                            try
-                                repeat with m2 in (mailboxes of m1)
-                                    try
-                                        set nm2 to name of m2
-                                        if (nm2 is "Spam") or (nm2 is "Junk") or nm2 contains "Spam" or nm2 contains "Junk" then
-                                            set output to output & "  nested candidate: " & (name of m1) & "/" & nm2 & return
-                                        end if
-                                    end try
-                                end repeat
-                            end try
-                        end repeat
-                    end try
-                end repeat
-                return output
-            end tell
-        end timeout
-        """
-        let (stdout, stderr, exitCode) = await runOsascript(source)
-        if exitCode != 0 {
-            return "Diagnostic failed (exit \(exitCode)): \(stderr.isEmpty ? stdout : stderr)"
-        }
-        return stdout
-    }
 
     /// Returns a human-readable dump of Mail.app's account / mailbox
     /// hierarchy (top-level + one nested level). Useful when "Mark as

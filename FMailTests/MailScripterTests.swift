@@ -4,16 +4,6 @@ import XCTest
 /// Tests for `MailScripter.buildScriptSource` and the per-action script
 /// pieces. These don't invoke Mail.app — they verify that the AppleScript
 /// text we generate contains the right commands and fallback logic.
-///
-/// Background: the user reported that `move_to_junk` silently failed for
-/// a message in `[Gmail]/All Mail`. The script at the time was a single
-/// statement (`set mailbox of msg to junk mailbox of theAccount`) with no
-/// fallback when `junk mailbox of <account>` returned `missing value`.
-/// These tests pin the new robust shape:
-///   1. set junk mail status of msg to true   (always succeeds, fast, local)
-///   2. try junk mailbox of <account>
-///   3. if missing, walk mailboxes by name (Spam / Junk / variants)
-///   4. set mailbox of msg to tgtMbox
 final class MailScripterTests: XCTestCase {
 
     // MARK: — Fixture
@@ -45,13 +35,6 @@ final class MailScripterTests: XCTestCase {
             mailboxPathComponents: nil
         )
     }
-
-    // (Junk-action tests removed when AppleScriptWritebackService.moveToJunk
-    //  was hard-failed. macOS Tahoe broke the underlying `junk mailbox of
-    //  <account>` AppleScript property for every account in practice;
-    //  authorize Gmail via OAuth or wait for IMAP support instead. The
-    //  whole moveToJunkBatch + moveToJunkAction code path is gone.
-    //  setReadStatus and delete via AppleScript are still tested below.)
 
     // MARK: — Delete still works for all mailboxes
 

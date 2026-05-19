@@ -28,14 +28,6 @@ struct FMailApp: App {
                         }
                     }
                 }
-                Button("Diagnose Junk mailboxes…") {
-                    Task {
-                        let dump = await MailScripter.diagnoseJunkMailboxes()
-                        await MainActor.run {
-                            showDiagnosticAlert(title: "Junk mailbox per account", body: dump)
-                        }
-                    }
-                }
             }
         }
 
