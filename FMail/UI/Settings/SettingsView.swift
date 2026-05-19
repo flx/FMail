@@ -23,18 +23,26 @@ struct SettingsView: View {
     @State private var tokenRevealed = false
     @State private var showRecentLogs = false
 
+    /// Force-rerender ticker so the OAuth approval window countdown
+    /// shows live seconds. Updated by a 1s timer while the view is visible.
+    @State private var approvalCountdownTick: Int = 0
+
     var body: some View {
         Form {
             mcpServerSection
             authTokenSection
             tunnelSection
+            oauthPairingSection
             mcpStatusSection
             clientConfigSection
             privacySection
         }
         .formStyle(.grouped)
         .padding()
-        .frame(minWidth: 520, minHeight: 600)
+        .frame(minWidth: 520, minHeight: 640)
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            approvalCountdownTick &+= 1
+        }
     }
 
     // MARK: — MCP Server
@@ -372,6 +380,119 @@ struct SettingsView: View {
                 Circle().fill(.red).frame(width: 8, height: 8)
                 Text("Error")
             }
+        }
+    }
+
+    // MARK: — OAuth pairing
+
+    /// Settings UI for the OAuth authorization-window flow. The user
+    /// clicks "Open approval window (5 min)" before starting the
+    /// connector setup in Cowork; the window auto-closes after one
+    /// successful approval or 5 minutes. Active sessions (issued tokens)
+    /// are listed below with a revoke control each, plus a "Revoke all"
+    /// button. The `approvalCountdownTick` state above forces a
+    /// re-render every second so the countdown is live.
+    private var oauthPairingSection: some View {
+        Section {
+            // Reference the tick so SwiftUI tracks it as a dependency of
+            // this view's body — without this the view wouldn't observe
+            // the timer, since the only consumer is the countdown text.
+            let _ = approvalCountdownTick
+
+            VStack(alignment: .leading, spacing: 12) {
+                approvalWindowRow
+                Divider()
+                sessionsRow
+            }
+        } header: {
+            Text("OAuth Pairing")
+        } footer: {
+            Text("For remote MCP clients (Cowork's \"Add Custom Connector\"). Open the approval window in FMail first, then complete the connector flow in the client — its browser will land on a one-click Approve page. Local Claude Code doesn't use this; it talks directly with the bearer token above.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var approvalWindowRow: some View {
+        let state = OAuthStore.shared.approvalWindowState
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Approval window")
+                    .font(.callout)
+                switch state {
+                case .closed:
+                    Text("Closed")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                case .open(let secs):
+                    Text("Open · closes in \(secs)s, or after one approval")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+            Spacer()
+            switch state {
+            case .closed:
+                Button("Open approval window (5 min)") {
+                    OAuthStore.shared.openApprovalWindow()
+                    approvalCountdownTick &+= 1
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(authToken.isEmpty)
+                .help(authToken.isEmpty ? "Generate an auth token first." : "")
+            case .open:
+                Button("Close window", role: .cancel) {
+                    OAuthStore.shared.closeApprovalWindow()
+                    approvalCountdownTick &+= 1
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sessionsRow: some View {
+        let sessions = OAuthStore.shared.sessions
+        HStack {
+            Text("Active sessions")
+                .font(.callout)
+            Spacer()
+            Text("\(sessions.count)")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        if sessions.isEmpty {
+            Text("No remote clients are currently authorized.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            ForEach(Array(sessions.keys.sorted()), id: \.self) { token in
+                if let session = sessions[token] {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(session.label)
+                                .font(.caption.bold())
+                            Text("issued \(session.issuedAt, format: .dateTime.day().month().year().hour().minute())")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Revoke", role: .destructive) {
+                            OAuthStore.shared.revokeSession(token: token)
+                            approvalCountdownTick &+= 1
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                    }
+                }
+            }
+            Button("Revoke all", role: .destructive) {
+                OAuthStore.shared.revokeAllSessions()
+                approvalCountdownTick &+= 1
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
         }
     }
 

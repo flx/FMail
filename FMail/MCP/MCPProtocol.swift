@@ -177,7 +177,13 @@ struct JSONRPCResponse: Sendable, Encodable {
 
 struct HTTPRequestLine: Sendable {
     let method: String
+    /// Path *without* the query string — e.g. `/authorize` for an incoming
+    /// `GET /authorize?response_type=code&...`. Use `query` for the raw
+    /// query, parsed via `FormParser.parseQuery`.
     let path: String
+    /// Raw query string, *without* the leading `?`. Empty when no `?`
+    /// was present in the request line.
+    let query: String
     /// Lowercased keys, last-wins on duplicates. Sufficient for the headers
     /// we care about (`Authorization`, `Content-Length`).
     let headers: [String: String]
@@ -215,7 +221,10 @@ enum HTTPParser {
             throw HTTPParseError.malformed("bad request line: \(requestLine)")
         }
         let method = parts[0]
-        let path = parts[1]
+        let rawTarget = parts[1]
+        let pathSeparator = rawTarget.firstIndex(of: "?")
+        let path = pathSeparator.map { String(rawTarget[..<$0]) } ?? rawTarget
+        let query = pathSeparator.map { String(rawTarget[rawTarget.index(after: $0)...]) } ?? ""
 
         var headers: [String: String] = [:]
         var contentLength = 0
@@ -233,7 +242,7 @@ enum HTTPParser {
         let bodyEnd = bodyStart + contentLength
         if data.count < bodyEnd { return nil }
         let body = data.subdata(in: bodyStart..<bodyEnd)
-        return (HTTPRequestLine(method: method, path: path, headers: headers, body: body), bodyEnd)
+        return (HTTPRequestLine(method: method, path: path, query: query, headers: headers, body: body), bodyEnd)
     }
 
     /// Format an HTTP/1.1 response with a JSON body and `Connection: close`.
@@ -247,10 +256,13 @@ enum HTTPParser {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
+        case 201: statusText = "Created"
         case 202: statusText = "Accepted"
         case 204: statusText = "No Content"
+        case 302: statusText = "Found"
         case 400: statusText = "Bad Request"
         case 401: statusText = "Unauthorized"
+        case 403: statusText = "Forbidden"
         case 404: statusText = "Not Found"
         case 405: statusText = "Method Not Allowed"
         case 500: statusText = "Internal Server Error"

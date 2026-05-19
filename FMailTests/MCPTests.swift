@@ -7,6 +7,32 @@ import Network
 /// hand-built fixture.
 final class MCPTests: XCTestCase {
 
+    /// Tests share `UserDefaults.standard` with the host app (the test
+    /// bundle is loaded into the FMail binary). Without these resets,
+    /// any auth state the developer left in their real Settings would
+    /// flip the no-auth path on / off in tests that assume the legacy
+    /// loopback behaviour.
+    private var savedAuthToken: String = ""
+
+    override func setUp() {
+        super.setUp()
+        savedAuthToken = MCPSettings.authToken
+        MCPSettings.authToken = ""
+        MainActor.assumeIsolated {
+            OAuthStore.shared.revokeAllSessions()
+            OAuthStore.shared.closeApprovalWindow()
+        }
+    }
+
+    override func tearDown() {
+        MCPSettings.authToken = savedAuthToken
+        MainActor.assumeIsolated {
+            OAuthStore.shared.revokeAllSessions()
+            OAuthStore.shared.closeApprovalWindow()
+        }
+        super.tearDown()
+    }
+
     // MARK: — JSONValue / JSON-RPC envelope round-trips
 
     func testJSONValueRoundTripsAllShapes() throws {
