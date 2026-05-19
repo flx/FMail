@@ -45,16 +45,17 @@ struct AppShell: View {
                 .overlay(alignment: .bottom) {
                     footerStatus
                 }
+                // Loud red bar above the split view's content when the
+                // tunnel is active. Applied directly to the
+                // NavigationSplitView so its safe-area inset actually
+                // takes effect — applying it to the surrounding Group
+                // doesn't propagate down through SwiftUI's split-view
+                // chrome on macOS. When the tunnel is off the banner
+                // renders EmptyView and the inset takes zero space.
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    TunnelBanner(model: model)
+                }
             }
-        }
-        // Loud red bar at top whenever tunnel state ≠ .off. We use
-        // `safeAreaInset` rather than wrapping in a VStack so the
-        // NavigationSplitView keeps its window-chrome integration —
-        // otherwise an empty toolbar band appears between the banner
-        // and the search bar. When the tunnel is off, `TunnelBanner`
-        // renders EmptyView and the inset takes zero space.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            TunnelBanner(model: model)
         }
         .task {
             await model.boot()
