@@ -235,11 +235,54 @@ enum MIMEParser {
     private static func attachmentName(in headers: ParsedHeaders) -> String? {
         if let cd = headers["content-disposition"] {
             if let name = paramValue(in: cd, key: "filename") { return name }
+            if let name = rfc2231ParamValue(in: cd, key: "filename") { return name }
         }
         if let ct = headers["content-type"] {
             if let name = paramValue(in: ct, key: "name") { return name }
+            if let name = rfc2231ParamValue(in: ct, key: "name") { return name }
         }
         return nil
+    }
+
+    /// RFC 2231 continuations: `filename*0=foo; filename*1=bar` → "foobar".
+    /// Also handles the encoded form `filename*0*=utf-8'en'percent-encoded`
+    /// (charset prefix on segment 0 only; segments tagged with `*` at the
+    /// end are percent-decoded). Plain `filename=` is handled by `paramValue`
+    /// — this is the fallback for senders that always emit continuations
+    /// (e.g. Outlook for long filenames).
+    private static func rfc2231ParamValue(in header: String, key: String) -> String? {
+        let lowerKey = key.lowercased() + "*"
+        var pieces: [(index: Int, encoded: Bool, value: String)] = []
+        for chunk in header.split(separator: ";") {
+            let raw = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let eq = raw.firstIndex(of: "=") else { continue }
+            let pname = raw[..<eq].lowercased()
+            guard pname.hasPrefix(lowerKey) else { continue }
+            let suffix = String(pname.dropFirst(lowerKey.count))
+            let isEncoded = suffix.hasSuffix("*")
+            let digits = isEncoded ? String(suffix.dropLast()) : suffix
+            guard let n = Int(digits) else { continue }
+            var v = String(raw[raw.index(after: eq)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if v.hasPrefix("\""), v.hasSuffix("\""), v.count >= 2 {
+                v = String(v.dropFirst().dropLast())
+            }
+            pieces.append((n, isEncoded, v))
+        }
+        guard !pieces.isEmpty else { return nil }
+        pieces.sort { $0.index < $1.index }
+
+        // First segment may carry `charset'lang'` prefix (RFC 2231 §4).
+        if pieces[0].encoded, let firstQuote = pieces[0].value.firstIndex(of: "'") {
+            let afterCharset = pieces[0].value.index(after: firstQuote)
+            if let langQuote = pieces[0].value[afterCharset...].firstIndex(of: "'") {
+                pieces[0].value = String(pieces[0].value[pieces[0].value.index(after: langQuote)...])
+            }
+        }
+        var out = ""
+        for p in pieces {
+            out.append(p.encoded ? (p.value.removingPercentEncoding ?? p.value) : p.value)
+        }
+        return out
     }
 
     private static func paramValue(in header: String, key: String) -> String? {

@@ -36,7 +36,7 @@ These are explicitly **out** for v1 and probably forever — they are what turns
 - Calendar, contacts editing, snooze, send-later, follow-up reminders, undo-send.
 - Push notifications (Mail.app already does this).
 - Filters / rules / smart mailboxes that mutate server state.
-- Attachments handling beyond view/quick-look/save.
+- Attachments handling in the GUI beyond view/quick-look/save. (Read-only access to attachment bytes from a local LLM client via the MCP server is in scope — see §15.)
 - HTML composing, Markdown composing.
 - Tracking pixel blocking, "read receipts," remote content blocking (Mail.app's setting governs what's cached).
 - iOS / iPadOS app **in v1**. (iOS sandboxes Mail's data — see §14 for a deferred plan that reuses the Mac index without building a full IMAP/Gmail client.)
@@ -80,6 +80,8 @@ Single SwiftUI macOS app, three layers:
 - Per-account folders: `<UUID>/<Mailbox>.mbox/<UUID>/Data/Messages/*.emlx`.
 - Metadata DB: `~/Library/Mail/V10/MailData/Envelope Index` (SQLite). Tables include `messages`, `addresses`, `recipients`, `subjects`, `mailboxes`, plus thread/labels tables. Schema is undocumented and *can change between macOS versions* — see §9.
 - `.emlx` is RFC 822 + a small binary plist trailer with flags. Standard MIME parsers handle the RFC 822 part; the plist gives `read`, `flagged`, `replied`, `forwarded` bits.
+- **Attachments are stored out-of-line for Gmail/IMAP accounts.** Mail.app strips attachment payloads from the `.emlx` (leaving an `X-Apple-Content-Length: N` placeholder on the part) and writes the decoded bytes to `<dataDir>/Attachments/<rowid>/<partIdx>/<filename>` — sibling of the `Messages/` directory. `BodyLoader.fillExternalAttachments` reads them back after MIME parsing, matching by filename (with RFC 2231 `filename*0=…; filename*1=…` continuations reassembled) and falling back to part-index order. Without this step, `data.count == 0` for every attachment on a Gmail message.
+- **Draft autosaves are excluded.** Apple's `messages.type` column distinguishes regular mail (0) from Gmail draft autosaves (5). The reader filters `type = 5` and the indexer's `pruneMessagesNotIn` drops any previously-imported drafts on the next sync. Drafts live in Mail.app; FMail doesn't show them.
 
 **Access mode**: read-only. FMail never writes into `~/Library/Mail/`.
 
@@ -216,13 +218,13 @@ The `~/Library/Mail/V*/` path and Envelope Index schema are private API in spiri
 - **Compose**: **`mailto:` URL via `NSWorkspace.shared.open(_:)`** (decision: simpler than AppleScript, no Automation permission, RFC 6068 supports `subject` / `body` / `cc` / `in-reply-to` / `references`). Trade-off: Mail.app picks the From-account by heuristic. AppleScript path is a Phase 5 polish if needed.
 - **Project shape**: single Xcode app target driven by **`xcodegen`** (`project.yml` checked in; `.xcodeproj` regenerated, gitignored).
 - **Contacts**: `Contacts.framework`.
-- **Tests**: XCTest. Phase 0 smoke tests (FDA-gated) + UI pure-helper unit tests (`MailboxKind` view-scope, `Date.listFormat`, `ReplyKind.subjectPreview`, `TimeDeltaFormatter`, `MailModel` selection/sort). DSL tests + `.emlx` parser fixtures still Phase 5 debt.
+- **Tests**: XCTest. Phase 0 smoke tests (FDA-gated), UI pure-helper unit tests (`MailboxKind` view-scope, `Date.listFormat`, `ReplyKind.subjectPreview`, `TimeDeltaFormatter`, `MailModel` selection/sort), MCP dispatcher / handler / HTTP-framing coverage against an in-memory `IndexDB`, `MailScripter.buildScriptSource` assertions for the read + delete AppleScript shapes, query DSL parser+evaluator coverage (including the FTS5 column-filter-AND regression), `IndexDB.deleteMessagesByRowid` + `pruneMessagesNotIn` coverage, and `BodyLoader` external-attachment + RFC 2231 filename coverage against a synthetic Mail.app layout. Schema-fingerprint test against a live Envelope Index still Phase 5 debt.
 
 ## 11. Permissions, privacy, security
 
 - **Full Disk Access** required (read `~/Library/Mail/`). Surfaced via a clear first-run flow.
 - **Contacts permission** required for name resolution. Lazy-requested on first reply.
-- **Automation permission** ("FMail wants to control Mail.app") required for **Mark as Read / Mark as Unread**. Triggered the first time the user clicks one of those buttons; if denied (or never prompted because dismissed), surfacing a one-click button that opens **System Settings → Privacy & Security → Automation → FMail → Mail**. The TCC error -1743 ("Not authorized to send Apple events to Mail") is the user-visible signal. `NSAppleEventsUsageDescription` is set in `Info.plist`. Compose / reply do NOT use AppleScript — those go via `mailto:` URLs through `NSWorkspace`, no Automation permission needed.
+- **Automation permission** ("FMail wants to control Mail.app") required for **Mark as Read / Mark as Unread** and **Delete**. Triggered the first time the user clicks one of those buttons; if denied (or never prompted because dismissed), surfacing a one-click button that opens **System Settings → Privacy & Security → Automation → FMail → Mail**. The TCC error -1743 ("Not authorized to send Apple events to Mail") is the user-visible signal. `NSAppleEventsUsageDescription` is set in `Info.plist`. Compose / reply do NOT use AppleScript — those go via `mailto:` URLs through `NSWorkspace`, no Automation permission needed. **Move to Junk is not exposed** — macOS Tahoe broke `junk mailbox of <account>` AppleScript resolution; the planned bypass (a Gmail API writeback path) was attempted and removed (see §12 v2 candidates).
 - **No network** in v1. App makes zero outbound connections.
 - **Sandboxing**: **not sandboxed in v1** (deferred to Phase 5 — FSEventStream + sandbox interaction unproven). Signed ad-hoc for local dev; no notarisation yet.
 - **No telemetry**. Period.
@@ -278,13 +280,19 @@ Already shipped (per IMPLEMENTATION.md):
 - Bulk Mark Read / Unread failures now surface as a modal alert (`bulkActionError`) instead of masquerading as inline body-load errors in the reader.
 - Internal refactor: `MailModel` (1145 → 753 LOC) and `IndexDB` (1170 → 1014 LOC) split. New: `UI/ReadStatusController.swift`, `Core/Index/IndexModels.swift`, `Core/Index/IndexDB+ContactPrefs.swift`, `Core/Logging.swift` (centralised `os.Logger`). `EnvelopeReadOnly` merged into `MailStore/EnvelopeIndexReader.swift`. `MailScripter` AppleScript-builder helpers extracted (`bucketByMailbox`, `buildAccountScopedBlock`, `buildCrossAccountFallback`).
 - Second internal refactor pass: `MailModel` (760 → 675 LOC) further split. New `UI/SyncCoordinator.swift` (file watcher, body-indexer task lifecycle, sync coalescing, `skipSyncsUntil` window, `runIncrementalSync`, post-sync missing-body prefetch) and `UI/BodyFetchPoller.swift` (on-demand `.emlx` poll loop after AppleScript IMAP fetch). New `MailboxKind` enum replaces `Mailbox.kind: String`; one `MailboxKind.viewScope(forSelectedKind:allMailboxesScope:)` helper consolidates the 3× duplicated drafts/trash/junk predicate. Bulk Mark-Read writes batch through `IndexDB.setIsReadBatch` (one transaction, single throw); `countAllUnreadExcludingDrafts` failure now keeps the prior count instead of zeroing the badge; `openFromSearch` surfaces errors via `threadsError`; new `Log.db` os.Logger category for previously-silent DB paths. Shared `UI/Components/{BulkActionHeader, ListSelectionGesture}.swift` dedupe the threads-list / search-results headers and the plain/⌘/⇧ click resolver. `UI/DateFormats.swift` (`Date.listFormat()`) unifies row date formatting. `MailAppOpener.openMessage` calls now route through `MailModel.openInMailApp(_:)`.
+- **Writeback / Gmail OAuth integration removed.** A "writeback router" with a Gmail API + IMAP backend was prototyped in response to Tahoe's broken AppleScript junk-mailbox handler. The Gmail OAuth flow shipped (PKCE loopback) and worked, but the maintenance surface (per-fork OAuth client registration, Keychain storage, refresh-token lifecycle, IMAP follow-up) wasn't worth it for one button. Move-to-Junk is gone from the UI, MCP, and AppleScript layers; Delete + Mark Read still go through `MailScripter` directly (those continue to work on Tahoe). `WRITEBACK_PLAN.md` deleted.
+- **FTS5 column-filter AND fix.** `(from:x OR to:x) subject:y` used to compile to `(… OR …) {subject}: y*` which FTS5 rejects with a syntax error (implicit-AND grammar doesn't allow a parenthesised subexpression on either side of a column filter). `Evaluator.compileAND` now joins fused text branches with explicit `AND`, so the query parses and returns results.
+- **Draft autosaves filtered + index pruning.** Gmail keeps stale draft autosaves in `[Gmail]/All Mail` with `messages.type = 5`, no Drafts label. `EnvelopeIndexReader.fetchAllMessages` skips them; new `IndexDB.pruneMessagesNotIn` runs after the upsert pass and drops any FMail row no longer present in Apple's index. Together: previously-ghosted draft duplicates clear on the next sync, and any future Apple-side deletion propagates without manual rebuild.
+- **External attachment fill.** Mail.app stores Gmail attachment bytes out-of-line at `Attachments/<rowid>/<partIdx>/<filename>` and leaves `X-Apple-Content-Length` placeholders in the `.partial.emlx`. `BodyLoader.fillExternalAttachments` enumerates that directory after MIME parsing and pairs the on-disk files into the parsed attachment list — primary match by filename (with RFC 2231 `filename*0=…; filename*1=…` continuations decoded in `MIMEParser`), fallback by part-index order. Inline-bodied attachments are left untouched.
+- **Optimistic DB delete on bulk-delete actions.** `ReadStatusController.applyOptimisticRemoval` now also calls `IndexDB.deleteMessagesByRowid` (one transaction across `messages`, `messages_fts`, `recipients`, `message_labels`, `message_links`). MCP- and UI-driven deletes are reflected in the DB and every view immediately; the next sync reconciles if the underlying AppleScript dispatch fails (the indexer's prune step only drops rowids that are actually gone from Apple's index).
+- **MCP `get_attachment` tool.** Returns one attachment's bytes (base64-encoded post-MIME-decode) by message rowid + 0-based attachment index, with a configurable size cap (10 MB default). Lets MCP clients read PDFs and other binary attachments instead of seeing only `{name, content_type, byte_count}`. Failure modes (unknown rowid, index out of range, body not on disk) surface as structured JSON-RPC errors with actionable messages.
 
 Remaining targets:
 - Saved searches, keyboard shortcuts (`J`/`K`/`N`), quote folding, Quick Look on attachments.
 - True incremental sync (currently full re-mirror per FSEvent; works but wasteful).
 - Body indexer that picks up new mail discovered by FSEvents.
 - Settings pane for address overrides.
-- DSL tests + schema-fingerprint test against live Envelope Index.
+- Schema-fingerprint test against live Envelope Index (DSL coverage shipped — see §10).
 - Sandbox attempt.
 - AppleScript compose path (for "send from this account" precision).
 - iCloud alias unification (`@me.com` ≡ `@icloud.com` ≡ `@mac.com`).
@@ -300,7 +308,7 @@ Remaining targets:
 
 Only if v1 proves itself for 6+ months:
 
-- Direct Gmail API client for the main Gmail account (sync independence from Mail.app). **Concrete proposal: [WRITEBACK_PLAN.md](WRITEBACK_PLAN.md)** — promoted from v2 candidate to active plan after macOS Tahoe broke Mail.app's AppleScript handler for move/junk operations. Initially scoped to writebacks (move/junk/delete), not full read-side independence.
+- Direct Gmail API client for the main Gmail account (sync independence from Mail.app). Previously promoted to an active writeback plan after macOS Tahoe broke `junk mailbox of <account>` AppleScript resolution; that plan (PKCE OAuth + `users.messages.modify` per-account router) shipped, was used briefly, and was removed — the maintenance surface (per-fork OAuth client, Keychain, refresh-token lifecycle, IMAP follow-up) didn't justify one button. Move-to-Junk is now simply not a feature. Re-entry would need a broader read-side independence rationale, not just writebacks.
 - IMAP IDLE for iCloud (same reason).
 - iOS companion viewer — see §14 for the strategy.
 
@@ -386,8 +394,23 @@ If Mac v1 isn't hitting daily-use bar, do not start the iOS phases.
 
 When FMail is running, an opt-in HTTP/JSON-RPC server on `127.0.0.1:8765` exposes the index to MCP clients (Claude Code, etc.). The point is to leverage what FMail already builds — schema-versioned SQLite, FTS5, the DSL, threading, contact prefs — so an LLM can triage email without parsing `.emlx` itself or pulling the whole index into context. See [MCP_PLAN.md](MCP_PLAN.md) for the full design.
 
-Eight tools, three writes: `search_emails`, `list_threads`, `get_thread`, `get_email`, `find_unanswered_threads`, `mark_read`, `delete_messages`, `move_to_junk`. The `search_emails` description embeds the full DSL grammar from §6.2 so the LLM can compose queries without external knowledge. The write tools route through `ReadStatusController` so the optimistic flip + AppleScript dispatch matches what the UI does — failures still surface as a `bulkActionError` alert in FMail. Delete and Move to Junk shipped as a follow-up after the core six (originally deferred — see MCP_PLAN.md), wiring up to the same `BulkActionHeader` buttons the UI exposes.
+Eight tools, two writes:
 
-Locked decisions: hand-rolled JSON-RPC + minimal HTTP framing on `Network.framework` (no SDK dep); off by default with an explicit privacy banner; loopback only (`requiredInterfaceType = .loopback`); a single bundled DSL string for `search_emails` rather than a structured-params second tool. `mark_read` synchronously waits for Mail.app's AppleScript dispatch — the tool description tells the LLM to keep batches ≤ ~50 to avoid client timeouts; SSE/streaming progress is deferred until usage demands it.
+| Tool | Kind | Purpose |
+|---|---|---|
+| `search_emails` | read | DSL-driven search; description embeds the full §6.2 grammar so the LLM can compose queries without external knowledge. |
+| `list_threads` | read | Thread summaries (mailbox-scoped or All Mailboxes). |
+| `get_thread` | read | All messages in a thread, oldest-first, with body text and attachment metadata. |
+| `get_email` | read | One message by rowid; same shape as a `get_thread` row. |
+| `get_attachment` | read | Raw attachment bytes (base64-encoded, post-MIME-decode) by rowid + 0-based index. 10 MB default cap; `truncated=true` if the cap was exceeded. Resolves the on-disk `Attachments/<rowid>/<partIdx>/<filename>` store transparently (see §5.1). |
+| `find_unanswered_threads` | read | Threads where the user sent the latest message and hasn't heard back. |
+| `mark_read` | write | Mark / unmark by rowid via AppleScript; optimistic in-memory flip + DB write, then `MailScripter.setReadStatusBatch`. |
+| `delete_messages` | write | Move to Trash via AppleScript; optimistic removal from in-memory views + DB, then `MailScripter.deleteBatch`. Sync reconciles on AppleScript failure. |
+
+Both write tools route through `ReadStatusController`, which now performs **optimistic DB-level removal** (`IndexDB.deleteMessagesByRowid` for delete; `setIsReadBatch` for mark-read) in the same MainActor task as the in-memory updates. So a follow-up MCP read or a UI navigation reflects the post-delete state without waiting for the FSEvent-driven sync. If AppleScript fails, the next sync re-upserts the rows from Apple's still-intact index. `bulkActionError` still surfaces in the FMail UI on dispatch failure.
+
+`move_to_junk` and the diagnostic `diagnose_junk_mailboxes` were previously exposed; both were removed when the writeback layer was dropped (see §12 Phase 5).
+
+Locked decisions: hand-rolled JSON-RPC + minimal HTTP framing on `Network.framework` (no SDK dep); off by default with an explicit privacy banner; loopback only (`requiredInterfaceType = .loopback`); a single bundled DSL string for `search_emails` rather than a structured-params second tool. `mark_read` and `delete_messages` synchronously wait for Mail.app's AppleScript dispatch — tool descriptions tell the LLM to keep batches small (~50 for mark_read, ≤5 for delete) to avoid client timeouts; SSE/streaming progress is deferred until usage demands it.
 
 Standalone daemon mode (so FMail doesn't have to be open) is **not** v1 — see MCP_PLAN.md "Stopping condition" for when to pivot to a `FMailCore` Swift package + LaunchAgent.

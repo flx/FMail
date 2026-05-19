@@ -19,12 +19,80 @@ actor BodyLoader {
         guard let url = map[messageRowId] else { return nil }
 
         let parsed = try EmlxParser.parse(url: url)
+        let attachments = Self.fillExternalAttachments(
+            parsed.mime.attachments,
+            emlxURL: url,
+            messageRowId: messageRowId
+        )
         return MessageBody(
             headers: parsed.headers,
             plainText: parsed.mime.plainText,
             html: parsed.mime.html,
-            attachments: parsed.mime.attachments
+            attachments: attachments
         )
+    }
+
+    /// For Gmail / IMAP messages, Mail.app commonly stores attachment bytes
+    /// out-of-line in `<dataDir>/Attachments/<rowid>/<partIdx>/<filename>`
+    /// and strips them from the `.partial.emlx` (leaving an
+    /// `X-Apple-Content-Length: NNN` header as a placeholder). The MIME
+    /// parser then sees the part headers but produces an `Attachment` with
+    /// zero data bytes — which is no good for MCP clients trying to read
+    /// the actual file.
+    ///
+    /// This pass enumerates the on-disk Attachments directory and pairs up
+    /// any zero-byte attachment with its file by filename. The fallback —
+    /// when filenames don't match (corrupted index, unusual MIME shapes) —
+    /// walks the disk files in part-index order and fills the remaining
+    /// zero-byte attachments in MIME-traversal order, which matches IMAP
+    /// part numbering for the common multipart/mixed layout.
+    private static func fillExternalAttachments(_ attachments: [Attachment], emlxURL: URL, messageRowId: Int) -> [Attachment] {
+        guard attachments.contains(where: { $0.data.isEmpty }) else { return attachments }
+
+        // emlxURL = <dataDir>/Messages/<rowid>(.partial)?.emlx
+        // attachments root = <dataDir>/Attachments/<rowid>/
+        let dataDir = emlxURL.deletingLastPathComponent().deletingLastPathComponent()
+        let attRoot = dataDir
+            .appendingPathComponent("Attachments")
+            .appendingPathComponent(String(messageRowId))
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: attRoot.path) else { return attachments }
+
+        // Collect every regular file under attRoot, indexed by both
+        // basename (for the by-name match) and by numeric part-index
+        // subdirectory (for the fallback ordering pass).
+        var byName: [String: URL] = [:]
+        var byPart: [(part: Int, url: URL)] = []
+        if let walker = fm.enumerator(at: attRoot, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+            for case let url as URL in walker {
+                let isFile = (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+                guard isFile else { continue }
+                byName[url.lastPathComponent] = url
+                // Part-index dir is the immediate subdir of attRoot.
+                let rel = url.path.dropFirst(attRoot.path.count).drop(while: { $0 == "/" })
+                let firstComponent = rel.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
+                if let p = Int(firstComponent) {
+                    byPart.append((p, url))
+                }
+            }
+        }
+        guard !byName.isEmpty else { return attachments }
+        byPart.sort { $0.part < $1.part }
+
+        var fallback = byPart.map(\.url).makeIterator()
+        return attachments.map { att in
+            guard att.data.isEmpty else { return att }
+            if let onDisk = byName[att.name], let bytes = try? Data(contentsOf: onDisk) {
+                return Attachment(name: att.name, contentType: att.contentType, data: bytes)
+            }
+            // Name mismatch — fall through to part-order pairing.
+            while let next = fallback.next() {
+                if let bytes = try? Data(contentsOf: next) {
+                    return Attachment(name: next.lastPathComponent, contentType: att.contentType, data: bytes)
+                }
+            }
+            return att
+        }
     }
 
     /// Drop the cached file map for one mailbox — call when we know its
