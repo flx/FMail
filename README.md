@@ -298,6 +298,29 @@ claude.ai's "Custom Connector" flow uses OAuth, not a static token:
 11. claude.ai opens FMail's `/authorize` page in your browser — click **Approve** while the window is
     open. The issued session token is persisted, so the connector survives FMail restarts.
 
+### Who can connect over the tunnel
+
+Only clients holding a valid token can connect — **not just any application that finds the URL.**
+Every request over the tunnel must present a bearer token; requests without one are rejected with
+HTTP 401, and if a tunnel is configured with no token *and* no session the server **fails closed** and
+refuses everything. There are exactly two kinds of valid token:
+
+- your **static token** — a secret that lives only in your own client config (e.g. local Claude
+  Code). It is never handed to claude.ai or anyone else.
+- an **OAuth session token** — issued *only* to a client that completed the approval flow.
+
+A new or unknown application **cannot authorize itself** by reaching the public URL. To obtain a
+session token it must, all at once: (1) arrive while you have **deliberately opened the approval
+window** (time-limited; grants exactly one code, then closes), (2) be **approved by you** clicking
+Approve in your browser while seeing its `redirect_uri`, and (3) prove possession of the **PKCE
+verifier** it generated — so an intercepted code or a drive-by approval can't yield a usable token.
+In short: a third-party app can't get in on its own; it needs either your static token or an approval
+you actively grant during the window.
+
+Caveat — these are **bearer** tokens: whoever holds a valid one can use it until it expires (OAuth
+sessions last 30 days) or you rotate the static token. Treat the static token like a password, and
+keep the tunnel closed when you're not using it.
+
 ### Threat model (worth being honest about)
 
 - **Loopback only, no token:** anything on your Mac that can reach `127.0.0.1:8765` can read your
