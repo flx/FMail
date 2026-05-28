@@ -103,6 +103,39 @@ enum MailScripter {
         )
     }
 
+    /// Ask Mail.app to open a reply / reply-all / forward compose window for
+    /// the given message, letting Mail build the quoted draft itself — no body
+    /// load in FMail. Locates the message with the same per-mailbox scan used
+    /// by mark-as-read, then runs Mail's native `reply` / `forward` command.
+    /// The action is guarded by `if foundCount = 0` so a message that appears
+    /// in several Gmail labels still opens exactly one window. On success the
+    /// app is brought to the front.
+    enum ComposeKind: Sendable {
+        case reply, replyAll, forward
+
+        /// AppleScript statement run against the matched `msg`. Guarded so only
+        /// the first match composes (Gmail label duplicates → one window).
+        var action: String {
+            switch self {
+            case .reply:    return "if foundCount = 0 then reply msg with opening window"
+            case .replyAll: return "if foundCount = 0 then reply msg with opening window and reply to all"
+            case .forward:  return "if foundCount = 0 then forward msg with opening window"
+            }
+        }
+    }
+
+    static func composeViaMailApp(_ entry: BatchEntry, kind: ComposeKind) async -> Result {
+        let result = await runActionBatch(
+            entries: [entry],
+            accountScopedAction: kind.action,
+            crossAccountAction: kind.action
+        )
+        if case .ok = result {
+            _ = await runOsascript("tell application \"Mail\" to activate")
+        }
+        return result
+    }
+
     // MARK: — Shared scaffold
 
     /// Common AppleScript runner for any per-message action that follows

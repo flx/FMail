@@ -38,6 +38,7 @@ targets:
         CFBundleIconFile: AppIcon
         LSApplicationCategoryType: public.app-category.productivity
         LSMinimumSystemVersion: "14.0"
+        LSUIElement: true
         NSPrincipalClass: NSApplication
         NSHighResolutionCapable: true
         NSContactsUsageDescription: "FMail uses your contacts to suggest the right address when you reply, so you don't accidentally send to a contact's secondary or App-Store-only email."
