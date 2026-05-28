@@ -17,7 +17,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// Max email rows shown — also the SQL LIMIT.
     private static let maxEmails = 20
-    private static let menuWidth: CGFloat = 320
+    private static let menuWidth: CGFloat = 460
 
     // Persistent items mutated on each open.
     private let markAllItem = NSMenuItem()
@@ -27,14 +27,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let searchView = MenuSearchFieldView(width: StatusItemController.menuWidth)
     private let placeholderItem = NSMenuItem()
     private var emailItems: [NSMenuItem] = []
+    private var emailRowViews: [MenuEmailRowView] = []
 
     // Cached query results backing the email rows.
     private var emails: [MessageHeader] = []
     private var currentSearchText = ""
     private var refreshTask: Task<Void, Never>?
 
-    private let unreadDot = StatusItemController.makeDot(color: .controlAccentColor)
-    private let readSpacer = NSImage(size: NSSize(width: 8, height: 8))
+    /// Row ids the user has ticked in the current open session. Cleared each
+    /// time the menu opens or the search text changes. Drives whether the top
+    /// command reads "Mark all as read" (empty) or "Mark N as read".
+    private var selectedRowIds: Set<Int> = []
 
     init(model: MailModel) {
         self.model = model
@@ -86,6 +89,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         searchItem.view = searchView
         searchView.onChange = { [weak self] text in
             self?.currentSearchText = text
+            self?.selectedRowIds.removeAll()
             self?.refreshEmails()
         }
         menu.addItem(searchItem)
@@ -98,8 +102,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         for _ in 0..<Self.maxEmails {
             let item = NSMenuItem()
+            let row = MenuEmailRowView(width: Self.menuWidth)
+            item.view = row
             item.isHidden = true
             emailItems.append(item)
+            emailRowViews.append(row)
             menu.addItem(item)
         }
 
@@ -117,9 +124,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         // Fresh start every open: clear the search field (programmatic set
-        // doesn't fire controlTextDidChange) so the list shows unread.
+        // doesn't fire controlTextDidChange) so the list shows unread, and
+        // drop any prior tick selection.
         searchView.field.stringValue = ""
         currentSearchText = ""
+        selectedRowIds.removeAll()
 
         mcpItem.state = MCPSettings.enabled ? .on : .off
         tunnelOpenItem.state = model.tunnel.state.isLive ? .on : .off
@@ -127,7 +136,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         approvalItem.state = OAuthStore.shared.approvalWindowIsOpen ? .on : .off
 
         updateEmailItems()   // show cached rows instantly
-        refreshEmails()      // then refresh from the index
+        refreshEmails()      // refresh from the current index
+
+        // Reconcile read/unread against Mail.app's Envelope Index, then
+        // refresh again — so marking read/unread in Mail.app shows up as soon
+        // as the menu is opened rather than waiting for the next full sync.
+        Task { @MainActor in
+            await model.syncCoordinator?.syncReadFlagsNow()
+            self.refreshEmails()
+            self.updateStatusBadge()
+        }
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -156,15 +174,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func updateEmailItems() {
+        // Drop selections for rows no longer in the list (e.g. after refresh).
+        let visibleIds = Set(emails.map(\.rowId))
+        selectedRowIds.formIntersection(visibleIds)
+
         for (i, item) in emailItems.enumerated() {
             if i < emails.count {
-                configure(item, with: emails[i])
+                let msg = emails[i]
+                configure(row: emailRowViews[i], with: msg)
+                item.submenu = makeEmailActionsMenu(for: msg)
                 item.isHidden = false
             } else {
                 item.isHidden = true
-                item.representedObject = nil
                 item.submenu = nil
-                item.image = nil
             }
         }
         if emails.isEmpty {
@@ -176,17 +198,66 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             placeholderItem.target = nil
             placeholderItem.action = nil
         }
-        let hasUnread = emails.contains { !$0.isRead } || model.allUnreadCount > 0
-        markAllItem.isEnabled = hasUnread
+        updateMarkAllItem()
     }
 
-    private func configure(_ item: NSMenuItem, with msg: MessageHeader) {
-        item.title = rowTitle(for: msg)
-        item.image = msg.isRead ? readSpacer : unreadDot
-        item.representedObject = msg
-        item.target = nil
-        item.action = nil
-        item.submenu = makeEmailSubmenu(for: msg)
+    private func configure(row: MenuEmailRowView, with msg: MessageHeader) {
+        row.configure(title: rowTitle(for: msg), selected: selectedRowIds.contains(msg.rowId))
+        row.onToggleSelect = { [weak self] in self?.toggleSelection(msg.rowId) }
+    }
+
+    /// Top command: "Mark all as read" (acts on every displayed unread row)
+    /// when nothing is ticked, otherwise "Mark N as read" (acts on the ticks).
+    private func updateMarkAllItem() {
+        let n = selectedRowIds.count
+        if n > 0 {
+            markAllItem.title = "Mark \(n) as read"
+            markAllItem.isEnabled = true
+        } else {
+            markAllItem.title = "Mark all as read"
+            markAllItem.isEnabled = emails.contains { !$0.isRead } || model.allUnreadCount > 0
+        }
+    }
+
+    private func toggleSelection(_ rowId: Int) {
+        if selectedRowIds.contains(rowId) {
+            selectedRowIds.remove(rowId)
+        } else {
+            selectedRowIds.insert(rowId)
+        }
+        // The checkbox flipped its own state; only the top command needs
+        // updating. A full rebuild here would fight the menu's open state.
+        updateMarkAllItem()
+    }
+
+    private func makeEmailActionsMenu(for msg: MessageHeader) -> NSMenu {
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+
+        let open = NSMenuItem(title: "Open in Mail", action: #selector(openInMail(_:)), keyEquivalent: "")
+        open.target = self
+        open.representedObject = msg
+        open.isEnabled = (msg.rfcMessageId?.isEmpty == false)
+        sub.addItem(open)
+
+        for (title, sel) in [
+            ("Reply", #selector(replyToMessage(_:))),
+            ("Reply All", #selector(replyAllToMessage(_:))),
+            ("Forward", #selector(forwardMessage(_:))),
+        ] {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = self
+            item.representedObject = msg
+            sub.addItem(item)
+        }
+
+        sub.addItem(.separator())
+        for line in detailLines(for: msg) {
+            let detail = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            detail.isEnabled = false
+            sub.addItem(detail)
+        }
+        return sub
     }
 
     private func configurePlaceholder() {
@@ -220,42 +291,31 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func makeEmailSubmenu(for msg: MessageHeader) -> NSMenu {
-        let sub = NSMenu()
-        sub.autoenablesItems = false
-
-        let open = NSMenuItem(title: "Open in Mail", action: #selector(openInMail(_:)), keyEquivalent: "")
-        open.target = self
-        open.representedObject = msg
-        open.isEnabled = (msg.rfcMessageId?.isEmpty == false)
-        sub.addItem(open)
-
-        for (title, sel) in [
-            ("Reply", #selector(replyToMessage(_:))),
-            ("Reply All", #selector(replyAllToMessage(_:))),
-            ("Forward", #selector(forwardMessage(_:))),
-        ] {
-            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
-            item.target = self
-            item.representedObject = msg
-            sub.addItem(item)
-        }
-
-        sub.addItem(.separator())
-        for line in detailLines(for: msg) {
-            let detail = NSMenuItem(title: line, action: nil, keyEquivalent: "")
-            detail.isEnabled = false
-            sub.addItem(detail)
-        }
-        return sub
-    }
-
     // MARK: — Row / detail formatting
 
-    private func rowTitle(for msg: MessageHeader) -> String {
+    /// Checkbox title for a row: an accent-colored dot prefix when unread,
+    /// then "Sender — Subject".
+    private func rowTitle(for msg: MessageHeader) -> NSAttributedString {
         let sender = msg.senderDisplay.isEmpty ? msg.senderAddress : msg.senderDisplay
         let subject = msg.subject.isEmpty ? "(no subject)" : msg.subject
-        return truncate("\(sender) — \(subject)", to: 60)
+        // Backstop cutoff for pathological subjects; the row also truncates
+        // visually at the menu's edge.
+        let text = truncate("\(sender) — \(subject)", to: 90)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        paragraph.alignment = .left
+        let out = NSMutableAttributedString()
+        if !msg.isRead {
+            out.append(NSAttributedString(
+                string: "● ",
+                attributes: [.foregroundColor: NSColor.controlAccentColor, .paragraphStyle: paragraph]
+            ))
+        }
+        out.append(NSAttributedString(
+            string: text,
+            attributes: [.foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph]
+        ))
+        return out
     }
 
     private func detailLines(for msg: MessageHeader) -> [String] {
@@ -294,9 +354,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: — Actions
 
+    /// Mark the ticked rows when any are selected, otherwise every displayed
+    /// unread row.
     @objc private func markAllAsRead() {
-        let rowids = emails.filter { !$0.isRead }.map(\.rowId)
+        let rowids = selectedRowIds.isEmpty
+            ? emails.filter { !$0.isRead }.map(\.rowId)
+            : Array(selectedRowIds)
         guard !rowids.isEmpty else { return }
+        selectedRowIds.removeAll()
         Task { @MainActor in
             _ = await model.readStatus.setReadStatus(rowids: rowids, isRead: true)
             self.refreshEmails()
@@ -391,16 +456,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     // MARK: — Helpers
-
-    private static func makeDot(color: NSColor) -> NSImage {
-        let size = NSSize(width: 8, height: 8)
-        let img = NSImage(size: size)
-        img.lockFocus()
-        color.setFill()
-        NSBezierPath(ovalIn: NSRect(origin: .zero, size: size)).fill()
-        img.unlockFocus()
-        return img
-    }
 
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()

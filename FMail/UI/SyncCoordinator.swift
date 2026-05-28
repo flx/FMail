@@ -76,6 +76,26 @@ final class SyncCoordinator {
         }
     }
 
+    /// Lightweight read/unread reconcile, triggered when the menu opens so
+    /// external Mail.app read-state changes show up immediately instead of
+    /// waiting for the next full sync. Respects `skipSyncsUntil` so it can't
+    /// revert an optimistic flip we just wrote back to Mail.app.
+    func syncReadFlagsNow() async {
+        guard let model else { return }
+        if let until = skipSyncsUntil, until > Date() { return }
+        do {
+            let changed = try await indexer.syncReadFlagsOnly()
+            if changed > 0 {
+                if let count = try? await model.indexDB?.countAllUnreadExcludingDrafts() {
+                    model.allUnreadCount = count
+                }
+                model.updateDockBadge()
+            }
+        } catch {
+            Log.sync.error("read-flag reconcile failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
     func runIncrementalSync() async {
         guard let model else { return }
         if let until = skipSyncsUntil, until > Date() {

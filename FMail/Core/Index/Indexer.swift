@@ -23,6 +23,26 @@ final class Indexer: Sendable {
         self.mailVersionDir = mailVersionDir
     }
 
+    /// Cheap read/unread reconcile against Apple's Envelope Index — updates
+    /// only the rows whose `read` flag diverged from FMail's index. No thread
+    /// rebuild, FTS, or body work, so it's safe to run on every menu open.
+    /// Returns the number of rows changed.
+    func syncReadFlagsOnly() async throws -> Int {
+        let env = try EnvelopeReadOnly(path: envelopePath)
+        defer { env.close() }
+        let appleFlags = try env.fetchReadFlags()
+        let current = try await indexDB.snapshotReadFlags()
+        var toRead: [Int] = []
+        var toUnread: [Int] = []
+        for (rowid, read) in appleFlags {
+            guard let cur = current[rowid], cur != read else { continue }
+            if read { toRead.append(rowid) } else { toUnread.append(rowid) }
+        }
+        if !toRead.isEmpty { try await indexDB.setIsReadBatch(rowids: toRead, isRead: true) }
+        if !toUnread.isEmpty { try await indexDB.setIsReadBatch(rowids: toUnread, isRead: false) }
+        return toRead.count + toUnread.count
+    }
+
     /// One full mirror pass. Idempotent (uses ON CONFLICT upserts).
     func runFullSync(progress: @MainActor @escaping (IndexProgress) -> Void) async throws {
         let env = try EnvelopeReadOnly(path: envelopePath)

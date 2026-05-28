@@ -997,6 +997,20 @@ actor IndexDB {
 
     // MARK: — Internals used by ThreadGrouper
 
+    /// `apple_rowid → is_read` for every indexed message. Backs the flag-only
+    /// reconcile (compared against Apple's Envelope Index `read` column).
+    func snapshotReadFlags() throws -> [Int: Bool] {
+        var stmt: OpaquePointer?
+        try prepare("SELECT apple_rowid, is_read FROM messages", into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        var out: [Int: Bool] = [:]
+        out.reserveCapacity(200_000)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out[Int(sqlite3_column_int64(stmt, 0))] = sqlite3_column_int(stmt, 1) != 0
+        }
+        return out
+    }
+
     /// Streams (apple_rowid, apple_message_id_hash, date_received, is_read, is_flagged)
     /// for all messages. Used by ThreadGrouper to build components in memory.
     func snapshotMessagesForThreading() throws -> [(rowid: Int, hash: Int64, date: Int, isRead: Bool, isFlagged: Bool)] {

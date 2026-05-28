@@ -246,6 +246,25 @@ final class EnvelopeReadOnly {
         return out.map { (messageRowId: $0.0, mailboxRowId: $0.1) }
     }
 
+    /// Cheap read/unread snapshot — just `ROWID` + `read` for the rows FMail
+    /// indexes (same `deleted = 0 AND type != 5` filter as `fetchAllMessages`).
+    /// Backs the flag-only reconcile that runs when the menu opens, so external
+    /// Mail.app read-state changes surface without a full re-mirror.
+    func fetchReadFlags() throws -> [(rowid: Int, read: Bool)] {
+        let sql = "SELECT ROWID, read FROM messages WHERE deleted = 0 AND type != 5"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw EnvelopeIndexError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        var out: [(rowid: Int, read: Bool)] = []
+        out.reserveCapacity(160_000)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append((Int(sqlite3_column_int64(stmt, 0)), sqlite3_column_int(stmt, 1) != 0))
+        }
+        return out
+    }
+
     func fetchAllMessages() throws -> [RawMessage] {
         // The RFC 2822 Message-ID header lives in `message_global_data`. The FK
         // is `messages.global_message_id` → `message_global_data.ROWID` (NOT
