@@ -159,10 +159,10 @@ actor MCPServer {
         //   unauthenticated by design; public-internet exposure is gated
         //   by the user-controlled approval window (see `OAuthStore`).
         if method == "GET" && path == "/.well-known/oauth-authorization-server" {
-            return OAuthHandlers.metadata(issuer: currentIssuer)
+            return OAuthHandlers.metadata(issuer: issuerOrigin(for: request))
         }
         if method == "GET" && path == "/.well-known/oauth-protected-resource" {
-            return OAuthHandlers.protectedResource(issuer: currentIssuer)
+            return OAuthHandlers.protectedResource(issuer: issuerOrigin(for: request))
         }
         if method == "POST" && path == "/register" {
             return await MainActor.run { OAuthHandlers.register(body: request.body) }
@@ -212,7 +212,8 @@ actor MCPServer {
         // OAuth-issued session token (used by remote MCP clients that
         // completed the /authorize → /token flow). When both stores are
         // empty, the server runs unauthenticated for local loopback.
-        if let denial = await MainActor.run(body: { denyIfMissingAuth(request) }) {
+        let issuer = issuerOrigin(for: request)
+        if let denial = await MainActor.run(body: { denyIfMissingAuth(request, issuer: issuer) }) {
             return denial
         }
 
@@ -237,7 +238,7 @@ actor MCPServer {
     /// would silently make the server reachable on the public Internet
     /// with no authentication.
     @MainActor
-    private func denyIfMissingAuth(_ request: HTTPRequestLine) -> Data? {
+    private func denyIfMissingAuth(_ request: HTTPRequestLine, issuer: String) -> Data? {
         let staticToken = MCPSettings.authToken
         let presented = bearerToken(in: request.headers["authorization"] ?? "")
         let hasStaticToken = !staticToken.isEmpty
@@ -247,30 +248,32 @@ actor MCPServer {
         if !hasStaticToken && !hasSessions {
             if tunnelConfigured {
                 Log.mcp.error("MCP rejected request: tunnel configured but no auth token / OAuth sessions — refusing to serve unauthenticated requests")
-                return unauthorizedResponse(reason: "tunnel-configured-no-auth")
+                return unauthorizedResponse(issuer: issuer, reason: "tunnel-configured-no-auth")
             }
             // No auth configured AND no tunnel → loopback-only legacy
             // behaviour; the listener is bound to 127.0.0.1 only.
             return nil
         }
-        // Accept static token OR any active OAuth session token.
+        // Accept static token OR any active OAuth session token. The static
+        // token is what the local Claude Code route uses (set it in the MCP
+        // config's `headers` Authorization to skip OAuth entirely).
         if hasStaticToken, constantTimeEqual(presented, staticToken) { return nil }
         if !presented.isEmpty, OAuthStore.shared.tokenIsValid(presented) { return nil }
 
         Log.mcp.info("MCP rejected request: missing/invalid bearer token")
-        return unauthorizedResponse(reason: "missing-or-invalid-token")
+        return unauthorizedResponse(issuer: issuer, reason: "missing-or-invalid-token")
     }
 
     /// Build the standard 401 response with the OAuth discovery hint.
     /// Shared between the fail-closed and bad-token paths.
     @MainActor
-    private func unauthorizedResponse(reason: String) -> Data {
+    private func unauthorizedResponse(issuer: String, reason: String) -> Data {
         let body = Data(#"{"error":"unauthorized"}"#.utf8)
         // The MCP authorization spec discovers OAuth via the
         // `resource_metadata=...` parameter on this header. Without it,
         // remote clients can't find `/.well-known/oauth-protected-resource`
         // and the connector flow fails before it ever reaches /authorize.
-        let metadataURL = "\(currentIssuer)/.well-known/oauth-protected-resource"
+        let metadataURL = "\(issuer)/.well-known/oauth-protected-resource"
         _ = reason  // kept for log-grep symmetry with the call sites
         return HTTPParser.formatResponse(
             status: 401,
@@ -279,19 +282,40 @@ actor MCPServer {
         )
     }
 
-    /// Public origin the server identifies as. Used by the OAuth
-    /// metadata + 401 hints. When the tunnel is up, this is the public
-    /// hostname the user typed in Settings; otherwise the loopback URL.
-    /// Read on each request so a Settings edit takes effect without a
-    /// server restart. Trailing slashes are stripped so concatenating
-    /// `\(currentIssuer)/path` never produces a `//path`.
-    nonisolated private var currentIssuer: String {
+    /// Origin to advertise in OAuth discovery + the 401 `resource_metadata`
+    /// hint, derived from the request's `Host`. A loopback host yields an
+    /// `http://<host>` issuer so a local MCP client's RFC 8707 resource check
+    /// matches the URL it actually connected to (`http://127.0.0.1:8765/mcp`)
+    /// instead of the remote tunnel URL; non-loopback (tunnel) requests use
+    /// the configured public URL.
+    ///
+    /// This affects discovery hints ONLY — `denyIfMissingAuth` validates the
+    /// bearer token regardless of issuer, so a spoofed `Host` can't bypass
+    /// auth or reach the index unauthenticated.
+    nonisolated private func issuerOrigin(for request: HTTPRequestLine) -> String {
+        let host = (request.headers["host"] ?? "").trimmingCharacters(in: .whitespaces)
+        if Self.isLoopbackHost(host) {
+            return "http://\(host)"
+        }
         let raw = MCPSettings.tunnelPublicURL.trimmingCharacters(in: .whitespaces)
-        var base = raw.isEmpty
-            ? "http://127.0.0.1:\(MCPSettings.port)"
-            : raw
+        var base = raw.isEmpty ? "http://127.0.0.1:\(MCPSettings.port)" : raw
         while base.hasSuffix("/") { base.removeLast() }
         return base
+    }
+
+    /// True for `127.0.0.1`, `localhost`, or `::1`, with or without a port
+    /// (and IPv6 bracket form `[::1]:8765`).
+    nonisolated private static func isLoopbackHost(_ host: String) -> Bool {
+        let h = host.lowercased()
+        let name: String
+        if h.hasPrefix("["), let close = h.firstIndex(of: "]") {
+            name = String(h[h.index(after: h.startIndex)..<close])
+        } else if let colon = h.firstIndex(of: ":") {
+            name = String(h[h.startIndex..<colon])
+        } else {
+            name = h
+        }
+        return name == "127.0.0.1" || name == "localhost" || name == "::1"
     }
 
     /// Extracts the token from a `Bearer <token>` header value. Tolerates
