@@ -615,6 +615,25 @@ enum MailScripter {
     }
 }
 
+/// Opens a message in Mail.app via the `message://<Message-ID>` URL scheme.
+/// Mail.app handles the URL natively (no AppleScript / Automation permission
+/// needed) — it navigates to the message *and* triggers a body fetch from
+/// the IMAP server if the body isn't downloaded yet.
+enum MailAppOpener {
+    @MainActor
+    static func openMessage(rfcMessageId: String) -> Bool {
+        let id = rfcMessageId.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty else { return false }
+        // message:// expects the full Message-ID including the angle brackets.
+        // Percent-encode anything that isn't safe in a URL path; Mail.app
+        // decodes back to the original `<...>` form.
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-_"))
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: allowed) ?? id
+        guard let url = URL(string: "message://\(encoded)") else { return false }
+        return NSWorkspace.shared.open(url)
+    }
+}
+
 private extension Array {
     /// Splits the array into sub-arrays of at most `size` elements. The
     /// final sub-array may be shorter. `chunked(into: 5)` on a 12-element
