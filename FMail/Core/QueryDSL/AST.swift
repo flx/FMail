@@ -32,7 +32,7 @@ enum Term: Equatable {
 
     case isUnread, isRead, isFlagged, isUnflagged, hasAttachment, noAttachment
     case mailboxKind(String)        // in:inbox / in:sent / etc.
-    case account(String)            // account:felix.matschke@gmail.com or short prefix
+    case account(String)            // account:you@example.com or short prefix
     case thread(Int)                // thread:<id> — narrow to one conversation
 
     /// Field we didn't recognize — pass through as bag-of-words on value

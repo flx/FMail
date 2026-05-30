@@ -7,7 +7,7 @@ import Foundation
 ///
 /// As an optimization, *pure-text* subtrees (no date/flag/scope) collapse into
 /// a single FTS5 MATCH expression — FTS5 has its own AND / OR / NOT — so a
-/// query like `from:kyoko OR from:meiko` becomes one MATCH subquery, not two.
+/// query like `from:alice OR from:bob` becomes one MATCH subquery, not two.
 struct CompiledQuery {
     /// SQL boolean expression, suitable as a WHERE clause body.
     let whereClause: String
@@ -153,13 +153,13 @@ enum Evaluator {
         guard !safe.isEmpty else { return .empty }
         // Split on non-alphanumerics so addresses / domains tokenise the
         // same way FTS5's unicode61 tokeniser broke them apart at index
-        // time. Without this, `from:savills.com` searches for the
-        // single token "savills.com" — which doesn't exist, because
-        // `felix@savills.com` was indexed as ["felix", "savills",
+        // time. Without this, `from:vendor.com` searches for the
+        // single token "vendor.com" — which doesn't exist, because
+        // `alice@vendor.com` was indexed as ["alice", "vendor",
         // "com"]. With this split, the search becomes
-        // `{sender}: (savills* AND com*)` and hits any savills.com
-        // sender. Same for `from:james@savills.com` → tokens
-        // [james, savills, com] all AND-prefixed.
+        // `{sender}: (vendor* AND com*)` and hits any vendor.com
+        // sender. Same for `from:jdoe@vendor.com` → tokens
+        // [jdoe, vendor, com] all AND-prefixed.
         let tokens = safe
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map(String.init)

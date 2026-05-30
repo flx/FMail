@@ -29,7 +29,7 @@ enum MCPProtocol {
     plus per-field operators (`from:`, `to:`, `cc:`, `subject:`, `body:`,
     `attachment:`, `account:`, `in:`, `thread:`, `is:`, `has:`,
     `before:`/`after:`/`on:`). Domain-style values work (e.g.
-    `from:savills.com`), date forms include ISO and relative (`7d`, `2w`,
+    `from:vendor.com`), date forms include ISO and relative (`7d`, `2w`,
     `"last 30 days"`, month names).
 
     Complementary tools: `list_threads` (per mailbox or all), `get_thread`

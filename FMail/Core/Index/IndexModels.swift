@@ -52,8 +52,8 @@ struct IndexedThread {
 ///   - For incoming mail: sender display (or address if no display).
 ///   - For outgoing mail (sender matches one of our accounts'
 ///     `email_address`): the first `To:` recipient's display, so the row
-///     in All Mailboxes / Sent says "Bank A" / "Anna" rather than just
-///     "Felix Matschke" repeating across every Sent thread.
+///     in All Mailboxes / Sent shows the other party (e.g. "Bank") rather
+///     than the user's own name repeating across every Sent thread.
 /// `latestIsOutgoing` lets the UI prefix "To:" or use a different style.
 struct ThreadSummary: Identifiable, Hashable {
     let threadId: Int

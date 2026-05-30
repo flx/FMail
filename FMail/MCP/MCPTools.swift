@@ -509,9 +509,9 @@ enum MCPTools {
     ADDRESS / DOMAIN MATCHING
     -------------------------
     Values for `from:`/`to:`/`cc:`/`attachment:` are split on non-alphanumeric
-    chars before searching, so `from:savills.com` matches any sender with
-    "savills" AND "com" in their address column (i.e. all @savills.com
-    addresses). `from:james@savills.com` ANDs four tokens. This catches
+    chars before searching, so `from:vendor.com` matches any sender with
+    "vendor" AND "com" in their address column (i.e. all @vendor.com
+    addresses). `from:jdoe@vendor.com` ANDs four tokens. This catches
     senders even though FTS5 tokenises email addresses by `@` and `.`.
 
     DATE FORMS
@@ -539,12 +539,12 @@ enum MCPTools {
 
     EXAMPLES
     --------
-      from:anna school trip
-      from:savills.com (matches any savills.com sender)
-      from:anna@gmail.com after:2024-01
+      from:alice school trip
+      from:vendor.com (matches any vendor.com sender)
+      from:alice@gmail.com after:2024-01
       to:me from:bank invoice
       thread:1234 body:"550k"            (grep within a conversation)
-      (anna OR kyoko) school -homework
+      (alice OR bob) school -homework
       "exact phrase" has:attachment
       isunread last 7d
 

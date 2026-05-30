@@ -84,9 +84,9 @@ The search box takes a structured query. Adjacent terms are AND-ed; everything c
 
 | Operator (and aliases) | Matches | Example |
 |---|---|---|
-| `from:` | sender (address or display name); domain-style works | `from:kyoko`, `from:savills.com` |
-| `to:` | "To:" recipient; domain-style works | `to:me`, `to:savills.com` |
-| `cc:` | "Cc:" recipient | `cc:anna` |
+| `from:` | sender (address or display name); domain-style works | `from:alice`, `from:vendor.com` |
+| `to:` | "To:" recipient; domain-style works | `to:me`, `to:vendor.com` |
+| `cc:` | "Cc:" recipient | `cc:bob` |
 | `subject:` *(or `subj:`)* | subject only | `subject:invoice` |
 | `body:` *(or `content:`, `text:`)* | body content only | `body:meeting` |
 | `attachment:` *(or `filename:`)* | attachment filename | `attachment:invoice.pdf` |
@@ -100,8 +100,8 @@ The search box takes a structured query. Adjacent terms are AND-ed; everything c
 | `on:DATE` / `during:DATE` | the entire period (year / month / day) | `during:2025` |
 
 Values for `from:` / `to:` / `cc:` / `attachment:` are split on non-alphanumeric characters, so
-`from:savills.com` ANDs the tokens `savills` and `com` against the sender column and matches any
-`@savills.com` address. (FTS5's tokeniser breaks email addresses at `@` and `.`, so a single-token
+`from:vendor.com` ANDs the tokens `vendor` and `com` against the sender column and matches any
+`@vendor.com` address. (FTS5's tokeniser breaks email addresses at `@` and `.`, so a single-token
 search would miss them.)
 
 **No-colon shortcuts** also work as bare words: `hasattachment` (or `hasattachments`), `isunread`,
@@ -134,13 +134,13 @@ period start; `during:` / `on:` matches the whole period at the precision you ty
 ### Examples
 
 ```text
-from:kyoko subject:invoice                       # all-fields AND (implicit)
+from:alice subject:invoice                       # all-fields AND (implicit)
 "exact phrase" -draft                            # phrase + NOT (-)
-from:anna ("school trip" OR "ski trip")          # quoted phrases inside OR
-(from:kyoko OR from:meiko) is:unread             # OR mixes text with flags
+from:alice ("school trip" OR "ski trip")         # quoted phrases inside OR
+(from:alice OR from:bob) is:unread               # OR mixes text with flags
 account:gmail.com (subject:invoice OR subject:receipt) after:2024
 in:sent has:attachment after:"last 30 days"      # multi-word date needs quotes
-since:march from:anna                            # `since:` is `after:` alias; month name
+since:march from:alice                           # `since:` is `after:` alias; month name
 ```
 
 ## Requirements
