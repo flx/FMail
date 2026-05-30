@@ -22,6 +22,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // Persistent items mutated on each open.
     private let markAllItem = NSMenuItem()
+    private let markAllUnreadItem = NSMenuItem()
     private let mcpTunnelItem = NSMenuItem()
     private let mcpItem = NSMenuItem()
     private let tunnelOpenItem = NSMenuItem()
@@ -38,7 +39,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// Row ids the user has ticked in the current open session. Cleared each
     /// time the menu opens or the search text changes. Drives whether the top
-    /// command reads "Mark all as read" (empty) or "Mark N as read".
+    /// commands read "Mark all as read/unread" (empty) or "Mark N as
+    /// read/unread", and which of the two is enabled.
     private var selectedRowIds: Set<Int> = []
 
     /// Settings window, created on first open and reused (see `openSettings`).
@@ -69,6 +71,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         markAllItem.target = self
         markAllItem.action = #selector(markAllAsRead)
         menu.addItem(markAllItem)
+
+        markAllUnreadItem.title = "Mark all as unread"
+        markAllUnreadItem.target = self
+        markAllUnreadItem.action = #selector(markAllAsUnread)
+        menu.addItem(markAllUnreadItem)
 
         // MCP + the (more sensitive) tunnel live together under one item so
         // the tunnel's running state is visible at the top level via the
@@ -218,7 +225,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             placeholderItem.target = nil
             placeholderItem.action = nil
         }
-        updateMarkAllItem()
+        updateMarkItems()
     }
 
     private func configure(row: MenuEmailRowView, with msg: MessageHeader) {
@@ -226,17 +233,28 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         row.onToggleSelect = { [weak self] in self?.toggleSelection(msg.rowId) }
     }
 
-    /// Top command: "Mark all as read" (acts on every displayed unread row)
-    /// when nothing is ticked, otherwise "Mark N as read" (acts on the ticks).
-    private func updateMarkAllItem() {
+    /// The messages a top-level mark command acts on: the ticked rows when any
+    /// are selected, otherwise every displayed row.
+    private var actionableMessages: [MessageHeader] {
+        selectedRowIds.isEmpty ? emails : emails.filter { selectedRowIds.contains($0.rowId) }
+    }
+
+    /// Top commands: "Mark all as read/unread" (acting on every displayed row)
+    /// when nothing is ticked, otherwise "Mark N as read/unread" (acting on the
+    /// ticks). Each command is disabled when it would be a no-op — i.e. when
+    /// the working set has nothing in the opposite state. A mixed set leaves
+    /// both enabled.
+    private func updateMarkItems() {
+        let set = actionableMessages
+        let hasUnread = set.contains { !$0.isRead }
+        let hasRead = set.contains { $0.isRead }
         let n = selectedRowIds.count
-        if n > 0 {
-            markAllItem.title = "Mark \(n) as read"
-            markAllItem.isEnabled = true
-        } else {
-            markAllItem.title = "Mark all as read"
-            markAllItem.isEnabled = emails.contains { !$0.isRead } || model.allUnreadCount > 0
-        }
+
+        markAllItem.title = n > 0 ? "Mark \(n) as read" : "Mark all as read"
+        markAllItem.isEnabled = hasUnread
+
+        markAllUnreadItem.title = n > 0 ? "Mark \(n) as unread" : "Mark all as unread"
+        markAllUnreadItem.isEnabled = hasRead
     }
 
     private func toggleSelection(_ rowId: Int) {
@@ -245,9 +263,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         } else {
             selectedRowIds.insert(rowId)
         }
-        // The checkbox flipped its own state; only the top command needs
+        // The checkbox flipped its own state; only the top commands need
         // updating. A full rebuild here would fight the menu's open state.
-        updateMarkAllItem()
+        updateMarkItems()
     }
 
     private func makeEmailActionsMenu(for msg: MessageHeader) -> NSMenu {
@@ -374,16 +392,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: — Actions
 
-    /// Mark the ticked rows when any are selected, otherwise every displayed
-    /// unread row.
-    @objc private func markAllAsRead() {
-        let rowids = selectedRowIds.isEmpty
-            ? emails.filter { !$0.isRead }.map(\.rowId)
-            : Array(selectedRowIds)
+    @objc private func markAllAsRead() { markActionable(isRead: true) }
+    @objc private func markAllAsUnread() { markActionable(isRead: false) }
+
+    /// Flip the working set (ticked rows, or every displayed row) to `isRead`,
+    /// touching only the rows that actually need it.
+    private func markActionable(isRead: Bool) {
+        let rowids = actionableMessages.filter { $0.isRead != isRead }.map(\.rowId)
         guard !rowids.isEmpty else { return }
         selectedRowIds.removeAll()
         Task { @MainActor in
-            _ = await model.readStatus.setReadStatus(rowids: rowids, isRead: true)
+            _ = await model.readStatus.setReadStatus(rowids: rowids, isRead: isRead)
             self.refreshEmails()
             self.updateStatusBadge()
         }

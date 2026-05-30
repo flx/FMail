@@ -5,7 +5,7 @@ A small, opinionated macOS email **viewer** that fixes the four things about App
 > **Implementation status**: see [IMPLEMENTATION.md](IMPLEMENTATION.md). This file remains the design-intent spec; deviations and decisions made during build are tracked there.
 
 > **⚠️ UI has changed — read this first.** The shipping app on `master` is now a **menu-bar-only**
-> build (no main window, no Dock icon): unread/search list, multi-select mark-as-read, and per-email
+> build (no main window, no Dock icon): unread/search list, multi-select mark read/unread, and per-email
 > Open-in-Mail / Reply / Forward, all from a status-bar dropdown. Reply/Forward drive Mail.app's
 > native AppleScript commands (not `mailto:`); there is no in-app thread reader, HTML rendering, or
 > per-contact preferred-address handling — reading and replying are delegated to Mail.app. The MCP

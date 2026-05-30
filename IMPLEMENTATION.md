@@ -6,7 +6,7 @@ Last updated: 2026-05-09 (window-UI era).
 
 > **⚠️ Current UI is menu-bar-only.** Everything below documents the three-pane **window** app, now
 > preserved on the [`window-UI`](../../tree/window-UI) branch. `master` ships a **menu-bar** build: a
-> status-bar dropdown with the unread/search list (multi-select mark-as-read), per-email
+> status-bar dropdown with the unread/search list (multi-select mark read/unread), per-email
 > Open-in-Mail / Reply / Reply All / Forward via Mail.app's native AppleScript commands, and an
 > MCP/Tunnel submenu. Removed in the menu-bar build: `AppShell`, the sidebar/thread-list/reader views,
 > `HTMLBodyView`, `ReplyConfirmationSheet`, `ContactsService`, the `mailto:` `MailComposer`, and

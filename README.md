@@ -18,7 +18,11 @@ envelope icon and a dropdown gives you:
 
 - Your **unread** messages (or **search results** when you type in the search box), each with an
   unread dot and a checkbox.
-- **Mark all as read** — or tick a few and it becomes **Mark N as read**.
+- **Mark all as read** and **Mark all as unread** — or tick a few rows and they become **Mark N as
+  read** / **Mark N as unread**. Whichever command would change nothing is disabled: if everything in
+  view (or everything ticked) is already read, "Mark as read" greys out, and vice-versa; a mix leaves
+  both active. (In the default unread-only list, "Mark as unread" is therefore disabled until you
+  search up some already-read messages.)
 - A per-email **submenu** (click the title or the `›`): **Open in Mail**, **Reply**, **Reply All**,
   **Forward**, plus the From / To / Date details.
 - An **MCP/Tunnel** submenu for the optional local MCP server and Cloudflare tunnel.
