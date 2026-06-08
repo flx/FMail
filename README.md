@@ -194,7 +194,8 @@ since:march from:alice                           # `since:` is `after:` alias; m
 
 ## Build
 
-Requires Xcode 15+ and [xcodegen](https://github.com/yonaskolb/XcodeGen).
+Requires **Xcode 16 or later** (the project builds in Swift 6 language mode) and
+[xcodegen](https://github.com/yonaskolb/XcodeGen). Developed and tested on Xcode 26.
 
 ```bash
 brew install xcodegen
@@ -202,8 +203,42 @@ xcodegen generate
 xcodebuild -project FMail.xcodeproj -scheme FMail -configuration Debug build
 ```
 
-The `.xcodeproj` and `Info.plist` are generated from `project.yml` and not checked in. Run the app
-once and look for the **envelope icon in the menu bar** (no window, no Dock icon).
+The `.xcodeproj` and `Info.plist` are **generated from `project.yml` and not checked in** (the
+`FMail.xcodeproj/` directory is `.gitignore`d). XcodeGen globs the `FMail/` source tree, so the
+project must be regenerated whenever the file set changes. Run the app once and look for the
+**envelope icon in the menu bar** (no window, no Dock icon).
+
+### Troubleshooting the build
+
+The single most common issue — **"Build input files cannot be found"** listing files that don't exist
+(e.g. `AppShell.swift`, `ReaderView.swift`, `SidebarView.swift`), or stale compile errors after a
+`git pull` or branch switch — means your generated `FMail.xcodeproj` is out of date. Because it's
+git-ignored, git never touches it across branch switches or pulls, so it can keep pointing at files
+from another branch (those names belong to the [`window-UI`](../../tree/window-UI) branch, not
+`master`). Regenerate it on the current branch:
+
+```bash
+rm -rf FMail.xcodeproj          # drop the stale generated project
+xcodegen generate               # regenerate from project.yml for the current branch
+```
+
+Then in Xcode do **Product → Clean Build Folder** (⇧⌘K) to clear stale DerivedData, or from the
+command line:
+
+```bash
+xcodebuild -project FMail.xcodeproj -scheme FMail -configuration Debug clean build
+```
+
+Other checks if it still won't compile:
+
+- **Point the toolchain at Xcode** (not just the Command Line Tools):
+  `sudo xcode-select -s /Applications/Xcode.app`, then verify with `xcodebuild -version` (expect 16+).
+- **Build from the command line to see the real first error.** Xcode's issue navigator can bury the
+  root cause; `xcodebuild … build` prints it plainly. Please share that first `error:` line when
+  reporting a build failure — Swift-6-mode diagnostics can differ between Xcode point releases, so the
+  exact message and your `xcodebuild -version` are what pin it down.
+- **Nuke caches** if things are wedged: quit Xcode and
+  `rm -rf ~/Library/Developer/Xcode/DerivedData/FMail-*`, then regenerate and rebuild.
 
 ---
 
