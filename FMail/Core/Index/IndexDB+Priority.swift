@@ -4,7 +4,7 @@ import SQLite3
 // Backs the menu's "Priority Messages" / "Other Messages" split. A sender is
 // *priority* when its address is in the connection-scoped `priority_addr`
 // scratch table (exact matches) or matches a `priority_pat` GLOB pattern (e.g.
-// `*savills*`). The model fills these from (everyone you've emailed) ∪ (the
+// `*vendor*`). The model fills these from (everyone you've emailed) ∪ (the
 // hand-edited supplemental list). These queries just join against them.
 extension IndexDB {
     /// Distinct lowercased addresses you've sent mail to — the auto-prefill for

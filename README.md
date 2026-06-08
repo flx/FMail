@@ -66,8 +66,8 @@ A sender counts as **priority** when it is **either**:
 
 You manage the supplemental list under **Settings → Priority Messages**, which shows the auto-list
 greyed-out (non-removable) beneath your own editable entries. A supplemental entry can be a **full
-address** (exact match), a **bare word or domain** like `savills` or `ubs.com` (matches any address
-containing it), or an explicit **wildcard pattern** using `*` / `?` (e.g. `*@savills.com`). Add several
+address** (exact match), a **bare word or domain** like `vendor` or `vendor.com` (matches any address
+containing it), or an explicit **wildcard pattern** using `*` / `?` (e.g. `*@vendor.com`). Add several
 at once separated by `;`, or pick from a **dropdown of the 20 most recent senders you've received
 from**.
 

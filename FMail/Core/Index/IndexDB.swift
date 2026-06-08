@@ -35,7 +35,7 @@ actor IndexDB {
         try Schema.apply(to: handle)
         // Connection-scoped scratch tables holding the current "priority
         // senders" set: exact lowercased addresses (`priority_addr`) and
-        // lowercased GLOB patterns like `*savills*` (`priority_pat`). Rebuilt by
+        // lowercased GLOB patterns like `*vendor*` (`priority_pat`). Rebuilt by
         // `updatePrioritySet`; joined against by the menu's Priority/Other
         // split. Created here so the split queries can reference them before the
         // first update.

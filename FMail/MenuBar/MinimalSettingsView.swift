@@ -180,7 +180,7 @@ private struct PrioritySettingsView: View {
 
     private var addArea: some View {
         VStack(alignment: .leading, spacing: 6) {
-            TextField("alice@example.com; *savills*", text: $newText)
+            TextField("alice@example.com; *vendor*", text: $newText)
                 .textFieldStyle(.roundedBorder)
             HStack {
                 if recentSenders.isEmpty {
@@ -202,7 +202,7 @@ private struct PrioritySettingsView: View {
                     .keyboardShortcut(.defaultAction)
                     .disabled(PriorityListSettings.parse(newText).isEmpty)
             }
-            Text("Separate several with “;”. A full address matches exactly; a word or domain (savills, ubs.com) matches any address containing it; or use * / ? wildcards (e.g. *@savills.com).")
+            Text("Separate several with “;”. A full address matches exactly; a word or domain (vendor, vendor.com) matches any address containing it; or use * / ? wildcards (e.g. *@vendor.com).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

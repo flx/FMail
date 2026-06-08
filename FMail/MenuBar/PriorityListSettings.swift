@@ -61,11 +61,11 @@ enum PriorityListSettings {
     /// Interpret a raw entry (all lowercased; matching is case-insensitive):
     ///   - contains `*` / `?`            → a GLOB pattern, used verbatim
     ///   - a full address `local@dom.tld` → exact match
-    ///   - anything else (a bare word or a domain like `savills`, `ubs.com`)
+    ///   - anything else (a bare word or a domain like `vendor`, `vendor.com`)
     ///     → substring match, i.e. GLOB `*entry*`
     ///
-    /// The substring fallback is the forgiving bit: typing `savills` matches
-    /// every `…@savills.com` / `…@email.savills.info` address without the user
+    /// The substring fallback is the forgiving bit: typing `vendor` matches
+    /// every `…@vendor.com` / `…@mail.vendor.com` address without the user
     /// having to remember the `*…*` syntax.
     static func classify(_ entry: String) -> Match {
         let e = entry.trimmingCharacters(in: .whitespaces).lowercased()
