@@ -88,4 +88,49 @@ enum PriorityListSettings {
         if case .glob = classify(entry) { return true }
         return false
     }
+
+    /// The hand-edited entries that currently put `address` into Priority — an
+    /// exact entry equal to it, or a wildcard/substring entry whose pattern
+    /// matches it. Order preserved; case-insensitive. Drives the menu's
+    /// per-message "Remove … from Priority Mail" commands: one per matching
+    /// entry, each shown verbatim, so a wildcard reads e.g. "*savills.com".
+    ///
+    /// Mirrors the SQLite `GLOB` membership test the index runs to build the
+    /// Priority/Other split (see `IndexDB.priorityMembership`), so the entry a
+    /// menu offers to remove is the same one that landed the message there.
+    static func entriesMatching(_ address: String) -> [String] {
+        let addr = address.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !addr.isEmpty else { return [] }
+        return supplementalAddresses.filter { entry in
+            switch classify(entry) {
+            case .exact(let e):   return e == addr
+            case .glob(let pat):  return globMatch(pat, addr)
+            }
+        }
+    }
+
+    /// Minimal GLOB matcher for the `*` (any run, incl. empty) and `?` (one
+    /// char) wildcards — enough to mirror SQLite `GLOB` for the patterns we
+    /// generate (`*vendor*`, `*@vendor.com`, …). Both arguments are already
+    /// lowercased by the caller, so matching is effectively case-insensitive.
+    /// Character classes (`[…]`) aren't handled; they don't occur in practice,
+    /// and the only cost is such an entry not being offered for removal here.
+    private static func globMatch(_ pattern: String, _ text: String) -> Bool {
+        let p = Array(pattern), t = Array(text)
+        var pi = 0, ti = 0
+        var star = -1, mark = 0        // last `*` position and the text index it began at
+        while ti < t.count {
+            if pi < p.count, p[pi] == "?" || p[pi] == t[ti] {
+                pi += 1; ti += 1
+            } else if pi < p.count, p[pi] == "*" {
+                star = pi; mark = ti; pi += 1
+            } else if star != -1 {
+                pi = star + 1; mark += 1; ti = mark   // backtrack: let `*` swallow one more char
+            } else {
+                return false
+            }
+        }
+        while pi < p.count, p[pi] == "*" { pi += 1 }
+        return pi == p.count
+    }
 }

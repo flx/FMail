@@ -219,8 +219,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let visibleIds = Set((priorityEmails + otherEmails).map(\.rowId))
         selectedRowIds.formIntersection(visibleIds)
 
-        updateBlock(priorityBlock, title: "Priority Messages", emails: priorityEmails)
-        updateBlock(otherBlock, title: "Other Messages", emails: otherEmails)
+        updateBlock(priorityBlock, title: "Priority Messages", emails: priorityEmails, priority: true)
+        updateBlock(otherBlock, title: "Other Messages", emails: otherEmails, priority: false)
 
         if priorityEmails.isEmpty && otherEmails.isEmpty {
             placeholderItem.isHidden = false
@@ -237,7 +237,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Fill one block's pre-allocated pool: show its divider, then a row per
     /// message with a date sub-header at each new date group. The whole block
     /// hides when it has no messages.
-    private func updateBlock(_ block: MenuBlock, title: String, emails: [MessageHeader]) {
+    private func updateBlock(_ block: MenuBlock, title: String, emails: [MessageHeader], priority: Bool) {
         guard !emails.isEmpty else { block.hideAll(); return }
         block.headerView.configure(title: title)
         block.headerItem.isHidden = false
@@ -263,7 +263,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             prevGroup = group
 
             configure(row: block.rowViews[i], with: msg)
-            block.rowItems[i].submenu = makeEmailActionsMenu(for: msg)
+            block.rowItems[i].submenu = makeEmailActionsMenu(for: msg, priority: priority)
             block.rowItems[i].isHidden = false
         }
     }
@@ -318,7 +318,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         updateMarkItems()
     }
 
-    private func makeEmailActionsMenu(for msg: MessageHeader) -> NSMenu {
+    private func makeEmailActionsMenu(for msg: MessageHeader, priority: Bool) -> NSMenu {
         let sub = NSMenu()
         sub.autoenablesItems = false
 
@@ -339,6 +339,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             sub.addItem(item)
         }
 
+        addPriorityItems(to: sub, for: msg, priority: priority)
+
         sub.addItem(.separator())
         let subjectItem = NSMenuItem()
         subjectItem.attributedTitle = subjectDetailTitle(for: msg)
@@ -350,6 +352,45 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             sub.addItem(detail)
         }
         return sub
+    }
+
+    /// The per-message Priority commands, grouped under the reply actions. In
+    /// the Other block the sender isn't priority, so we offer to add their exact
+    /// address. In the Priority block we offer to remove whichever supplemental
+    /// entries put them there — one item each, shown verbatim so a wildcard
+    /// reads "Remove *savills.com from Priority Mail". When none match, the
+    /// sender is priority only because you've emailed them: an item the index
+    /// derives automatically and Settings marks non-removable, so it's shown
+    /// here as a disabled note rather than a command.
+    private func addPriorityItems(to menu: NSMenu, for msg: MessageHeader, priority: Bool) {
+        let address = msg.senderAddress.trimmingCharacters(in: .whitespaces)
+        guard !address.isEmpty else { return }
+        menu.addItem(.separator())
+
+        guard priority else {
+            let add = NSMenuItem(title: "Add \(address) to Priority Mail",
+                                 action: #selector(addToPriority(_:)), keyEquivalent: "")
+            add.target = self
+            add.representedObject = address
+            menu.addItem(add)
+            return
+        }
+
+        let entries = PriorityListSettings.entriesMatching(address)
+        guard !entries.isEmpty else {
+            let note = NSMenuItem(title: "Always in Priority Mail (you've emailed this sender)",
+                                  action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            menu.addItem(note)
+            return
+        }
+        for entry in entries {
+            let remove = NSMenuItem(title: "Remove \(entry) from Priority Mail",
+                                    action: #selector(removeFromPriority(_:)), keyEquivalent: "")
+            remove.target = self
+            remove.representedObject = entry
+            menu.addItem(remove)
+        }
     }
 
     private func configurePlaceholder() {
@@ -602,6 +643,31 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func replyToMessage(_ sender: NSMenuItem) { compose(sender, kind: .reply) }
     @objc private func replyAllToMessage(_ sender: NSMenuItem) { compose(sender, kind: .replyAll) }
     @objc private func forwardMessage(_ sender: NSMenuItem) { compose(sender, kind: .forward) }
+
+    /// Add a sender's exact address to the hand-edited priority list, then
+    /// re-derive the split so the next open shows them under Priority Messages.
+    @objc private func addToPriority(_ sender: NSMenuItem) {
+        guard let address = sender.representedObject as? String else { return }
+        PriorityListSettings.add([address])
+        applyPriorityChange()
+    }
+
+    /// Remove one supplemental entry (an exact address or a wildcard such as
+    /// `*savills.com`) from the priority list. A sender who is also someone
+    /// you've emailed stays in Priority — that membership is index-derived, not
+    /// in this list.
+    @objc private func removeFromPriority(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? String else { return }
+        PriorityListSettings.remove(entry)
+        applyPriorityChange()
+    }
+
+    private func applyPriorityChange() {
+        Task { @MainActor in
+            await model.refreshPrioritySenders()
+            self.refreshEmails()
+        }
+    }
 
     private func compose(_ sender: NSMenuItem, kind: MailScripter.ComposeKind) {
         guard let msg = sender.representedObject as? MessageHeader,
