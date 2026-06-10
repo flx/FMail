@@ -136,20 +136,28 @@ extension IndexDB {
     /// flagged_count)` ordered newest-first. `representative` supplies the
     /// thread's display message; it differs per query (whole index vs scoped
     /// to one mailbox).
+    // `throws` (not `rethrows`): besides re-throwing from `representative`, this
+    // now throws on a truncated read loop (terminal rc != SQLITE_DONE), which a
+    // `rethrows` signature can't express. Both callers
+    // (`loadAllThreadSummaries`, `loadThreadSummaries`) already `throws`.
     private func decodeThreadSummaries(
         _ stmt: OpaquePointer?,
         limit: Int,
         representative: (Int) throws -> RepresentativeMessage?
-    ) rethrows -> [ThreadSummary] {
+    ) throws -> [ThreadSummary] {
         var out: [ThreadSummary] = []
         var seenOutgoingKeys: Set<String> = []
         var readThreadCount = 0
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let tid = Int(sqlite3_column_int64(stmt, 0))
             let latest = Int(sqlite3_column_int64(stmt, 1))
             let local = Int(sqlite3_column_int64(stmt, 2))
             let unread = Int(sqlite3_column_int64(stmt, 3))
             let flagged = Int(sqlite3_column_int64(stmt, 4))
+            // Advance to the next row now that this row's columns are read, so
+            // the `continue` paths below can't skip the step and spin forever.
+            rc = sqlite3_step(stmt)
             // Cap only fully-read threads at `limit`; unread threads are always
             // kept so the list can never fall behind the unread badge. Rows
             // arrive newest-first, so an old unread thread still lands in its
@@ -175,6 +183,7 @@ extension IndexDB {
                 latestIsOutgoing: repr?.isOutgoing ?? false
             ))
         }
+        try checkRowLoopDone(rc)
         return out
     }
 

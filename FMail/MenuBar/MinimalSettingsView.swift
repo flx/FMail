@@ -10,7 +10,7 @@ struct MinimalSettingsView: View {
 
     var body: some View {
         TabView {
-            ConnectionSettingsView()
+            ConnectionSettingsView(model: model)
                 .tabItem { Label("Connection", systemImage: "network") }
             PrioritySettingsView(model: model)
                 .tabItem { Label("Priority Messages", systemImage: "star") }
@@ -28,6 +28,8 @@ struct MinimalSettingsView: View {
 /// MCP / tunnel / OAuth settings. Deliberately excludes anything already
 /// controlled from the menu (MCP on/off, tunnel open, approval window).
 private struct ConnectionSettingsView: View {
+    let model: MailModel
+
     @State private var authToken = MCPSettings.authToken
     @State private var port = String(MCPSettings.port)
     @State private var tunnelName = MCPSettings.tunnelName
@@ -41,10 +43,19 @@ private struct ConnectionSettingsView: View {
     var body: some View {
         Form {
             Section("MCP") {
+                // Store only a valid port as you type (ignore garbage like
+                // "87a"); restart the running server on commit (⏎) so the
+                // listener actually moves to the new port.
                 TextField("Port", text: $port)
                     .onChange(of: port) { _, new in
-                        if let v = Int(new) { MCPSettings.port = v }
+                        if let v = Int(new), (1...65_535).contains(v) {
+                            MCPSettings.port = v
+                        }
                     }
+                    .onSubmit { model.applyMCPSettings() }
+                Text("Press ⏎ to apply a new port to the running server.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Auth token") {

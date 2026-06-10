@@ -41,6 +41,15 @@ final class SyncCoordinator {
         self.mailVersionDir = mailVersionDir
     }
 
+    deinit {
+        // The periodic ticker loops `while !Task.isCancelled` forever; without
+        // this it would outlive the coordinator (e.g. if `boot()` re-runs after
+        // an FDA grant and builds a fresh coordinator). `FileWatcher` tears its
+        // FSEventStream down in its own deinit when `watcher` is released.
+        periodicSyncTask?.cancel()
+        bodyIndexerTask?.cancel()
+    }
+
     func startFileWatcher() {
         let watcher = FileWatcher(rootPath: mailVersionDir.path) { [weak self] in
             Task { @MainActor [weak self] in

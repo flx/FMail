@@ -554,9 +554,33 @@ enum MailScripter {
                 let started = Date()
                 do {
                     try process.run()
+                    // Drain both pipes on their own background threads BEFORE
+                    // waiting for exit. osascript can emit more than the pipe
+                    // buffer (~64 KB) — verbose AppleScript errors,
+                    // diagnoseStructure over many mailboxes — and if we called
+                    // waitUntilExit() first the child would block writing while
+                    // we block waiting, deadlocking this serial queue and
+                    // bricking every later Mark-Read/Delete/Compose action.
+                    // Each handle is drained on its own background thread into a
+                    // lock-guarded box; we join (DispatchGroup wait) before
+                    // reading the boxes, so there's no data race on the buffers.
+                    let group = DispatchGroup()
+                    let outBox = DataBox()
+                    let errBox = DataBox()
+                    let outHandle = outPipe.fileHandleForReading
+                    let errHandle = errPipe.fileHandleForReading
+                    DispatchQueue.global(qos: .userInitiated).async(group: group) {
+                        outBox.set(outHandle.readDataToEndOfFile())
+                    }
+                    DispatchQueue.global(qos: .userInitiated).async(group: group) {
+                        errBox.set(errHandle.readDataToEndOfFile())
+                    }
                     process.waitUntilExit()
-                    let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                    let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    // Both reads hit EOF when the child's pipe write ends close,
+                    // which happens at/after exit; wait for both to finish.
+                    group.wait()
+                    let out = String(data: outBox.get(), encoding: .utf8) ?? ""
+                    let err = String(data: errBox.get(), encoding: .utf8) ?? ""
                     let elapsed = Date().timeIntervalSince(started)
                     let outTrim = out.trimmingCharacters(in: .whitespacesAndNewlines)
                     let errTrim = err.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -631,6 +655,26 @@ enum MailAppOpener {
         let encoded = id.addingPercentEncoding(withAllowedCharacters: allowed) ?? id
         guard let url = URL(string: "message://\(encoded)") else { return false }
         return NSWorkspace.shared.open(url)
+    }
+}
+
+/// Thread-safe one-shot container for the bytes drained from a pipe on a
+/// background thread. `@unchecked Sendable` because all access to the mutable
+/// `data` is serialized through `lock`; the value is written once by the
+/// draining thread and read once by `runOsascript` after the DispatchGroup
+/// join, so the lock guards against the (formal) concurrent-access window.
+private final class DataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func set(_ d: Data) {
+        lock.lock(); defer { lock.unlock() }
+        data = d
+    }
+
+    func get() -> Data {
+        lock.lock(); defer { lock.unlock() }
+        return data
     }
 }
 

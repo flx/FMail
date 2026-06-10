@@ -92,26 +92,51 @@ enum OAuthHandlers {
             return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(message: "Only S256 code_challenge_method is supported."))
         }
 
+        let state = query["state"] ?? ""
+        let scope = query["scope"]
+
+        // Record the *reviewed* request server-side and bind it to a fresh
+        // CSPRNG nonce. The approve/deny POST carries only this nonce; the
+        // handler reissues the code from this stored record, so an attacker
+        // can't substitute their own redirect_uri/challenge by racing the
+        // approve POST. (Fix #1 — token-theft race / confused deputy.)
+        let nonce = OAuthStore.shared.recordPendingAuthorization(
+            clientID: clientID,
+            redirectURI: redirectURI,
+            codeChallenge: codeChallenge,
+            codeChallengeMethod: challengeMethod,
+            scope: scope,
+            state: state
+        )
+
         let ctx = OAuthApprovalPage.Context(
             clientID: clientID,
             clientName: clientNameLookup(clientID),
             redirectURI: redirectURI,
-            state: query["state"] ?? "",
+            state: state,
             codeChallenge: codeChallenge,
             codeChallengeMethod: challengeMethod,
-            scope: query["scope"],
-            windowState: OAuthStore.shared.approvalWindowState
+            scope: scope,
+            windowState: OAuthStore.shared.approvalWindowState,
+            nonce: nonce
         )
         return htmlResponse(status: 200, html: OAuthApprovalPage.render(ctx))
     }
 
     // MARK: — Approve (`POST /authorize/approve`)
 
-    /// Approves the pending request. Requires the approval window to be
-    /// open *now*; otherwise the click is rejected. On success, generates
-    /// an authorization code and 302s the browser to
-    /// `redirect_uri?code=...&state=...`. Closes the approval window
-    /// immediately so a single window grants exactly one code.
+    /// Approves the pending request. Two gates, both required:
+    ///   1. The approval window must be open *now* (5-minute one-shot).
+    ///   2. The `nonce` from the form must resolve to a server-side
+    ///      pending record created when the user loaded `GET /authorize`.
+    ///
+    /// The authorization code is issued from the STORED record's
+    /// client_id / redirect_uri / code_challenge — NOT from the approve
+    /// POST body — so an attacker can't race the approve POST with their
+    /// own redirect_uri/challenge to hijack the single-shot grant.
+    /// (Fixes #1.) On success, 302s the browser to
+    /// `redirect_uri?code=...&state=...`, then closes the window so one
+    /// window grants exactly one code.
     @MainActor
     static func authorizeApprove(form: [String: String]) -> Data {
         guard OAuthStore.shared.approvalWindowIsOpen else {
@@ -119,32 +144,44 @@ enum OAuthHandlers {
                 message: "Approval window not open. Open it in FMail Settings, then start the connector flow again."
             ))
         }
-        guard let clientID = form["client_id"],
-              let redirectURI = form["redirect_uri"],
-              let challenge = form["code_challenge"]
-        else {
+        guard let nonce = form["nonce"], !nonce.isEmpty else {
             return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
-                message: "Approval form was missing required fields."
+                message: "Approval form was missing the request nonce. Reload the authorization page and try again."
             ))
         }
-        guard isAllowedRedirectURI(redirectURI) else {
-            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
-                message: "redirect_uri scheme not allowed."
+        // Consume (one-shot) the pending record. nil ⇒ unknown/expired/replayed.
+        guard let pending = OAuthStore.shared.consumePendingAuthorization(nonce: nonce) else {
+            return htmlResponse(status: 403, html: OAuthApprovalPage.renderError(
+                message: "This authorization request is unknown or has expired. Reload the authorization page and try again."
             ))
         }
-        let method = form["code_challenge_method"] ?? "S256"
-        let state = form["state"] ?? ""
+        // Re-validate the STORED redirect_uri against current policy (it was
+        // already validated at /authorize, but policy is cheap to re-assert).
+        guard isAllowedRedirectURI(pending.redirectURI) else {
+            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
+                message: "redirect_uri policy not satisfied."
+            ))
+        }
 
+        // Issue the code from the reviewed record — never from the POST body.
         let code = OAuthStore.shared.issueAuthorizationCode(
-            challenge: challenge,
-            challengeMethod: method,
-            redirectURI: redirectURI,
-            clientID: clientID
+            challenge: pending.codeChallenge,
+            challengeMethod: pending.codeChallengeMethod,
+            redirectURI: pending.redirectURI,
+            clientID: pending.clientID
         )
         OAuthStore.shared.closeApprovalWindow()
 
-        let separator = redirectURI.contains("?") ? "&" : "?"
-        let location = "\(redirectURI)\(separator)code=\(percentEncode(code))&state=\(percentEncode(state))"
+        guard let location = buildRedirectLocation(
+            redirectURI: pending.redirectURI,
+            params: [("code", code), ("state", pending.state)]
+        ) else {
+            // Should be unreachable (redirectURI passed policy above), but
+            // never emit a header we couldn't sanitize.
+            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
+                message: "redirect_uri could not be turned into a safe redirect."
+            ))
+        }
         return HTTPParser.formatResponse(
             status: 302,
             body: Data(),
@@ -157,14 +194,27 @@ enum OAuthHandlers {
     @MainActor
     static func authorizeDeny(form: [String: String]) -> Data {
         // Per RFC 6749 §4.1.2.1, deny redirects back with `error=access_denied`.
-        guard let redirectURI = form["redirect_uri"], isAllowedRedirectURI(redirectURI) else {
-            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
-                message: "Missing or unsupported redirect_uri."
+        // Like approve, the redirect target comes from the stored pending
+        // record (keyed by nonce), not from the POST body.
+        guard let nonce = form["nonce"], !nonce.isEmpty,
+              let pending = OAuthStore.shared.consumePendingAuthorization(nonce: nonce) else {
+            return htmlResponse(status: 403, html: OAuthApprovalPage.renderError(
+                message: "This authorization request is unknown or has expired."
             ))
         }
-        let state = form["state"] ?? ""
-        let separator = redirectURI.contains("?") ? "&" : "?"
-        let location = "\(redirectURI)\(separator)error=access_denied&state=\(percentEncode(state))"
+        guard isAllowedRedirectURI(pending.redirectURI) else {
+            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
+                message: "redirect_uri policy not satisfied."
+            ))
+        }
+        guard let location = buildRedirectLocation(
+            redirectURI: pending.redirectURI,
+            params: [("error", "access_denied"), ("state", pending.state)]
+        ) else {
+            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
+                message: "redirect_uri could not be turned into a safe redirect."
+            ))
+        }
         return HTTPParser.formatResponse(
             status: 302,
             body: Data(),
@@ -192,6 +242,11 @@ enum OAuthHandlers {
             return errorResponse(status: 400, code: "invalid_request", description: "Missing client_id.")
         }
 
+        // `exchangeCode` byte-compares `redirectURI` against the value bound
+        // to the code at issue time. That bound value originates from the
+        // server-side pending record (the reviewed redirect_uri), not from
+        // any client-supplied field on the approve POST — so this enforces
+        // an exact round-trip back to what the user approved. (Fixes #1/#2.)
         let result = OAuthStore.shared.exchangeCode(
             code, verifier: verifier, redirectURI: redirectURI, clientID: clientID
         )
@@ -242,16 +297,91 @@ enum OAuthHandlers {
         s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
     }
 
-    /// Restrict `redirect_uri` to web schemes (`http`, `https`). Without
-    /// this, anyone who can reach `/authorize` can craft a URL whose
-    /// approval/deny redirect sends the user to a `javascript:` or
-    /// `data:` URI when they click — a small open-redirect surface.
-    /// `URL(string:)` alone would accept those.
+    /// Build the 302 `Location` value for a redirect back to the client,
+    /// appending percent-encoded query params. Returns nil if the result
+    /// would be unsafe to emit as an HTTP header.
+    ///
+    /// Defense-in-depth (Fix #3): the redirect_uri has already passed
+    /// `isAllowedRedirectURI` (which rejects raw CR/LF), but header
+    /// injection is severe enough to re-check here rather than trust
+    /// `URL(string:)` leniency. If the base or any param contains CR/LF
+    /// we refuse outright instead of emitting a splittable header.
+    private static func buildRedirectLocation(
+        redirectURI: String,
+        params: [(String, String)]
+    ) -> String? {
+        guard !containsCRLF(redirectURI) else { return nil }
+        let separator = redirectURI.contains("?") ? "&" : "?"
+        var location = redirectURI + separator
+        location += params
+            .map { "\($0.0)=\(percentEncode($0.1))" }
+            .joined(separator: "&")
+        // percentEncode already removes CR/LF from param values, but assert
+        // the final string is header-safe before we hand it back.
+        guard !containsCRLF(location) else { return nil }
+        return location
+    }
+
+    /// True if the string contains a raw CR or LF (header-injection chars).
+    private static func containsCRLF(_ s: String) -> Bool {
+        s.contains("\r") || s.contains("\n")
+    }
+
+    /// Redirect-URI policy for `redirect_uri` (Fix #2).
+    ///
+    /// FMail is a single-user app pairing a small, known set of OAuth
+    /// clients. Two legitimate shapes exist:
+    ///   • Hosted connectors (e.g. claude.ai) → **https** callback URLs.
+    ///   • Native/CLI clients → **loopback** `http://127.0.0.1[:port]/…`
+    ///     or `http://localhost[:port]/…` (RFC 8252 §7.3).
+    ///
+    /// Policy, tightest-reasonable without a connector allowlist UI:
+    ///   1. Scheme must be parseable and either `https`, or `http` ONLY
+    ///      when the host is the loopback literal `127.0.0.1` / `localhost`
+    ///      (`::1` too). Any other plain-`http` is rejected — that closes
+    ///      cleartext exfiltration of the code.
+    ///   2. No `userinfo` (`user:pass@host`) — a common phishing/spoofing
+    ///      vector and never needed for an OAuth callback.
+    ///   3. No URL `fragment` — codes go in the query, and a fragment can
+    ///      smuggle data past server-side checks.
+    ///   4. No raw CR/LF anywhere — header-injection defense in depth.
+    ///   5. A host must be present (rules out scheme-only / opaque URLs and
+    ///      things like `javascript:` / `data:` that have no host).
+    ///
+    /// Rationale for not maintaining an explicit host allowlist: hosted
+    /// connector hostnames change and the user still has to click Approve
+    /// on a page that shows the exact redirect_uri, so the scheme/host
+    /// policy plus the visible-approval gate is sufficient here.
     static func isAllowedRedirectURI(_ s: String) -> Bool {
-        guard let url = URL(string: s), let scheme = url.scheme?.lowercased() else {
+        // Reject control chars up front; URLComponents would otherwise
+        // tolerate some and we never want them in a redirect target.
+        guard !containsCRLF(s) else { return false }
+        guard let comps = URLComponents(string: s),
+              let scheme = comps.scheme?.lowercased() else {
             return false
         }
-        return scheme == "http" || scheme == "https"
+        // No userinfo, no fragment.
+        guard comps.user == nil, comps.password == nil, comps.fragment == nil else {
+            return false
+        }
+        // Must have a real host.
+        guard let host = comps.host, !host.isEmpty else { return false }
+        let lowerHost = host.lowercased()
+
+        switch scheme {
+        case "https":
+            return true
+        case "http":
+            // Loopback only — native OAuth clients (RFC 8252). Accept the
+            // IPv6 literal with or without brackets, depending on how the
+            // platform's URLComponents surfaces `host`.
+            return lowerHost == "127.0.0.1"
+                || lowerHost == "localhost"
+                || lowerHost == "::1"
+                || lowerHost == "[::1]"
+        default:
+            return false
+        }
     }
 }
 

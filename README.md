@@ -265,6 +265,14 @@ Read-only by design so it's safe to expose over a tunnel.
 | `get_attachments_for_rowids` | Bulk variant — writes every attachment of every supplied rowid to `save_dir/<rowid>/<filename>`. |
 | `find_unanswered_threads` | Threads where you sent the latest message and haven't heard back. |
 
+> **Attachment writes are confined.** Because attachment bytes are
+> attacker-controlled (anyone can email you a file) and FMail isn't sandboxed,
+> every `save_to_path` / `save_dir` target must resolve **inside `~/Downloads/FMail`**
+> (the folder is created on first use). Relative paths anchor there; absolute
+> paths outside it — and any `..` / symlink escape — are rejected. This keeps a
+> compromised or malicious MCP client from writing arbitrary files (`~/.zshrc`,
+> `~/Library/LaunchAgents/…`).
+
 ### Authentication model
 
 - **Loopback, no token:** if no auth token is set and no tunnel is configured, the server serves

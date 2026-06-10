@@ -18,16 +18,25 @@ struct MIMEContent {
 }
 
 enum MIMEParser {
+    /// Cap on multipart nesting depth. Received mail is attacker-controlled and
+    /// flows through here (indexing + MCP `get_email`); a deeply-nested crafted
+    /// multipart could otherwise overflow the stack via
+    /// parsePart → parseMultipart → parsePart. Real mail rarely nests past
+    /// depth 2-4 (alternative inside mixed inside a forward), so 32 is generous.
+    /// Beyond it we stop descending and treat the part as an opaque leaf rather
+    /// than crashing.
+    private static let maxDepth = 32
+
     /// Parses `bodyData` using the parsed top-level headers.
     static func parse(headers: ParsedHeaders, body: Data) -> MIMEContent {
         let ct = ContentType(headers["content-type"] ?? "text/plain; charset=us-ascii")
         let cte = (headers["content-transfer-encoding"] ?? "7bit").lowercased().trimmingCharacters(in: .whitespaces)
-        return parsePart(contentType: ct, transferEncoding: cte, body: body, partHeaders: headers)
+        return parsePart(contentType: ct, transferEncoding: cte, body: body, partHeaders: headers, depth: 0)
     }
 
-    private static func parsePart(contentType: ContentType, transferEncoding: String, body: Data, partHeaders: ParsedHeaders) -> MIMEContent {
-        if contentType.major == "multipart", let boundary = contentType.parameters["boundary"] {
-            return parseMultipart(body: body, boundary: boundary, subtype: contentType.minor)
+    private static func parsePart(contentType: ContentType, transferEncoding: String, body: Data, partHeaders: ParsedHeaders, depth: Int) -> MIMEContent {
+        if contentType.major == "multipart", let boundary = contentType.parameters["boundary"], depth < maxDepth {
+            return parseMultipart(body: body, boundary: boundary, subtype: contentType.minor, depth: depth + 1)
         }
 
         // Single part.
@@ -63,7 +72,10 @@ enum MIMEParser {
         }
     }
 
-    private static func parseMultipart(body: Data, boundary: String, subtype: String) -> MIMEContent {
+    /// `depth` is the nesting level of this multipart container (1 for the
+    /// top-level multipart). It's threaded into each child `parsePart` so the
+    /// recursion can be capped at `maxDepth` — see `parse`.
+    private static func parseMultipart(body: Data, boundary: String, subtype: String, depth: Int) -> MIMEContent {
         let parts = splitMultipart(body: body, boundary: boundary)
         var aggregatePlain: String?
         var aggregateHTML: String?
@@ -73,7 +85,7 @@ enum MIMEParser {
             let (partHeaders, partBody) = splitHeaderBody(partData)
             let partCT = ContentType(partHeaders["content-type"] ?? "text/plain")
             let partCTE = (partHeaders["content-transfer-encoding"] ?? "7bit").lowercased().trimmingCharacters(in: .whitespaces)
-            let parsed = parsePart(contentType: partCT, transferEncoding: partCTE, body: partBody, partHeaders: partHeaders)
+            let parsed = parsePart(contentType: partCT, transferEncoding: partCTE, body: partBody, partHeaders: partHeaders, depth: depth)
 
             if let p = parsed.plainText, aggregatePlain == nil {
                 aggregatePlain = p

@@ -70,12 +70,15 @@ extension IndexDB {
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(messageRowId))
         var out: [MCPRecipient] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let kind = Int(sqlite3_column_int64(stmt, 0))
             let address = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
             let display = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
             out.append(MCPRecipient(kind: kind, address: address, display: display.isEmpty ? nil : display))
+            rc = sqlite3_step(stmt)
         }
+        try checkRowLoopDone(rc)
         return out
     }
 
@@ -104,7 +107,8 @@ extension IndexDB {
             bind(stmt, Int32(i + 1), Int64(id))
         }
         var out: [Int: MCPMessageEnrichment] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let rowid = Int(sqlite3_column_int64(stmt, 0))
             let path = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
             let tid = Int(sqlite3_column_int64(stmt, 2))
@@ -122,7 +126,9 @@ extension IndexDB {
                 bodyOnDisk: bodyOnDisk,
                 accountEmail: accountEmail
             )
+            rc = sqlite3_step(stmt)
         }
+        try checkRowLoopDone(rc)
         return out
     }
 
@@ -149,12 +155,15 @@ extension IndexDB {
             bind(stmt, Int32(i + 1), Int64(id))
         }
         var out: [Int: Int] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let from = Int(sqlite3_column_int64(stmt, 0))
             let to = Int(sqlite3_column_int64(stmt, 1))
             // Multiple parents per message can exist (rare); first one wins.
             if out[from] == nil { out[from] = to }
+            rc = sqlite3_step(stmt)
         }
+        try checkRowLoopDone(rc)
         return out
     }
 
@@ -226,7 +235,8 @@ extension IndexDB {
 
         var out: [UnansweredThread] = []
         let now = Date()
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let tid = Int(sqlite3_column_int64(stmt, 1))
             let subj = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
             let sender = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
@@ -243,7 +253,9 @@ extension IndexDB {
                 days_silent: daysSilent,
                 recipient_addresses: recipients
             ))
+            rc = sqlite3_step(stmt)
         }
+        try checkRowLoopDone(rc)
         return out
     }
 

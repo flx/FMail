@@ -63,14 +63,61 @@ final class MCPCleanupTests: XCTestCase {
         }
     }
 
-    func testSafeAbsolutePathAcceptsPlainAbsolute() throws {
-        let path = try MCPHandlers.safeAbsolutePath("/tmp/fmail-test-clean.pdf")
-        XCTAssertEqual(path, "/tmp/fmail-test-clean.pdf")
+    func testSafeAbsolutePathAcceptsRelativeInsideRoot() throws {
+        // A relative path is anchored on the allowed root (~/Downloads/FMail),
+        // not the home dir.
+        let path = try MCPHandlers.safeAbsolutePath("fmail-test-clean.pdf")
+        XCTAssertTrue(path.contains("/Downloads/FMail/"), "got \(path)")
+        XCTAssertTrue(path.hasSuffix("fmail-test-clean.pdf"), "got \(path)")
     }
 
-    func testSafeAbsolutePathExpandsTilde() throws {
-        let path = try MCPHandlers.safeAbsolutePath("~/Downloads/fmail-test.pdf")
-        XCTAssertTrue(path.hasPrefix(NSHomeDirectory() + "/Downloads/"), "got \(path)")
+    func testSafeAbsolutePathAcceptsAbsoluteInsideRoot() throws {
+        let inside = MCPHandlers.attachmentSaveRoot + "/sub/fmail-test.pdf"
+        let path = try MCPHandlers.safeAbsolutePath(inside)
+        XCTAssertTrue(path.contains("/Downloads/FMail/"), "got \(path)")
+    }
+
+    func testSafeAbsolutePathRejectsOutsideRoot() {
+        // The whole point of the confinement: an absolute path outside the
+        // allowed root (e.g. ~/.zshrc, /tmp, ~/Downloads itself) is refused,
+        // so a malicious MCP client can't write attachment bytes anywhere.
+        for p in ["/tmp/fmail-test-clean.pdf",
+                  "~/Downloads/fmail-test.pdf",
+                  "~/Library/LaunchAgents/com.evil.plist"] {
+            do {
+                _ = try MCPHandlers.safeAbsolutePath(p)
+                XCTFail("expected PathSafetyError.outsideRoot for \(p)")
+            } catch let err as PathSafetyError {
+                if case .outsideRoot = err { continue }
+                XCTFail("wrong PathSafetyError case for \(p): \(err)")
+            } catch {
+                XCTFail("wrong error type for \(p): \(error)")
+            }
+        }
+    }
+
+    func testSafeAbsolutePathRejectsSymlinkEscape() throws {
+        // A symlink INSIDE the root that points OUTSIDE it must not be a usable
+        // escape: the realpath-based containment check resolves the link and
+        // rejects a write that traverses it. This is the subtle case the plain
+        // `..`/absolute checks don't cover.
+        let root = MCPHandlers.attachmentSaveRoot
+        try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let linkName = "escape-\(UUID().uuidString)"
+        let linkPath = (root as NSString).appendingPathComponent(linkName)
+        // Point the link at a directory well outside the root.
+        try FileManager.default.createSymbolicLink(
+            atPath: linkPath, withDestinationPath: NSTemporaryDirectory()
+        )
+        defer { try? FileManager.default.removeItem(atPath: linkPath) }
+
+        do {
+            _ = try MCPHandlers.safeAbsolutePath("\(linkName)/evil.pdf")
+            XCTFail("expected a symlink-escape path to be rejected")
+        } catch let err as PathSafetyError {
+            if case .outsideRoot = err { return }
+            XCTFail("wrong PathSafetyError case: \(err)")
+        }
     }
 
     func testSafeAbsolutePathRejectsEmpty() {
@@ -176,6 +223,119 @@ final class MCPCleanupTests: XCTestCase {
         let raw = try await sendRaw(port: port, payload: Data(req.utf8))
         XCTAssertTrue(statusLine(raw).hasPrefix("HTTP/1.1 200"),
                       "expected 200 when token matches, got: \(statusLine(raw))")
+    }
+
+    // MARK: — Host/Origin gate (DNS-rebinding defence)
+
+    /// The DNS-rebinding gate: a request from loopback (so `isLoopbackPeer`
+    /// passes) but carrying a non-loopback `Host` — exactly what a browser
+    /// tricked via DNS rebinding sends — must be refused before auth/dispatch.
+    func testMCPRejectsNonLoopbackHost() async throws {
+        let server = MCPServer()
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        let req = "POST /mcp HTTP/1.1\r\nHost: evil.example.com\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+        let raw = try await sendRaw(port: port, payload: Data(req.utf8))
+        XCTAssertTrue(statusLine(raw).hasPrefix("HTTP/1.1 403"),
+                      "expected 403 for a non-loopback Host, got: \(statusLine(raw))")
+    }
+
+    /// A cross-origin browser fetch (loopback Host but a foreign `Origin`) is
+    /// likewise refused.
+    func testMCPRejectsCrossOriginRequest() async throws {
+        let server = MCPServer()
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        let req = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example.com\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+        let raw = try await sendRaw(port: port, payload: Data(req.utf8))
+        XCTAssertTrue(statusLine(raw).hasPrefix("HTTP/1.1 403"),
+                      "expected 403 for a cross-origin Origin, got: \(statusLine(raw))")
+    }
+
+    /// The gate must NOT break legitimate tunnel traffic: a request whose Host
+    /// matches the configured tunnel host is admitted (then auth runs — here it
+    /// carries the matching static token, so it reaches a 200).
+    func testMCPAllowsConfiguredTunnelHost() async throws {
+        let token = MCPSettings.generateAuthToken()
+        MCPSettings.authToken = token
+        MCPSettings.tunnelPublicURL = "https://fmail.example.com"
+        defer { MCPSettings.tunnelPublicURL = "" }
+
+        let server = MCPServer()
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        let body = #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        let req = """
+            POST /mcp HTTP/1.1\r
+            Host: fmail.example.com\r
+            Content-Type: application/json\r
+            Authorization: Bearer \(token)\r
+            Content-Length: \(body.utf8.count)\r
+            \r
+            \(body)
+            """
+        let raw = try await sendRaw(port: port, payload: Data(req.utf8))
+        XCTAssertTrue(statusLine(raw).hasPrefix("HTTP/1.1 200"),
+                      "expected the tunnel host to be admitted, got: \(statusLine(raw))")
+    }
+
+    // MARK: — Slowloris defences (connection cap + read deadline)
+
+    /// Once the concurrency cap is reached, further connections are refused at
+    /// admission — cancelled before any response is produced. Exercised with a
+    /// cap of 1 and a partial (never-completed) request holding the slot.
+    func testConnectionCapRefusesExcessConnections() async throws {
+        let server = MCPServer(maxConcurrentConnections: 1)
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        // Hold the only slot with a partial request (no terminating CRLFCRLF),
+        // so the server keeps reading and the slot stays occupied.
+        let holder = try await openAndSend(
+            port: port, payload: Data("GET /mcp HTTP/1.1\r\nHost: localhost\r\n".utf8)
+        )
+        defer { holder.cancel() }
+        // Let the server admit + start reading the holder before we probe.
+        try await Task.sleep(for: .milliseconds(400))
+
+        // A second complete request is refused at admission — the server cancels
+        // it, which surfaces client-side as either an empty read or a reset
+        // (thrown). Either way there is no HTTP response.
+        let raw = (try? await sendRaw(
+            port: port, payload: Data("GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        )) ?? Data()
+        XCTAssertFalse(statusLine(raw).hasPrefix("HTTP/1.1"),
+                       "expected the over-cap connection to get no HTTP response, got: \(statusLine(raw))")
+    }
+
+    /// A peer that opens a connection but never finishes its request (slowloris)
+    /// has the connection cancelled by the read-deadline watchdog. Verified with
+    /// a short deadline so the test is fast and deterministic.
+    func testReadDeadlineClosesIncompleteRequest() async throws {
+        let server = MCPServer(requestReadDeadline: .milliseconds(300))
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        let started = Date()
+        // Partial request that never completes; the watchdog cancels it. The
+        // cancel surfaces as an empty read or a reset (thrown) — neither is an
+        // HTTP response.
+        let raw = (try? await sendRaw(
+            port: port, payload: Data("GET /mcp HTTP/1.1\r\nHost: localhost\r\n".utf8)
+        )) ?? Data()
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertFalse(statusLine(raw).hasPrefix("HTTP/1.1"),
+                       "expected no HTTP response for a deadline-cancelled connection, got: \(statusLine(raw))")
+        XCTAssertLessThan(elapsed, 5.0,
+                          "connection should be cancelled near the 300ms deadline, not held open")
     }
 
     // MARK: — Strict enum parsing
@@ -334,6 +494,38 @@ final class MCPCleanupTests: XCTestCase {
         return String(data: raw.subdata(in: 0..<crlf.lowerBound), encoding: .ascii) ?? ""
     }
 
+    /// Open a loopback connection and send `payload`, returning the still-open
+    /// `NWConnection` WITHOUT reading any response. Used to hold a connection
+    /// open (e.g. a partial request that never completes) while the test probes
+    /// server behaviour. The caller must `cancel()` it.
+    private func openAndSend(port: UInt16, payload: Data) async throws -> NWConnection {
+        let conn = NWConnection(
+            host: .ipv4(.loopback),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tcp
+        )
+        let q = DispatchQueue(label: "mcp.cleanup.holder")
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            conn.stateUpdateHandler = { state in
+                switch state {
+                // Clear the handler before resuming so a later `.failed`
+                // (e.g. the server resetting the connection) can't resume this
+                // already-resumed continuation a second time.
+                case .ready: conn.stateUpdateHandler = nil; cont.resume()
+                case .failed(let err), .waiting(let err): conn.stateUpdateHandler = nil; cont.resume(throwing: err)
+                default: break
+                }
+            }
+            conn.start(queue: q)
+        }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            conn.send(content: payload, completion: .contentProcessed { err in
+                if let err { cont.resume(throwing: err) } else { cont.resume() }
+            })
+        }
+        return conn
+    }
+
     private func sendRaw(port: UInt16, payload: Data) async throws -> Data {
         let conn = NWConnection(
             host: .ipv4(.loopback),
@@ -344,13 +536,19 @@ final class MCPCleanupTests: XCTestCase {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             conn.stateUpdateHandler = { state in
                 switch state {
-                case .ready: cont.resume()
-                case .failed(let err), .waiting(let err): cont.resume(throwing: err)
+                // Clear the handler before resuming so a later `.failed`
+                // (e.g. the server resetting the connection) can't resume this
+                // already-resumed continuation a second time.
+                case .ready: conn.stateUpdateHandler = nil; cont.resume()
+                case .failed(let err), .waiting(let err): conn.stateUpdateHandler = nil; cont.resume(throwing: err)
                 default: break
                 }
             }
             conn.start(queue: q)
         }
+        // Send may race a server-side reset (the over-cap / deadline cases),
+        // which surfaces as a thrown error here; the caller treats a thrown
+        // send as "no response" just like an empty read.
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             conn.send(content: payload, completion: .contentProcessed { err in
                 if let err { cont.resume(throwing: err) } else { cont.resume() }

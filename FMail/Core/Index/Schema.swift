@@ -22,6 +22,14 @@ enum Schema {
         """)
 
         let v = currentSchemaVersion(db)
+        // Downgrade guard: a newer FMail build may have written a schema we
+        // don't understand. Running our migrations against it would leave the
+        // DB in an inconsistent state and fail later with opaque errors. The
+        // index is a derived cache, so surfacing this as a clean load failure
+        // (which the caller can recover from by rebuilding) is the safe move.
+        guard v <= Self.currentVersion else {
+            throw IndexDBError.schemaTooNew(stored: v, supported: Self.currentVersion)
+        }
         if v < 1 { try migrateTo1(db) }
         if v < 2 { try migrateTo2(db) }
         if v < 3 { try migrateTo3(db) }
@@ -140,17 +148,7 @@ enum Schema {
 
             "INSERT INTO schema_version(version, applied_at) VALUES (1, strftime('%s','now'));"
         ]
-
-        try exec(db, "BEGIN TRANSACTION;")
-        do {
-            for s in statements {
-                try exec(db, s)
-            }
-            try exec(db, "COMMIT;")
-        } catch {
-            try? exec(db, "ROLLBACK;")
-            throw error
-        }
+        try runMigration(db, statements: statements)
     }
 
     /// v7: per-account writeback service preference. Lets the user route
@@ -175,14 +173,7 @@ enum Schema {
             """,
             "INSERT INTO schema_version(version, applied_at) VALUES (7, strftime('%s','now'));"
         ]
-        try exec(db, "BEGIN TRANSACTION;")
-        do {
-            for s in statements { try exec(db, s) }
-            try exec(db, "COMMIT;")
-        } catch {
-            try? exec(db, "ROLLBACK;")
-            throw error
-        }
+        try runMigration(db, statements: statements)
     }
 
     /// v6: mirror Apple's `messages.remote_id` (IMAP UID per canonical
@@ -195,14 +186,7 @@ enum Schema {
             "CREATE INDEX idx_messages_imap_uid ON messages(imap_uid) WHERE imap_uid IS NOT NULL;",
             "INSERT INTO schema_version(version, applied_at) VALUES (6, strftime('%s','now'));"
         ]
-        try exec(db, "BEGIN TRANSACTION;")
-        do {
-            for s in statements { try exec(db, s) }
-            try exec(db, "COMMIT;")
-        } catch {
-            try? exec(db, "ROLLBACK;")
-            throw error
-        }
+        try runMigration(db, statements: statements)
     }
 
     /// v5: recover from a pre-fix bug where every sync wiped FTS body content.
@@ -215,14 +199,7 @@ enum Schema {
             "UPDATE messages SET body_indexed = 0;",
             "INSERT INTO schema_version(version, applied_at) VALUES (5, strftime('%s','now'));"
         ]
-        try exec(db, "BEGIN TRANSACTION;")
-        do {
-            for s in statements { try exec(db, s) }
-            try exec(db, "COMMIT;")
-        } catch {
-            try? exec(db, "ROLLBACK;")
-            throw error
-        }
+        try runMigration(db, statements: statements)
     }
 
     /// v4: store the RFC 2822 Message-ID header on each message, joined from
@@ -236,14 +213,7 @@ enum Schema {
             "CREATE INDEX idx_messages_rfc ON messages(rfc_message_id) WHERE rfc_message_id IS NOT NULL;",
             "INSERT INTO schema_version(version, applied_at) VALUES (4, strftime('%s','now'));"
         ]
-        try exec(db, "BEGIN TRANSACTION;")
-        do {
-            for s in statements { try exec(db, s) }
-            try exec(db, "COMMIT;")
-        } catch {
-            try? exec(db, "ROLLBACK;")
-            throw error
-        }
+        try runMigration(db, statements: statements)
     }
 
     /// v3: mirror Apple's `labels` table so Gmail label-mailboxes (INBOX,
@@ -262,14 +232,7 @@ enum Schema {
             "CREATE INDEX idx_message_labels_mailbox ON message_labels(mailbox_rowid);",
             "INSERT INTO schema_version(version, applied_at) VALUES (3, strftime('%s','now'));"
         ]
-        try exec(db, "BEGIN TRANSACTION;")
-        do {
-            for s in statements { try exec(db, s) }
-            try exec(db, "COMMIT;")
-        } catch {
-            try? exec(db, "ROLLBACK;")
-            throw error
-        }
+        try runMigration(db, statements: statements)
     }
 
     /// v2: contact preference table (reserved; not yet read/written by code).
@@ -284,6 +247,14 @@ enum Schema {
             """,
             "INSERT INTO schema_version(version, applied_at) VALUES (2, strftime('%s','now'));"
         ]
+        try runMigration(db, statements: statements)
+    }
+
+    /// Run one migration's statements inside a single transaction, rolling
+    /// back on any failure. Every `migrateToN` passes its full statement list
+    /// (the `INSERT INTO schema_version(...)` row must be the last element so
+    /// the version bump only lands if every preceding DDL succeeded).
+    private static func runMigration(_ db: OpaquePointer, statements: [String]) throws {
         try exec(db, "BEGIN TRANSACTION;")
         do {
             for s in statements { try exec(db, s) }
@@ -310,6 +281,7 @@ enum IndexDBError: Error, CustomStringConvertible {
     case execFailed(String)
     case prepareFailed(String)
     case stepFailed(String)
+    case schemaTooNew(stored: Int, supported: Int)
 
     var description: String {
         switch self {
@@ -317,6 +289,8 @@ enum IndexDBError: Error, CustomStringConvertible {
         case .execFailed(let m): return "Index DB exec failed: \(m)"
         case .prepareFailed(let m): return "Index DB prepare failed: \(m)"
         case .stepFailed(let m): return "Index DB step failed: \(m)"
+        case .schemaTooNew(let stored, let supported):
+            return "Index DB schema version \(stored) is newer than this build supports (\(supported)); the index was written by a newer FMail. Rebuild the index to continue."
         }
     }
 }

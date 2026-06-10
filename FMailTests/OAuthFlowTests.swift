@@ -89,8 +89,13 @@ final class OAuthFlowTests: XCTestCase {
 
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
 
-        let form = "client_id=abc&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=xyz"
-        let raw = try await postForm(port: port, path: "/authorize/approve", body: form)
+        // The approve POST now carries only the server-issued nonce from
+        // GET /authorize; client_id/redirect_uri/challenge come from the
+        // stored pending record, not the POST body.
+        let nonce = try await fetchApprovalNonce(
+            port: port, challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", state: "xyz"
+        )
+        let raw = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
         XCTAssertTrue(responseStatus(raw).hasPrefix("HTTP/1.1 302"))
         // Location header contains the auth code + state, points at the
         // requested redirect_uri.
@@ -105,6 +110,24 @@ final class OAuthFlowTests: XCTestCase {
         XCTAssertFalse(stillOpen)
     }
 
+    /// The token-theft race fix: with the window open, an approve POST whose
+    /// nonce was never issued by GET /authorize is rejected — an attacker
+    /// can't consume the window by submitting their own redirect_uri.
+    func testApprovePathRejectsUnknownNonce() async throws {
+        let server = MCPServer()
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        await MainActor.run { OAuthStore.shared.openApprovalWindow() }
+
+        let raw = try await postForm(port: port, path: "/authorize/approve", body: "nonce=not-a-real-nonce")
+        XCTAssertTrue(responseStatus(raw).hasPrefix("HTTP/1.1 403"))
+        // The window must NOT have been consumed by the bogus attempt.
+        let stillOpen = await MainActor.run { OAuthStore.shared.approvalWindowIsOpen }
+        XCTAssertTrue(stillOpen)
+    }
+
     // MARK: — End-to-end /token exchange
 
     func testTokenExchangeIssuesSessionToken() async throws {
@@ -116,10 +139,11 @@ final class OAuthFlowTests: XCTestCase {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
-        // 1. Open window + approve a synthetic request.
+        // 1. Open window + approve a synthetic request (GET /authorize first
+        //    to obtain the nonce, then approve with it).
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
-        let approveBody = "client_id=test&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb&code_challenge=\(challenge)&code_challenge_method=S256&state=xyz"
-        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: approveBody)
+        let nonce = try await fetchApprovalNonce(port: port, challenge: challenge, state: "xyz")
+        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
         XCTAssertTrue(responseStatus(approveResp).hasPrefix("HTTP/1.1 302"))
         let code = try XCTUnwrap(extractQueryParam("code", fromLocationIn: approveResp))
 
@@ -146,8 +170,8 @@ final class OAuthFlowTests: XCTestCase {
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
-        let approveBody = "client_id=test&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb&code_challenge=\(challenge)&code_challenge_method=S256&state=xyz"
-        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: approveBody)
+        let nonce = try await fetchApprovalNonce(port: port, challenge: challenge, state: "xyz")
+        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
         let code = try XCTUnwrap(extractQueryParam("code", fromLocationIn: approveResp))
 
         // Wrong verifier.
@@ -168,8 +192,8 @@ final class OAuthFlowTests: XCTestCase {
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
-        let approveBody = "client_id=test&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb&code_challenge=\(challenge)&code_challenge_method=S256&state=xyz"
-        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: approveBody)
+        let nonce = try await fetchApprovalNonce(port: port, challenge: challenge, state: "xyz")
+        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
         let code = try XCTUnwrap(extractQueryParam("code", fromLocationIn: approveResp))
 
         let tokenBody = "grant_type=authorization_code&code=\(code)&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb&client_id=test&code_verifier=\(verifier)"
@@ -301,6 +325,23 @@ final class OAuthFlowTests: XCTestCase {
     private func get(port: UInt16, path: String) async throws -> Data {
         let req = "GET \(path) HTTP/1.1\r\nHost: localhost\r\n\r\n"
         return try await sendRaw(port: port, payload: Data(req.utf8))
+    }
+
+    /// Drive `GET /authorize` (which records a server-side pending request)
+    /// and pull the issued nonce out of the rendered approval form. The
+    /// approve/deny POST then carries only this nonce. `redirect_uri` is
+    /// fixed to `https://claude.ai/cb` to match the assertions above.
+    private func fetchApprovalNonce(port: UInt16, challenge: String, state: String) async throws -> String {
+        let query = "response_type=code&client_id=test"
+            + "&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb"
+            + "&code_challenge=\(challenge)&code_challenge_method=S256&state=\(state)"
+        let resp = try await get(port: port, path: "/authorize?\(query)")
+        let html = bodyString(resp)
+        let marker = "name=\"nonce\" value=\""
+        let nonceStart = try XCTUnwrap(html.range(of: marker), "approval form must embed a nonce")
+        let rest = html[nonceStart.upperBound...]
+        let end = try XCTUnwrap(rest.firstIndex(of: "\""), "nonce value must be quoted")
+        return String(rest[..<end])
     }
 
     private func responseStatus(_ raw: Data) -> String {

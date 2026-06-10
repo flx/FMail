@@ -25,6 +25,12 @@ enum OAuthApprovalPage {
         let codeChallengeMethod: String
         let scope: String?
         let windowState: OAuthStore.ApprovalWindowState
+        /// Server-generated CSPRNG nonce binding this rendered page to the
+        /// pending authorization record. Embedded as a hidden form field;
+        /// it's the ONLY field `POST /authorize/approve` trusts to look up
+        /// what the user actually reviewed. The displayed client_id /
+        /// redirect_uri / challenge below are informational only.
+        let nonce: String
     }
 
     static func render(_ ctx: Context) -> String {
@@ -141,16 +147,17 @@ enum OAuthApprovalPage {
         formWithHiddenFields(action: "/authorize/deny", ctx: ctx, button: "Deny", primary: false)
     }
 
+    /// The form carries ONLY the server-issued `nonce`. The approve/deny
+    /// handlers reconstruct client_id / redirect_uri / PKCE challenge /
+    /// scope / state from the server-side pending record keyed by this
+    /// nonce — they deliberately do NOT trust those values from the POST
+    /// body, which closes the token-theft race where an attacker swaps in
+    /// their own redirect_uri/challenge to consume the approval window.
     private static func formWithHiddenFields(action: String, ctx: Context, button: String, primary: Bool) -> String {
         let cls = primary ? "primary" : ""
         return """
         <form method="POST" action="\(action)">
-            <input type="hidden" name="client_id" value="\(escape(ctx.clientID))">
-            <input type="hidden" name="redirect_uri" value="\(escape(ctx.redirectURI))">
-            <input type="hidden" name="state" value="\(escape(ctx.state))">
-            <input type="hidden" name="code_challenge" value="\(escape(ctx.codeChallenge))">
-            <input type="hidden" name="code_challenge_method" value="\(escape(ctx.codeChallengeMethod))">
-            <input type="hidden" name="scope" value="\(escape(ctx.scope ?? ""))">
+            <input type="hidden" name="nonce" value="\(escape(ctx.nonce))">
             <button type="submit" class="\(cls)">\(button)</button>
         </form>
         """

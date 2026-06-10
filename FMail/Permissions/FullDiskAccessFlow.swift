@@ -31,38 +31,3 @@ enum FullDiskAccess {
         }
     }
 }
-
-import SwiftUI
-
-struct FullDiskAccessPrompt: View {
-    var onRecheck: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Label("Full Disk Access required", systemImage: "lock.shield")
-                .font(.title2)
-
-            Text("FMail reads Apple Mail's local data at `~/Library/Mail/` to build a faster index and search. macOS gates this behind Full Disk Access.")
-                .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Steps:").font(.headline)
-                Text("1. Click *Open System Settings* below.")
-                Text("2. Toggle FMail on in the Full Disk Access list. (You may need to drag FMail.app into the list if it isn't shown.)")
-                Text("3. Return here and click *Recheck*. macOS Tahoe sometimes requires relaunching FMail before the change takes effect.")
-            }
-            .font(.callout)
-
-            HStack {
-                Button("Open System Settings") {
-                    FullDiskAccess.openSystemSettings()
-                }
-                .keyboardShortcut(.defaultAction)
-
-                Button("Recheck", action: onRecheck)
-            }
-        }
-        .padding(20)
-        .frame(maxWidth: 520)
-    }
-}

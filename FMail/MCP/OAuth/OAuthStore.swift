@@ -47,6 +47,83 @@ final class OAuthStore {
 
     private var pendingCodes: [String: PendingCode] = [:]
 
+    // MARK: — Pending authorization requests (nonce-bound approval)
+
+    /// A *reviewed* authorization request. Created when `GET /authorize`
+    /// renders the approval page, keyed by a server-generated CSPRNG
+    /// nonce embedded as a hidden field in the approve/deny forms.
+    ///
+    /// The point: the values the user actually saw on the page (client_id,
+    /// redirect_uri, PKCE challenge, …) are captured here at render time.
+    /// `POST /authorize/approve` then issues the code from THIS record
+    /// rather than from the approve POST body, so an attacker can't swap
+    /// in their own redirect_uri/challenge to consume the approval window.
+    struct PendingAuthorization {
+        let clientID: String
+        let redirectURI: String
+        let codeChallenge: String
+        let codeChallengeMethod: String
+        let scope: String?
+        let state: String
+        let createdAt: Date
+        var isExpired: Bool { Date().timeIntervalSince(createdAt) > OAuthStore.pendingAuthorizationTTL }
+    }
+
+    /// How long a rendered-but-unapproved request stays pending. Generous
+    /// enough that the user can flip to FMail, open the approval window,
+    /// and come back to click Approve, but short so a stale nonce can't be
+    /// replayed later. Independent of `codeTTL`.
+    nonisolated static let pendingAuthorizationTTL: TimeInterval = 600  // 10 minutes
+
+    private var pendingAuthorizations: [String: PendingAuthorization] = [:]
+
+    /// Record a reviewed authorization request and return its nonce. The
+    /// nonce is a fresh CSPRNG token (same generator as codes/sessions);
+    /// it's embedded as a hidden form field so the subsequent approve/deny
+    /// POST can be bound back to exactly this record.
+    func recordPendingAuthorization(
+        clientID: String,
+        redirectURI: String,
+        codeChallenge: String,
+        codeChallengeMethod: String,
+        scope: String?,
+        state: String
+    ) -> String {
+        gcExpiredPendingAuthorizations()
+        let nonce = randomToken(byteCount: 32)
+        pendingAuthorizations[nonce] = PendingAuthorization(
+            clientID: clientID,
+            redirectURI: redirectURI,
+            codeChallenge: codeChallenge,
+            codeChallengeMethod: codeChallengeMethod,
+            scope: scope,
+            state: state,
+            createdAt: Date()
+        )
+        return nonce
+    }
+
+    /// Look up and CONSUME (remove) the pending request for `nonce`.
+    /// One-shot: a nonce is valid for exactly one approve-or-deny. Returns
+    /// nil if the nonce is unknown or expired (an expired record is also
+    /// removed). Callers must treat nil as "reject".
+    func consumePendingAuthorization(nonce: String) -> PendingAuthorization? {
+        gcExpiredPendingAuthorizations()
+        guard let record = pendingAuthorizations.removeValue(forKey: nonce) else {
+            return nil
+        }
+        if record.isExpired { return nil }
+        return record
+    }
+
+    /// Drop pending authorizations that have aged out, bounding the dict
+    /// against an attacker repeatedly hitting `GET /authorize`. Called
+    /// opportunistically on record/consume.
+    private func gcExpiredPendingAuthorizations() {
+        let cutoff = Date().addingTimeInterval(-Self.pendingAuthorizationTTL)
+        pendingAuthorizations = pendingAuthorizations.filter { $0.value.createdAt > cutoff }
+    }
+
     /// Generate a fresh authorization code and store the round-trip
     /// context (challenge + redirect_uri + client_id) so the token
     /// endpoint can verify the exchange.
@@ -214,16 +291,55 @@ final class OAuthStore {
 
     private static let sessionsKey = "mcp.oauth.sessions.v1"
 
+    /// Load persisted sessions resiliently. We decode entry-by-entry
+    /// (`[String: JSONValue]` first, then each value into `Session`) so a
+    /// single malformed/forward-incompatible entry is skipped rather than
+    /// silently un-pairing EVERY connector. Concretely: if a future build
+    /// adds a non-optional `Session` field, old-build entries written
+    /// without it won't wipe the whole store — only entries that genuinely
+    /// fail to decode are dropped, and the failure is logged.
+    ///
+    /// If a future field must survive a round-trip through an older build,
+    /// add it as `Optional` (or with a `decodeIfPresent` default) so
+    /// per-entry decode keeps succeeding here.
     private func loadSessions() {
-        guard let data = UserDefaults.standard.data(forKey: Self.sessionsKey),
-              let decoded = try? JSONDecoder().decode([String: Session].self, from: data)
-        else { return }
-        sessions = decoded
+        guard let data = UserDefaults.standard.data(forKey: Self.sessionsKey) else { return }
+
+        // First try the whole-blob decode (the common, all-current path).
+        if let decoded = try? JSONDecoder().decode([String: Session].self, from: data) {
+            sessions = decoded
+            return
+        }
+
+        // Fall back to per-entry decoding so one bad entry doesn't drop all.
+        guard let raw = try? JSONDecoder().decode([String: JSONValue].self, from: data) else {
+            Log.mcp.error("OAuthStore.loadSessions: sessions blob is not a JSON object; keeping current sessions")
+            return
+        }
+        var recovered: [String: Session] = [:]
+        var skipped = 0
+        for (token, value) in raw {
+            guard let entryData = try? JSONEncoder().encode(value),
+                  let session = try? JSONDecoder().decode(Session.self, from: entryData) else {
+                skipped += 1
+                continue
+            }
+            recovered[token] = session
+        }
+        if skipped > 0 {
+            Log.mcp.error("OAuthStore.loadSessions: skipped \(skipped, privacy: .public) undecodable session entry(ies); recovered \(recovered.count, privacy: .public)")
+        }
+        sessions = recovered
     }
 
     private func persistSessions() {
-        if let data = try? JSONEncoder().encode(sessions) {
+        do {
+            let data = try JSONEncoder().encode(sessions)
             UserDefaults.standard.set(data, forKey: Self.sessionsKey)
+        } catch {
+            // Don't silently drop: a failed persist means a pairing/revoke
+            // won't survive restart, which is a real (if rare) bug.
+            Log.mcp.error("OAuthStore.persistSessions: failed to encode sessions: \(String(describing: error), privacy: .public)")
         }
     }
 

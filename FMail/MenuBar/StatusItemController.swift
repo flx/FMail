@@ -55,6 +55,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// read/unread", and which of the two is enabled.
     private var selectedRowIds: Set<Int> = []
 
+    /// Set when the last list query threw, so the placeholder can say
+    /// "Couldn't load" instead of the misleading "No unread messages".
+    private var lastListLoadFailed = false
+
+    /// Guards against stacking modal error alerts when several bulk-action
+    /// failures land in quick succession (`NSAlert.runModal` pumps a nested
+    /// run loop, so a second observation callback could open a second alert
+    /// on top of the first).
+    private var isPresentingError = false
+
     /// Settings window, created on first open and reused (see `openSettings`).
     private var settingsWindow: NSWindow?
 
@@ -71,6 +81,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem.menu = menu
         updateStatusBadge()
         observeUnreadCount()
+        observeBulkActionError()
     }
 
     // MARK: — Menu construction (once)
@@ -194,7 +205,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             // the badge can't lag behind the visible rows.
             if let count = try? await self.model.indexDB?.countAllUnreadExcludingDrafts() {
                 if Task.isCancelled { return }
-                self.model.allUnreadCount = count
+                // Only write on a real change — `allUnreadCount` is observed
+                // (see `observeUnreadCount`), and an unconditional write would
+                // fire that observer on every refresh for no reason.
+                if self.model.allUnreadCount != count { self.model.allUnreadCount = count }
                 self.updateStatusBadge()
             }
         }
@@ -211,7 +225,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func fetchSplit(query: String) async -> (priority: [MessageHeader], other: [MessageHeader]) {
         guard let db = model.indexDB, let compiled = compiledSource() else { return ([], []) }
-        return (try? await db.searchSplitByPriority(compiled, limitPerBlock: Self.maxPerBlock)) ?? ([], [])
+        do {
+            let split = try await db.searchSplitByPriority(compiled, limitPerBlock: Self.maxPerBlock)
+            lastListLoadFailed = false
+            return split
+        } catch {
+            Log.db.error("searchSplitByPriority failed: \(String(describing: error), privacy: .public)")
+            lastListLoadFailed = true
+            return ([], [])
+        }
     }
 
     private func updateEmailItems() {
@@ -413,9 +435,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             placeholderItem.title = "Couldn't load mail"
             placeholderItem.isEnabled = false
         case .ready:
-            placeholderItem.title = currentSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "No unread messages"
-                : "No results"
+            if lastListLoadFailed {
+                placeholderItem.title = "Couldn't load messages"
+            } else {
+                placeholderItem.title = currentSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "No unread messages"
+                    : "No results"
+            }
             placeholderItem.isEnabled = false
         }
         if !placeholderItem.isEnabled {
@@ -678,16 +704,21 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Host Settings in a real AppKit window. The SwiftUI `Settings` scene's
     /// `showSettingsWindow:` action doesn't fire for an `LSUIElement` accessory
     /// app (no key window / no main menu to route through), so we own the
-    /// window directly and reuse it across opens.
+    /// window directly and reuse it across opens. The SwiftUI tree is rebuilt
+    /// on every open so its `@State` re-reads the current settings — the
+    /// priority list and token/port can change from the menu while this
+    /// (cached) window is hidden.
     @objc private func openSettings() {
+        let hosting = NSHostingController(rootView: MinimalSettingsView(model: model))
         if settingsWindow == nil {
-            let hosting = NSHostingController(rootView: MinimalSettingsView(model: model))
             let window = NSWindow(contentViewController: hosting)
             window.title = "FMail Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.center()
             settingsWindow = window
+        } else {
+            settingsWindow?.contentViewController = hosting
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
@@ -711,8 +742,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: — Status-item badge
 
-    /// Keep the menu-bar unread count live even while the menu is closed by
-    /// re-arming observation each time `allUnreadCount` changes.
+    /// Keep the menu-bar badge live even while the menu is closed by re-arming
+    /// observation each time `allUnreadCount` changes. Deliberately only
+    /// repaints the badge — it must NOT call `refreshEmails()`, which itself
+    /// writes `allUnreadCount` and would re-trigger this observer in a
+    /// self-sustaining query loop. The open menu refreshes its rows via
+    /// `menuNeedsUpdate`.
     private func observeUnreadCount() {
         withObservationTracking {
             _ = model.allUnreadCount
@@ -720,7 +755,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             Task { @MainActor in
                 guard let self else { return }
                 self.updateStatusBadge()
-                self.refreshEmails()
                 self.observeUnreadCount()
             }
         }
@@ -730,6 +764,42 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let button = statusItem.button else { return }
         let count = model.allUnreadCount
         button.title = count > 0 ? " \(min(count, 999))" : ""
+    }
+
+    // MARK: — Action errors
+
+    /// Surface a failed Mark-as-read/unread (AppleScript or local-index write)
+    /// to the user. Without this the optimistic flip silently reverts on the
+    /// next sync and the user has no idea why. Re-arms after each change; the
+    /// message is consumed (cleared) so the same error isn't shown twice.
+    private func observeBulkActionError() {
+        withObservationTracking {
+            _ = model.bulkActionError
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                if let message = self.model.bulkActionError {
+                    self.model.bulkActionError = nil
+                    self.presentActionError(message)
+                }
+                self.observeBulkActionError()
+            }
+        }
+    }
+
+    private func presentActionError(_ message: String) {
+        // `runModal` pumps a nested run loop, so a second error arriving while
+        // this alert is up could otherwise stack a second modal on top.
+        guard !isPresentingError else { return }
+        isPresentingError = true
+        defer { isPresentingError = false }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Couldn't update Mail"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: — Helpers

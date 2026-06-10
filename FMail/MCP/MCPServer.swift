@@ -9,6 +9,10 @@ import Network
 actor MCPServer {
     private var listener: NWListener?
     private(set) var isRunning = false
+    /// Set across the `start()` suspension point (NWListener `.ready` await)
+    /// so a re-entrant `start()` can't slip past the `isRunning` check while
+    /// the first call is suspended and bind a second listener to the port.
+    private var isStarting = false
     private(set) var port: UInt16 = 0
     private(set) var lastError: String?
 
@@ -19,8 +23,38 @@ actor MCPServer {
     /// against a misbehaving client wedging us with megabytes of bytes.
     private static let maxRequestBytes = 1 << 20  // 1 MB
 
-    init(dispatcher: MCPDispatcher = MCPDispatcher()) {
+    /// Hard ceiling on simultaneous in-flight connections. JSON-RPC requests
+    /// are short-lived, so legitimate clients never need many at once; this
+    /// caps the blast radius of a slowloris-style flood (esp. over a tunnel,
+    /// where reads happen before auth). New connections beyond this are
+    /// closed immediately. Defaults to 64; overridable via `init` so tests
+    /// can exercise the cap with a small value.
+    static let defaultMaxConcurrentConnections = 64
+    private let maxConcurrentConnections: Int
+
+    /// Wall-clock budget for reading one complete HTTP request. A peer that
+    /// hasn't sent a full request within this window (slowloris) has its
+    /// connection cancelled by a watchdog. Generous enough for slow local
+    /// pipes / tunnel latency, tight enough to free the connection slot.
+    /// Defaults to 15s; overridable via `init` so tests can use a short value.
+    static let defaultRequestReadDeadline: Duration = .seconds(15)
+    private let requestReadDeadline: Duration
+
+    /// In-flight per-connection work, keyed by a per-connection token so
+    /// `stop()` can cancel both the watchdog/handler task and the underlying
+    /// NWConnection. Also drives the concurrency cap above. Actor-isolated —
+    /// only mutated from this actor. The connection is boxed (`ConnectionBox`)
+    /// because `NWConnection` isn't `Sendable`.
+    private var activeConnections: [UUID: (task: Task<Void, Never>, box: ConnectionBox)] = [:]
+
+    init(
+        dispatcher: MCPDispatcher = MCPDispatcher(),
+        maxConcurrentConnections: Int = MCPServer.defaultMaxConcurrentConnections,
+        requestReadDeadline: Duration = MCPServer.defaultRequestReadDeadline
+    ) {
         self.dispatcher = dispatcher
+        self.maxConcurrentConnections = maxConcurrentConnections
+        self.requestReadDeadline = requestReadDeadline
     }
 
     /// Hand the dispatcher out so callers (`MCPTools.register`) can register
@@ -32,10 +66,17 @@ actor MCPServer {
     /// transitions to `.failed` / `.waiting` (port already in use surfaces
     /// as `.waiting`).
     func start(port portToUse: Int) async throws {
-        guard !isRunning else { return }
+        // Reject re-entrant starts. `isRunning` alone isn't enough: it's only
+        // set *after* the `.ready` await below, so without `isStarting` a
+        // second start() could pass the guard while the first is suspended and
+        // bind a second NWListener to the same port.
+        guard !isRunning, !isStarting else { return }
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(portToUse)) else {
             throw MCPServerError.invalidPort(portToUse)
         }
+
+        isStarting = true
+        defer { isStarting = false }
 
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
@@ -70,7 +111,10 @@ actor MCPServer {
                 }
             }
             newListener.newConnectionHandler = { [weak self] conn in
-                Task { [weak self] in await self?.handleConnection(conn) }
+                // Box immediately: `NWConnection` isn't Sendable, so it can't
+                // be captured directly into the detached Task.
+                let box = ConnectionBox(conn)
+                Task { [weak self] in await self?.admitConnection(box) }
             }
             newListener.start(queue: queue)
         }
@@ -101,11 +145,48 @@ actor MCPServer {
         listener = nil
         isRunning = false
         port = 0
+        // Tear down any in-flight connections too — cancelling only the
+        // listener leaves accepted connections (and their watchdog/handler
+        // tasks) running until they finish on their own. Cancel the task
+        // (which unwinds the handler) and the underlying NWConnection.
+        let inflight = activeConnections
+        activeConnections.removeAll()
+        for (_, entry) in inflight {
+            entry.task.cancel()
+            entry.box.conn.cancel()
+        }
     }
 
     // MARK: — Connection handling
 
-    private func handleConnection(_ conn: NWConnection) async {
+    /// Entry point for every accepted connection. Enforces the concurrency
+    /// cap, then registers a tracked task (so `stop()` can cancel it) that
+    /// runs the handler under a read-deadline watchdog.
+    private func admitConnection(_ box: ConnectionBox) {
+        // Over the cap → refuse immediately, before we read or even start the
+        // connection. Cheap back-pressure against a connection flood.
+        guard activeConnections.count < maxConcurrentConnections else {
+            Log.mcp.error("MCP refused connection: at concurrency cap (\(self.maxConcurrentConnections, privacy: .public))")
+            box.conn.cancel()
+            return
+        }
+
+        let token = UUID()
+        let task = Task { [weak self] in
+            await self?.handleConnection(box)
+            await self?.connectionFinished(token)
+        }
+        activeConnections[token] = (task: task, box: box)
+    }
+
+    /// Remove a connection from the active set once its handler returns. No-op
+    /// if `stop()` already cleared it.
+    private func connectionFinished(_ token: UUID) {
+        activeConnections[token] = nil
+    }
+
+    private func handleConnection(_ box: ConnectionBox) async {
+        let conn = box.conn
         // Defense-in-depth: refuse any peer that isn't on loopback.
         if !isLoopbackPeer(conn) {
             conn.cancel()
@@ -115,8 +196,26 @@ actor MCPServer {
         conn.start(queue: queue)
         defer { conn.cancel() }
 
+        // Read-deadline watchdog: a slowloris peer can dribble bytes (or
+        // none) to pin the connection open before we ever reach auth. Cancel
+        // the NWConnection after the budget elapses — that unblocks the
+        // `receive` continuation in `readHTTPRequest` with an error, so the
+        // read loop returns nil and we fall through to `defer { conn.cancel() }`.
+        // The watchdog is itself cancelled the moment the read completes, so a
+        // fast request never trips it. NWConnection.cancel() is idempotent.
+        // Capture the box (Sendable), not the raw connection, across the Task.
+        let watchdog = Task {
+            try? await Task.sleep(for: requestReadDeadline)
+            guard !Task.isCancelled else { return }
+            Log.mcp.error("MCP connection read deadline exceeded — cancelling")
+            box.conn.cancel()
+        }
+
         // Read until we have a complete HTTP request (or hit the size cap).
-        guard let (request, _) = await readHTTPRequest(conn) else {
+        let read = await readHTTPRequest(conn)
+        watchdog.cancel()
+
+        guard let (request, _) = read else {
             return
         }
 
@@ -154,6 +253,24 @@ actor MCPServer {
     private func produceResponse(for request: HTTPRequestLine) async -> Data {
         let method = request.method.uppercased()
         let path = request.path
+
+        // — Host/Origin gate (DNS-rebinding + cross-origin defence).
+        //   `isLoopbackPeer` only proves the TCP peer is on 127.0.0.1 — a
+        //   browser tricked via DNS rebinding (evil.com → 127.0.0.1) still
+        //   connects from loopback but sends `Host: evil.com`. The allowlist
+        //   admits only loopback + the configured tunnel host, so such a
+        //   request is refused before auth/dispatch ever runs. Applied to
+        //   every route: allowed hosts already cover both the local Claude
+        //   Code client and the tunnel client, so discovery/authorize/token
+        //   stay reachable over the tunnel by design.
+        guard hostIsAllowed(request) else {
+            Log.mcp.error("MCP rejected request: disallowed Host header (possible DNS rebinding)")
+            return HTTPParser.formatResponse(status: 403, body: Data(#"{"error":"forbidden_host"}"#.utf8))
+        }
+        guard originIsAllowed(request) else {
+            Log.mcp.error("MCP rejected request: disallowed Origin header (cross-origin browser fetch)")
+            return HTTPParser.formatResponse(status: 403, body: Data(#"{"error":"forbidden_origin"}"#.utf8))
+        }
 
         // — OAuth endpoints. Auth is what they implement, so they run
         //   unauthenticated by design; public-internet exposure is gated
@@ -305,18 +422,72 @@ actor MCPServer {
         return base
     }
 
+    /// Bare hostname of the configured tunnel (e.g. `fmail.example.com` from
+    /// `https://fmail.example.com/`), lowercased, port stripped. Empty when no
+    /// tunnel is configured or the URL doesn't parse. Used by the Host/Origin
+    /// allowlist so tunnel traffic is admitted while arbitrary `Host:` values
+    /// (DNS-rebinding attacks) are not.
+    nonisolated static func tunnelHostName() -> String {
+        let raw = MCPSettings.tunnelPublicURL.trimmingCharacters(in: .whitespaces)
+        guard !raw.isEmpty else { return "" }
+        // Prefer URLComponents; fall back to manual parsing if the user typed
+        // a bare host (no scheme), which URLComponents would treat as a path.
+        if let host = URLComponents(string: raw)?.host, !host.isEmpty {
+            return host.lowercased()
+        }
+        var s = raw.lowercased()
+        if let schemeRange = s.range(of: "://") { s = String(s[schemeRange.upperBound...]) }
+        if let slash = s.firstIndex(of: "/") { s = String(s[..<slash]) }
+        return hostName(stripping: s)
+    }
+
+    /// Strip an optional `:port` (and IPv6 `[...]` brackets) from a host
+    /// authority, returning the bare lowercased name.
+    nonisolated static func hostName(stripping authority: String) -> String {
+        let h = authority.lowercased()
+        if h.hasPrefix("["), let close = h.firstIndex(of: "]") {
+            return String(h[h.index(after: h.startIndex)..<close])
+        }
+        if let colon = h.firstIndex(of: ":") {
+            return String(h[h.startIndex..<colon])
+        }
+        return h
+    }
+
+    /// Host-header allowlist: true iff the request's `Host` is loopback or the
+    /// configured tunnel host. This is the DNS-rebinding gate — a browser
+    /// pointed at `evil.com` (resolving to 127.0.0.1) connects from loopback
+    /// (so `isLoopbackPeer` passes) but carries `Host: evil.com`, which is
+    /// neither loopback nor the tunnel host, so it's rejected here. An
+    /// empty/missing Host is *not* allowed.
+    nonisolated func hostIsAllowed(_ request: HTTPRequestLine) -> Bool {
+        let host = (request.headers["host"] ?? "").trimmingCharacters(in: .whitespaces)
+        guard !host.isEmpty else { return false }
+        if Self.isLoopbackHost(host) { return true }
+        let tunnel = Self.tunnelHostName()
+        return !tunnel.isEmpty && Self.hostName(stripping: host) == tunnel
+    }
+
+    /// Origin-header gate. Browsers attach `Origin` to cross-site fetches; if
+    /// present, its host must be loopback or the tunnel host. Requests without
+    /// an `Origin` (the normal MCP/CLI client case) pass. A present-but-
+    /// disallowed Origin is rejected (cross-origin browser fetch defence).
+    nonisolated func originIsAllowed(_ request: HTTPRequestLine) -> Bool {
+        let origin = (request.headers["origin"] ?? "").trimmingCharacters(in: .whitespaces)
+        guard !origin.isEmpty, origin.lowercased() != "null" else { return true }
+        // Origin is `scheme://host[:port]` — reuse the same authority parsing.
+        var s = origin.lowercased()
+        if let schemeRange = s.range(of: "://") { s = String(s[schemeRange.upperBound...]) }
+        if let slash = s.firstIndex(of: "/") { s = String(s[..<slash]) }
+        if Self.isLoopbackHost(s) { return true }
+        let tunnel = Self.tunnelHostName()
+        return !tunnel.isEmpty && Self.hostName(stripping: s) == tunnel
+    }
+
     /// True for `127.0.0.1`, `localhost`, or `::1`, with or without a port
     /// (and IPv6 bracket form `[::1]:8765`).
     nonisolated static func isLoopbackHost(_ host: String) -> Bool {
-        let h = host.lowercased()
-        let name: String
-        if h.hasPrefix("["), let close = h.firstIndex(of: "]") {
-            name = String(h[h.index(after: h.startIndex)..<close])
-        } else if let colon = h.firstIndex(of: ":") {
-            name = String(h[h.startIndex..<colon])
-        } else {
-            name = h
-        }
+        let name = hostName(stripping: host)
         return name == "127.0.0.1" || name == "localhost" || name == "::1"
     }
 
@@ -408,6 +579,19 @@ enum MCPServerError: Error, CustomStringConvertible {
         case .invalidPort(let p): return "invalid MCP port: \(p)"
         }
     }
+}
+
+/// Sendable wrapper around an `NWConnection`. `NWConnection` itself is not
+/// `Sendable` (declared with `NW_OBJECT_DECL`, not the sendable variant), so
+/// to hand a connection across the actor's task boundaries — the detached
+/// handler task, the read-deadline watchdog, and the `activeConnections`
+/// registry consulted by `stop()` — without tripping Swift 6 region
+/// isolation, we box it. The wrapped operations we use (`start`, `cancel`,
+/// `send`, `receive`) all marshal onto the connection's dispatch queue and
+/// are safe to invoke from any thread, so the `@unchecked` is sound.
+private final class ConnectionBox: @unchecked Sendable {
+    let conn: NWConnection
+    init(_ conn: NWConnection) { self.conn = conn }
 }
 
 /// Tiny one-shot atomic flag used to guard the startup continuation against

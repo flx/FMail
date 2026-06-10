@@ -177,7 +177,9 @@ final class EnvelopeReadOnly {
         defer { sqlite3_finalize(stmt) }
 
         var out: [Mailbox] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            defer { rc = sqlite3_step(stmt) }
             let rowid = Int(sqlite3_column_int64(stmt, 0))
             guard let urlCStr = sqlite3_column_text(stmt, 1) else { continue }
             let urlStr = String(cString: urlCStr)
@@ -195,6 +197,7 @@ final class EnvelopeReadOnly {
                 kind: .other
             ))
         }
+        guard rc == SQLITE_DONE else { throw EnvelopeIndexError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -299,9 +302,12 @@ final class EnvelopeReadOnly {
         defer { sqlite3_finalize(stmt) }
         var out: [(Int, Int)] = []
         out.reserveCapacity(300_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append((Int(sqlite3_column_int64(stmt, 0)), Int(sqlite3_column_int64(stmt, 1))))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw EnvelopeIndexError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out.map { (messageRowId: $0.0, mailboxRowId: $0.1) }
     }
 
@@ -315,9 +321,12 @@ final class EnvelopeReadOnly {
         defer { sqlite3_finalize(stmt) }
         var out: [(rowid: Int, read: Bool)] = []
         out.reserveCapacity(160_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append((Int(sqlite3_column_int64(stmt, 0)), sqlite3_column_int(stmt, 1) != 0))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw EnvelopeIndexError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -355,7 +364,8 @@ final class EnvelopeReadOnly {
 
         var out: [RawMessage] = []
         out.reserveCapacity(160_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let rowid = Int(sqlite3_column_int64(stmt, 0))
             let hash = sqlite3_column_int64(stmt, 1)
             let mboxId = Int(sqlite3_column_int64(stmt, 2))
@@ -384,7 +394,13 @@ final class EnvelopeReadOnly {
                 rfcMessageId: rfcId,
                 imapUID: uid
             ))
+            rc = sqlite3_step(stmt)
         }
+        // A truncated read here (SQLITE_BUSY/ERROR/CORRUPT while Mail.app writes
+        // the Envelope Index concurrently) would feed Indexer.pruneMessagesNotIn
+        // a too-small keep-set and DELETE index rows that still exist. Throw so
+        // the sync aborts and retries instead of silently shrinking the index.
+        guard rc == SQLITE_DONE else { throw EnvelopeIndexError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -400,7 +416,8 @@ final class EnvelopeReadOnly {
 
         var out: [RawRecipient] = []
         out.reserveCapacity(250_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append(RawRecipient(
                 messageRowId: Int(sqlite3_column_int64(stmt, 0)),
                 kind: Int(sqlite3_column_int64(stmt, 1)),
@@ -408,7 +425,9 @@ final class EnvelopeReadOnly {
                 address: Self.text(stmt, 3),
                 display: Self.text(stmt, 4)
             ))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw EnvelopeIndexError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -419,13 +438,16 @@ final class EnvelopeReadOnly {
 
         var out: [RawReference] = []
         out.reserveCapacity(500_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append(RawReference(
                 fromRowId: Int(sqlite3_column_int64(stmt, 0)),
                 toHash: sqlite3_column_int64(stmt, 1),
                 isParent: sqlite3_column_int(stmt, 2) != 0
             ))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw EnvelopeIndexError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 }

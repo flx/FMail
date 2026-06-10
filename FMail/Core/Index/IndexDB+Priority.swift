@@ -29,9 +29,12 @@ extension IndexDB {
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         var out = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             if let c = sqlite3_column_text(stmt, 0) { out.insert(String(cString: c)) }
+            rc = sqlite3_step(stmt)
         }
+        try checkRowLoopDone(rc)
         return out
     }
 
@@ -61,11 +64,14 @@ extension IndexDB {
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, limit)
         var out: [RecentSender] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let address = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
             let display = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
             if !address.isEmpty { out.append(RecentSender(address: address, display: display)) }
+            rc = sqlite3_step(stmt)
         }
+        try checkRowLoopDone(rc)
         return out
     }
 
@@ -128,9 +134,12 @@ extension IndexDB {
         defer { sqlite3_finalize(stmt) }
         bindAll(stmt, q.bindings, trailing: [.int(isRead ? 1 : 0), .int(Int64(limit))])
         var out: [Int] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append(Int(sqlite3_column_int64(stmt, 0)))
+            rc = sqlite3_step(stmt)
         }
+        try checkRowLoopDone(rc)
         return out
     }
 
@@ -152,7 +161,7 @@ extension IndexDB {
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         bindAll(stmt, q.bindings, trailing: [.int(Int64(limit))])
-        return Self.collectMessageHeaders(stmt)
+        return try Self.collectMessageHeaders(stmt)
     }
 
     /// Whether the sender is priority — exact-match in `priority_addr` OR a GLOB

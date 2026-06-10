@@ -91,13 +91,16 @@ actor IndexDB {
         try prepare(sql, into: &stmt)
         defer { sqlite3_finalize(stmt) }
         var out: [(Int, Int, Int?, String?)] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let rowid = Int(sqlite3_column_int64(stmt, 0))
             let mboxId = Int(sqlite3_column_int64(stmt, 1))
             let uid: Int? = sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 2))
             let rfc = sqlite3_column_text(stmt, 3).map { String(cString: $0) }
             out.append((rowid, mboxId, uid, rfc))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out.map { (rowid: $0.0, mailboxRowId: $0.1, imapUID: $0.2, rfcMessageId: $0.3) }
     }
 
@@ -116,9 +119,12 @@ actor IndexDB {
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(limit))
         var out: [(Int, Int)] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append((Int(sqlite3_column_int64(stmt, 0)), Int(sqlite3_column_int64(stmt, 1))))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out.map { (rowid: $0.0, mailboxRowId: $0.1) }
     }
 
@@ -146,11 +152,14 @@ actor IndexDB {
             bind(stmt, Int32(i + 1), Int64(id))
         }
         var out: [Int: Int] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let rowid = Int(sqlite3_column_int64(stmt, 0))
             let tid = Int(sqlite3_column_int64(stmt, 1))
             out[rowid] = tid
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -197,7 +206,7 @@ actor IndexDB {
             case .text(let s): bind(stmt, Int32(i + 1), s)
             }
         }
-        return Self.collectMessageHeaders(stmt)
+        return try Self.collectMessageHeaders(stmt)
     }
 
     // MARK: — Read API for UI
@@ -212,7 +221,8 @@ actor IndexDB {
         try prepare("SELECT apple_rowid, account_uuid, path, name, hidden, total_count, unread_count, kind FROM mailboxes ORDER BY name", into: &stmt)
         defer { sqlite3_finalize(stmt) }
         var out: [Mailbox] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let rowid = Int(sqlite3_column_int64(stmt, 0))
             let acctUUID = String(cString: sqlite3_column_text(stmt, 1))
             let path = String(cString: sqlite3_column_text(stmt, 2))
@@ -231,7 +241,9 @@ actor IndexDB {
                 hidden: hidden,
                 kind: kind
             ))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -240,12 +252,15 @@ actor IndexDB {
         try prepare("SELECT uuid, display_name, email_address FROM accounts ORDER BY display_name", into: &stmt)
         defer { sqlite3_finalize(stmt) }
         var out: [MailAccount] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             let uuid = String(cString: sqlite3_column_text(stmt, 0))
             let name = String(cString: sqlite3_column_text(stmt, 1))
             let email = sqlite3_column_text(stmt, 2).map { String(cString: $0) }
             out.append(MailAccount(uuid: uuid, displayName: name, emailAddress: email))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -313,7 +328,7 @@ actor IndexDB {
         defer { sqlite3_finalize(stmt) }
         bind(stmt, 1, Int64(threadId))
         bind(stmt, 2, Int64(threadId))
-        return Self.collectMessageHeaders(stmt)
+        return try Self.collectMessageHeaders(stmt)
     }
 
     // MARK: — Internals used by ThreadGrouper
@@ -326,9 +341,12 @@ actor IndexDB {
         defer { sqlite3_finalize(stmt) }
         var out: [Int: Bool] = [:]
         out.reserveCapacity(200_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out[Int(sqlite3_column_int64(stmt, 0))] = sqlite3_column_int(stmt, 1) != 0
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out
     }
 
@@ -340,7 +358,8 @@ actor IndexDB {
         defer { sqlite3_finalize(stmt) }
         var out: [(Int, Int64, Int, Bool, Bool)] = []
         out.reserveCapacity(200_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append((
                 Int(sqlite3_column_int64(stmt, 0)),
                 sqlite3_column_int64(stmt, 1),
@@ -348,7 +367,9 @@ actor IndexDB {
                 sqlite3_column_int(stmt, 3) != 0,
                 sqlite3_column_int(stmt, 4) != 0
             ))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out.map { (rowid: $0.0, hash: $0.1, date: $0.2, isRead: $0.3, isFlagged: $0.4) }
     }
 
@@ -358,9 +379,12 @@ actor IndexDB {
         defer { sqlite3_finalize(stmt) }
         var out: [(Int, Int64)] = []
         out.reserveCapacity(200_000)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append((Int(sqlite3_column_int64(stmt, 0)), sqlite3_column_int64(stmt, 1)))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out.map { (from: $0.0, toHash: $0.1) }
     }
 
@@ -423,10 +447,23 @@ actor IndexDB {
     }
 
     /// Decode every remaining row as a `MessageHeader`.
-    nonisolated static func collectMessageHeaders(_ stmt: OpaquePointer?) -> [MessageHeader] {
+    ///
+    /// Throws on a terminal code other than `SQLITE_DONE` (BUSY/ERROR/CORRUPT
+    /// from Mail.app's concurrent writes), so a truncated result surfaces to
+    /// the caller instead of silently returning a short list — consistent with
+    /// the other read loops (see `checkRowLoopDone`). It's `nonisolated static`
+    /// with no `db` handle, so the thrown message carries the raw `rc` rather
+    /// than `sqlite3_errmsg`; all callers (`search`, `loadThreadMessages`,
+    /// `searchSplitByPriority`) already `throws`.
+    nonisolated static func collectMessageHeaders(_ stmt: OpaquePointer?) throws -> [MessageHeader] {
         var out: [MessageHeader] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append(decodeMessageHeader(stmt))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else {
+            throw IndexDBError.stepFailed("collectMessageHeaders: terminal rc=\(rc) (result would be truncated)")
         }
         return out
     }
@@ -465,6 +502,19 @@ actor IndexDB {
     func stepDone(_ stmt: OpaquePointer?) throws {
         let rc = sqlite3_step(stmt)
         if rc != SQLITE_DONE && rc != SQLITE_ROW {
+            throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Assert that a read loop's terminal `sqlite3_step` return code is
+    /// `SQLITE_DONE`. Any other code (SQLITE_BUSY/ERROR/CORRUPT — common while
+    /// Mail.app concurrently writes the Envelope Index) means the loop stopped
+    /// early and the collected results are truncated; we throw rather than
+    /// silently return a short list, which would feed `pruneMessagesNotIn` a
+    /// too-small keep-set. Exposed (non-private) so the IndexDB extensions in
+    /// other files can reach `db`'s `sqlite3_errmsg`, which is file-private.
+    func checkRowLoopDone(_ rc: Int32) throws {
+        guard rc == SQLITE_DONE else {
             throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
     }

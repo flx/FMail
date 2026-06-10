@@ -421,35 +421,116 @@ extension MCPHandlers {
 
     // MARK: — Helpers
 
-    /// Resolve a user-supplied path: tilde expansion, then make absolute
-    /// relative to the user's home (the only sensible default in a
-    /// single-user macOS app). Rejects paths containing `..` segments —
-    /// any authenticated MCP client otherwise gets unrestricted write
-    /// access to any user-writable file (`~/.zshrc`, ssh keys, etc.).
-    /// A handful of legitimate paths happen to contain `..` (e.g.
-    /// `~/Documents/../Downloads/foo.pdf`); they can be re-expressed
-    /// without the parent reference.
+    /// The single directory under which every attachment write is allowed.
+    /// Attachment bytes are attacker-controlled (anyone can email you a
+    /// file), and FMail is NOT sandboxed, so an unconfined write is an
+    /// arbitrary-file-write → code-execution primitive (`~/.zshrc`,
+    /// `~/Library/LaunchAgents/*.plist`, ssh keys, …). Confining every
+    /// write to one allowlisted root removes that primitive.
+    static let attachmentSaveRoot = (NSHomeDirectory() as NSString)
+        .appendingPathComponent("Downloads/FMail")
+
+    /// Resolve and *confine* a user-supplied save path to ``attachmentSaveRoot``
+    /// (`~/Downloads/FMail`). The returned absolute path is guaranteed to be
+    /// the root itself or a descendant of it, even in the presence of `..`
+    /// segments, tilde expansion, or symlinks anywhere along an existing
+    /// prefix of the path.
+    ///
+    /// Resolution rules:
+    ///   * A relative path is resolved relative to the root (NOT the home
+    ///     dir), so `foo/bar.pdf` lands at `~/Downloads/FMail/foo/bar.pdf`.
+    ///   * An absolute (or `~`-expanded) path must already point inside the
+    ///     root; otherwise it is rejected.
+    ///   * The candidate's deepest *existing* ancestor is canonicalised with
+    ///     `realpath` (symlink-resolved) and the unresolved tail re-appended;
+    ///     the result must still be contained in the canonicalised root. This
+    ///     defeats symlink-escape (e.g. a symlinked subdir pointing at `/`)
+    ///     and `..` tricks uniformly. Containment is compared by path
+    ///     components, never by string prefix, so `~/Downloads/FMailEvil`
+    ///     can't masquerade as living under `~/Downloads/FMail`.
+    ///
+    /// The root is created (with intermediate dirs) so the canonicalisation
+    /// below always has a real, symlink-resolved anchor to compare against.
     static func safeAbsolutePath(_ path: String) throws -> String {
         let trimmed = path.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else {
             throw PathSafetyError.emptyPath
         }
+
+        // Materialise the root so we have a canonical anchor. If the user
+        // has replaced ~/Downloads/FMail with a symlink to somewhere else,
+        // realpath() will follow it — that's their own deliberate choice for
+        // the root and is out of scope; we only defend against escapes *via*
+        // an attacker-controlled save path, not against the user pointing
+        // the root elsewhere themselves.
+        try? FileManager.default.createDirectory(
+            atPath: attachmentSaveRoot, withIntermediateDirectories: true
+        )
+        let canonicalRoot = canonicalise(attachmentSaveRoot)
+        let rootComponents = (canonicalRoot as NSString).pathComponents
+
+        // Build the candidate absolute path. Relative paths anchor on the
+        // root; absolute / tilde paths are taken as-is and must prove they
+        // already live inside the root.
         let expanded = (trimmed as NSString).expandingTildeInPath
-        let absolute: String
+        let candidate: String
         if (expanded as NSString).isAbsolutePath {
-            absolute = expanded
+            candidate = (expanded as NSString).standardizingPath
         } else {
-            absolute = ((NSHomeDirectory() as NSString).appendingPathComponent(expanded) as NSString).standardizingPath
+            candidate = ((canonicalRoot as NSString)
+                .appendingPathComponent(expanded) as NSString).standardizingPath
         }
-        // After standardisation, no `..` segment should appear. We check
-        // both the standardised form and the raw input so a client can't
-        // sneak `..` past us by exploiting a quirk of `standardizingPath`.
-        let standardised = (absolute as NSString).standardizingPath
-        let components = (standardised as NSString).pathComponents
-        if components.contains("..") || (trimmed as NSString).pathComponents.contains("..") {
+
+        // Belt-and-braces: a literal `..` in either the raw input or the
+        // standardised candidate is rejected outright. The containment check
+        // below is the real guarantee, but this keeps the failure message
+        // crisp for the common, obviously-malicious case.
+        if (trimmed as NSString).pathComponents.contains("..")
+            || (candidate as NSString).pathComponents.contains("..") {
             throw PathSafetyError.parentReference(trimmed)
         }
-        return standardised
+
+        // Canonicalise: realpath the deepest existing ancestor (resolving any
+        // symlinks along it), then re-append the not-yet-existing tail.
+        let resolved = canonicalise(candidate)
+        guard isContained(resolved, within: rootComponents) else {
+            throw PathSafetyError.outsideRoot(trimmed)
+        }
+        return resolved
+    }
+
+    /// Canonicalise `path` by `realpath`-resolving its deepest existing
+    /// ancestor (which collapses symlinks and `..`/`.`), then re-appending
+    /// the remaining, not-yet-existing components. `realpath` on a missing
+    /// leaf returns the input unchanged, so we must resolve a prefix that
+    /// actually exists for symlink resolution to mean anything.
+    private static func canonicalise(_ path: String) -> String {
+        let fm = FileManager.default
+        var existing = (path as NSString).standardizingPath
+        var tail: [String] = []
+        while existing != "/" && !existing.isEmpty && !fm.fileExists(atPath: existing) {
+            tail.insert((existing as NSString).lastPathComponent, at: 0)
+            existing = (existing as NSString).deletingLastPathComponent
+        }
+        // `URL.resolvingSymlinksInPath` wraps realpath(3) for the existing
+        // prefix; falls back to the standardised input if it can't resolve.
+        let resolvedPrefix = existing.isEmpty
+            ? existing
+            : URL(fileURLWithPath: existing).resolvingSymlinksInPath().path
+        var result = resolvedPrefix
+        for component in tail {
+            result = (result as NSString).appendingPathComponent(component)
+        }
+        return result
+    }
+
+    /// True iff `path` is `rootComponents` itself or a strict descendant of
+    /// it, compared component-by-component (so `/a/b/FMailEvil` is NOT a
+    /// child of `/a/b/FMail`).
+    private static func isContained(_ path: String, within rootComponents: [String]) -> Bool {
+        let pathComponents = (path as NSString).pathComponents
+        guard pathComponents.count >= rootComponents.count else { return false }
+        return Array(pathComponents.prefix(rootComponents.count)) == rootComponents
     }
 
     private static func writeAttachment(_ data: Data, to absolutePath: String) throws {
@@ -486,6 +567,7 @@ extension MCPHandlers {
 enum PathSafetyError: Error, CustomStringConvertible {
     case emptyPath
     case parentReference(String)
+    case outsideRoot(String)
 
     var description: String {
         switch self {
@@ -493,6 +575,8 @@ enum PathSafetyError: Error, CustomStringConvertible {
             return "path is empty"
         case .parentReference(let p):
             return "path contains a `..` segment (\(p)) — re-express without parent references"
+        case .outsideRoot(let p):
+            return "path (\(p)) resolves outside the allowed directory — attachment writes must stay inside ~/Downloads/FMail (pass a relative path, or an absolute path already under that folder)"
         }
     }
 }
