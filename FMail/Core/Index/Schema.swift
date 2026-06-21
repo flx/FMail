@@ -4,7 +4,7 @@ import SQLite3
 /// FMail's own SQLite schema. Versioned via `schema_version` so future
 /// migrations can detect prior state and upgrade in place.
 enum Schema {
-    static let currentVersion: Int = 7
+    static let currentVersion: Int = 9
 
     /// Apply migrations to bring the DB up to `currentVersion`. Idempotent.
     static func apply(to db: OpaquePointer) throws {
@@ -37,6 +37,93 @@ enum Schema {
         if v < 5 { try migrateTo5(db) }
         if v < 6 { try migrateTo6(db) }
         if v < 7 { try migrateTo7(db) }
+        if v < 8 { try migrateTo8(db) }
+        if v < 9 { try migrateTo9(db) }
+    }
+
+    /// v9: relevance-ranking overhaul. Splits the single `body_text` FTS column
+    /// into `body_clean` (the real message text — primary ranking column) and
+    /// `body_quoted` (stripped reply chains / signatures — near-zero weight,
+    /// kept for recall), reorders the columns so `bm25()` weights line up with
+    /// their importance, and adds `messages.is_bulk` so the ranker can discount
+    /// newsletters / list mail. See `RelevanceTuning` for the weights and
+    /// `BodyCleaner.split` / `BulkHeuristic` for how the new columns are filled.
+    ///
+    /// FTS5 has no in-place column migration, so we drop and recreate
+    /// `messages_fts`. Subject / sender / recipients / attachment_names are
+    /// repopulated immediately from `messages` (so search keeps working before
+    /// the next sync); the two body columns + `is_bulk` are filled by the body
+    /// sweep, which we re-arm by resetting `body_indexed = 0` for every row
+    /// (same pattern as v5/v8). The index is a derived cache, so a full
+    /// re-parse of the `.emlx` files is a safe, if slow, one-time cost.
+    private static func migrateTo9(_ db: OpaquePointer) throws {
+        let statements = [
+            "ALTER TABLE messages ADD COLUMN is_bulk INTEGER NOT NULL DEFAULT 0;",
+            "DROP TABLE IF EXISTS messages_fts;",
+            ftsCreateStatement,
+            // Repopulate the metadata columns now so search isn't blank between
+            // this migration and the next full sync. Body columns stay empty
+            // until the body sweep refills them (body_indexed reset below).
+            """
+            INSERT INTO messages_fts(rowid, subject, body_clean, body_quoted, sender, recipients, attachment_names)
+            SELECT m.apple_rowid,
+                   COALESCE(m.subject_prefix, '') || COALESCE(m.subject, ''),
+                   '', '',
+                   COALESCE(m.sender_address, '') || ' ' || COALESCE(m.sender_display, ''),
+                   COALESCE((
+                       SELECT GROUP_CONCAT(COALESCE(r.address, '') || ' ' || COALESCE(r.display, ''), ' ')
+                       FROM recipients r WHERE r.message_rowid = m.apple_rowid
+                   ), ''),
+                   ''
+            FROM messages m
+            """,
+            "UPDATE messages SET body_indexed = 0;",
+            "INSERT INTO schema_version(version, applied_at) VALUES (9, strftime('%s','now'));"
+        ]
+        try runMigration(db, statements: statements)
+    }
+
+    /// The current `messages_fts` definition. Column order is load-bearing:
+    /// `bm25()` takes per-column weights positionally, and `RelevanceTuning`
+    /// lists its weights in exactly this order
+    /// (subject, body_clean, body_quoted, sender, recipients, attachment_names).
+    static let ftsCreateStatement = """
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            subject, body_clean, body_quoted, sender, recipients, attachment_names,
+            tokenize = 'unicode61 remove_diacritics 2'
+        );
+        """
+
+    /// v8: per-attachment metadata table, so the DSL can filter by content
+    /// type and size (`attachment-type:pdf`, `attachment-size:>1mb`) without
+    /// loading every candidate body. Populated by `BodyIndexer` via
+    /// `setBodyContent` as it parses `.emlx` files. `byte_count` is the
+    /// decoded local size; for attachments Apple Mail has offloaded
+    /// ("Optimise Mac Storage") it falls back to the declared
+    /// `X-Apple-Content-Length`, and `locally_available` is 0.
+    ///
+    /// Backfill: reset `body_indexed` for attachment-bearing messages so the
+    /// indexer re-runs and fills the table. The incremental FTS path
+    /// preserves already-indexed body text, so this only re-reads `.emlx`
+    /// files; messages with no attachments are left alone.
+    private static func migrateTo8(_ db: OpaquePointer) throws {
+        let statements = [
+            """
+            CREATE TABLE attachments (
+                message_rowid INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                content_type TEXT NOT NULL DEFAULT '',
+                byte_count INTEGER NOT NULL DEFAULT 0,
+                locally_available INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (message_rowid, idx)
+            ) WITHOUT ROWID;
+            """,
+            "CREATE INDEX idx_attachments_ctype ON attachments(content_type);",
+            "UPDATE messages SET body_indexed = 0 WHERE has_attachment = 1;",
+            "INSERT INTO schema_version(version, applied_at) VALUES (8, strftime('%s','now'));"
+        ]
+        try runMigration(db, statements: statements)
     }
 
     static func currentSchemaVersion(_ db: OpaquePointer) -> Int {

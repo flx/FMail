@@ -93,7 +93,7 @@ extension MCPHandlers {
             // Disk-write mode — sidesteps the per-tool-call payload cap.
             let absolute: String
             do {
-                absolute = try safeAbsolutePath(savePath)
+                absolute = try resolveSavePath(savePath)
             } catch let err as PathSafetyError {
                 throw JSONRPCErrorPayload(
                     code: JSONRPCErrorCode.invalidParams,
@@ -166,7 +166,7 @@ extension MCPHandlers {
         }
         let saveDir: String
         do {
-            saveDir = try safeAbsolutePath(saveDirRaw)
+            saveDir = try resolveSavePath(saveDirRaw)
         } catch let err as PathSafetyError {
             throw JSONRPCErrorPayload(
                 code: JSONRPCErrorCode.invalidParams,
@@ -305,7 +305,7 @@ extension MCPHandlers {
                     message: "fetch_from_server: `save_to_path` requires `attachment_index`"
                 )
             }
-            do { savePath = try safeAbsolutePath(raw) }
+            do { savePath = try resolveSavePath(raw) }
             catch let err as PathSafetyError {
                 throw JSONRPCErrorPayload(
                     code: JSONRPCErrorCode.invalidParams,
@@ -421,14 +421,41 @@ extension MCPHandlers {
 
     // MARK: — Helpers
 
-    /// The single directory under which every attachment write is allowed.
-    /// Attachment bytes are attacker-controlled (anyone can email you a
-    /// file), and FMail is NOT sandboxed, so an unconfined write is an
-    /// arbitrary-file-write → code-execution primitive (`~/.zshrc`,
-    /// `~/Library/LaunchAgents/*.plist`, ssh keys, …). Confining every
-    /// write to one allowlisted root removes that primitive.
+    /// Confinement root for attachment writes that arrive **over the tunnel**.
+    /// Attachment bytes are attacker-controlled (anyone can email you a file),
+    /// and FMail is NOT sandboxed, so an unconfined write is an arbitrary-
+    /// file-write → code-execution primitive (`~/.zshrc`,
+    /// `~/Library/LaunchAgents/*.plist`, ssh keys, …). A remote caller who got
+    /// past the bearer token is confined here so that primitive stays closed.
+    /// Local (loopback) callers — the user's own machine — are NOT confined;
+    /// see ``resolveSavePath(_:)``.
     static let attachmentSaveRoot = (NSHomeDirectory() as NSString)
         .appendingPathComponent("Downloads/FMail")
+
+    /// Resolve a caller-supplied `save_to_path`, honouring the request origin
+    /// (a per-request task-local set by `MCPDispatcher`). Local (loopback)
+    /// requests may write anywhere the process can; tunnel requests stay
+    /// confined to ``attachmentSaveRoot``. This keeps the read-only-over-the-
+    /// tunnel posture intact (a leaked bearer token still can't write outside
+    /// the save root) while giving the local user full filesystem reach.
+    static func resolveSavePath(_ path: String) throws -> String {
+        MCPRequestContext.isLocal
+            ? try unconfinedAbsolutePath(path)
+            : try safeAbsolutePath(path)
+    }
+
+    /// Resolve a path with NO confinement: tilde-expand, resolve a relative
+    /// path against `$HOME`, standardise away `.`/`..`. Local requests only.
+    /// Missing parents are created at write time by ``writeAttachment(_:to:)``.
+    static func unconfinedAbsolutePath(_ path: String) throws -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { throw PathSafetyError.emptyPath }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let absolute = (expanded as NSString).isAbsolutePath
+            ? expanded
+            : (NSHomeDirectory() as NSString).appendingPathComponent(expanded)
+        return (absolute as NSString).standardizingPath
+    }
 
     /// Resolve and *confine* a user-supplied save path to ``attachmentSaveRoot``
     /// (`~/Downloads/FMail`). The returned absolute path is guaranteed to be

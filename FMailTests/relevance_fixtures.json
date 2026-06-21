@@ -1,0 +1,75 @@
+[
+  {
+    "query": "Tredegar completion solicitor",
+    "relevant_rowids": [4723, 121398, 120914, 120915, 120916],
+    "note": "The headline failure case: an eBay listing (9001) and an FT newsletter (9002) quote an old conveyancing signature, so under the un-weighted blob ranking they beat the genuine Tredegar thread. Improved ranking must put the thread in the top 5 and drop both bulk emails out of it."
+  },
+  {
+    "query": "Tredegar House completion",
+    "relevant_rowids": [4723, 121398, 120914, 120915, 120916]
+  },
+  {
+    "query": "completion statement Tredegar",
+    "relevant_rowids": [120916]
+  },
+  {
+    "query": "conveyancing quote flat 6",
+    "relevant_rowids": [120914]
+  },
+  {
+    "query": "conveyancing Flat 6 Tredegar",
+    "relevant_rowids": [120914]
+  },
+  {
+    "query": "completion solicitor Tredegar purchase",
+    "relevant_rowids": [4723, 121398, 120916]
+  },
+  {
+    "query": "dinner reservation Luca Friday",
+    "relevant_rowids": [6001]
+  },
+  {
+    "query": "Q3 budget review spreadsheet",
+    "relevant_rowids": [6002]
+  },
+  {
+    "query": "marketing budget review",
+    "relevant_rowids": [6002]
+  },
+  {
+    "query": "flight confirmation Edinburgh BA2490",
+    "relevant_rowids": [6003]
+  },
+  {
+    "query": "Edinburgh flight Heathrow",
+    "relevant_rowids": [6003]
+  },
+  {
+    "query": "bathroom leak plumber quote",
+    "relevant_rowids": [6004]
+  },
+  {
+    "query": "fix bathroom leak seal",
+    "relevant_rowids": [6004]
+  },
+  {
+    "query": "school trip permission slip",
+    "relevant_rowids": [6005]
+  },
+  {
+    "query": "permission slip Friday school trip",
+    "relevant_rowids": [6005]
+  },
+  {
+    "query": "prescription ready collection pharmacy",
+    "relevant_rowids": [6006]
+  },
+  {
+    "query": "tax return deadline reminder",
+    "relevant_rowids": [6007]
+  },
+  {
+    "query": "wedding photos download gallery",
+    "relevant_rowids": [6008]
+  }
+]

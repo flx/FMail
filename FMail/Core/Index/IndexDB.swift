@@ -1,6 +1,20 @@
 import Foundation
 import SQLite3
 
+/// Markers + sizing for the `snippet()` excerpts returned by
+/// `IndexDB.searchRanked`. The markers wrap matched terms inside the excerpt;
+/// they're chosen to be rare in mail bodies so an LLM consumer can strip them
+/// unambiguously, and none contains a single quote (they're embedded in a
+/// single-quoted SQL string literal in the snippet() call).
+enum SearchSnippet {
+    static let open = "«"
+    static let close = "»"
+    static let ellipsis = "…"
+    static let defaultTokens = 18
+    static let minTokens = 5
+    static let maxTokens = 64
+}
+
 /// Actor wrapping FMail's own SQLite database. Not thread-safe externally;
 /// all access goes through actor methods.
 actor IndexDB {
@@ -173,11 +187,14 @@ actor IndexDB {
     /// `sort`:
     ///   .newestFirst (default): ORDER BY date_received DESC
     ///   .oldestFirst:           ORDER BY date_received ASC
-    ///   .relevance:             ORDER BY rowid (proxy — true relevance
-    ///                           would need bm25() through messages_fts,
-    ///                           which requires restructuring the query
-    ///                           since text predicates compile to IN subqueries)
-    func search(_ q: CompiledQuery, limit: Int = 200, sort: SearchSort = .newestFirst) throws -> [MessageHeader] {
+    ///   .relevance:             ORDER BY date (fallback) — true BM25 ranking
+    ///                           is handled by `searchRanked`, which the MCP
+    ///                           layer uses whenever the query carries a
+    ///                           `relevancePlan`. This IN-subquery shape can't
+    ///                           surface bm25() (the FTS table is hidden inside
+    ///                           the subquery), so a relevance sort with no
+    ///                           plan degrades to newest-first here.
+    func search(_ q: CompiledQuery, limit: Int = 200, offset: Int = 0, sort: SearchSort = .newestFirst) throws -> [MessageHeader] {
         guard q.hasAnyConstraint else { return [] }
 
         let orderBy: String
@@ -192,10 +209,11 @@ actor IndexDB {
         FROM messages m
         WHERE (\(q.whereClause))
           AND \(Self.systemMailboxExcludeFilter)
-        ORDER BY \(orderBy) LIMIT ?
+        ORDER BY \(orderBy) LIMIT ? OFFSET ?
         """
         var bindings = q.bindings
         bindings.append(.int(Int64(limit)))
+        bindings.append(.int(Int64(max(0, offset))))
 
         var stmt: OpaquePointer?
         try prepare(sql, into: &stmt)
@@ -207,6 +225,194 @@ actor IndexDB {
             }
         }
         return try Self.collectMessageHeaders(stmt)
+    }
+
+    /// One ranked search result: a decoded header plus an optional snippet —
+    /// a short excerpt of the best-matching column with the matched terms
+    /// wrapped in `SearchSnippet.open`/`.close` markers.
+    struct RankedHit: Sendable {
+        let header: MessageHeader
+        let snippet: String?
+    }
+
+    /// BM25-ranked / snippet search. Unlike `search()`'s `apple_rowid IN
+    /// (SELECT rowid FROM messages_fts …)` shape, this JOINs `messages_fts`
+    /// directly so `bm25()` and `snippet()` are in scope of the outer query.
+    /// Requires a `RelevancePlan` (a single positive FTS match plus an
+    /// FTS-free `m.*` residual) — the MCP layer only calls this when
+    /// `CompiledQuery.relevancePlan != nil`.
+    ///
+    /// `sort`: `.relevance` orders by the blended score (see
+    /// `searchRankedByRelevance`); `.newestFirst` / `.oldestFirst` keep date
+    /// order but still attach snippets.
+    func searchRanked(
+        plan: RelevancePlan,
+        limit: Int,
+        offset: Int,
+        sort: SearchSort,
+        includeSnippet: Bool,
+        snippetTokens: Int,
+        tuning: RelevanceTuning = .default
+    ) throws -> [RankedHit] {
+        switch sort {
+        case .relevance:
+            return try searchRankedByRelevance(
+                plan: plan, limit: limit, offset: offset,
+                includeSnippet: includeSnippet, snippetTokens: snippetTokens, tuning: tuning
+            )
+        case .newestFirst, .oldestFirst:
+            return try searchRankedByDate(
+                plan: plan, limit: limit, offset: offset, sort: sort,
+                includeSnippet: includeSnippet, snippetTokens: snippetTokens, tuning: tuning
+            )
+        }
+    }
+
+    /// `.relevance` ordering: a blended score over the matched set.
+    ///
+    ///   final = (bm25_norm * bulk_mult) + λ·recency + boost·[matches NEAR()]
+    ///
+    /// `bm25_norm` is the negated, column-weighted BM25 (higher = better)
+    /// divided by the top score in the matched set, so the recency and
+    /// proximity terms live on a comparable 0…1 scale and `λ` / `boost` mean
+    /// the same thing regardless of the query's raw BM25 magnitude. The
+    /// matched set is materialised in a CTE (one `MATCH`, the system-mailbox
+    /// filter, and the FTS-free residual) so `bm25()` / `snippet()` are in
+    /// scope and the page-wide `MAX(text_score)` is one scan. Column weights
+    /// are formatted as numeric literals (never user input); λ / τ / the bulk
+    /// multiplier / the proximity boost are bound parameters.
+    private func searchRankedByRelevance(
+        plan: RelevancePlan,
+        limit: Int,
+        offset: Int,
+        includeSnippet: Bool,
+        snippetTokens: Int,
+        tuning: RelevanceTuning
+    ) throws -> [RankedHit] {
+        let weights = tuning.columnWeights
+            .map { String(format: "%.6f", $0) }
+            .joined(separator: ", ")
+        let snippetSelect = includeSnippet ? ", \(Self.snippetExpr(tokens: snippetTokens)) AS snip" : ""
+        let snippetOut = includeSnippet ? ", scored.snip" : ", NULL"
+        let residual = plan.residualSQL.map { " AND (\($0))" } ?? ""
+        let bulkFilter = tuning.includeBulk ? "" : " AND m.is_bulk = 0"
+        let proximityTerm = plan.proximityMatch != nil
+            ? "\n          + ? * (CASE WHEN scored.rid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) THEN 1.0 ELSE 0.0 END)"
+            : ""
+
+        // `MATERIALIZED` is load-bearing: without it SQLite flattens the CTE
+        // into the outer query, which lifts `bm25()` / `snippet()` out of the
+        // `MATCH` context and fails with "unable to use function bm25 in the
+        // requested context". Materialising computes the FTS-aux columns where
+        // the MATCH is in scope, then the outer query just reads them.
+        let sql = """
+        WITH scored AS MATERIALIZED (
+            SELECT m.apple_rowid AS rid,
+                   (-bm25(messages_fts, \(weights))) AS text_score,
+                   m.is_bulk AS is_bulk,
+                   COALESCE(m.date_received, 0) AS dr\(snippetSelect)
+            FROM messages_fts
+            JOIN messages m ON m.apple_rowid = messages_fts.rowid
+            WHERE messages_fts MATCH ?\(residual)
+              AND \(Self.systemMailboxExcludeFilter)\(bulkFilter)
+        )
+        SELECT \(Self.messageHeaderSelectList)\(snippetOut)
+        FROM scored
+        JOIN messages m ON m.apple_rowid = scored.rid
+        ORDER BY
+            (scored.text_score / NULLIF((SELECT MAX(text_score) FROM scored), 0))
+              * (CASE WHEN scored.is_bulk = 1 THEN ? ELSE 1.0 END)
+          + ? * (CASE WHEN scored.dr <= 0 THEN 0.0
+                      ELSE exp(-((CAST(strftime('%s','now') AS REAL) - scored.dr) / 86400.0) / ?) END)\(proximityTerm)
+            DESC
+        LIMIT ? OFFSET ?
+        """
+
+        var stmt: OpaquePointer?
+        try prepare(sql, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        var pos: Int32 = 1
+        bind(stmt, pos, plan.ftsMatch); pos += 1
+        for b in plan.residualBindings { bindSQL(stmt, pos, b); pos += 1 }
+        sqlite3_bind_double(stmt, pos, tuning.bulkMultiplier); pos += 1
+        sqlite3_bind_double(stmt, pos, tuning.lambda); pos += 1
+        sqlite3_bind_double(stmt, pos, Swift.max(1.0, tuning.tauDays)); pos += 1
+        if let near = plan.proximityMatch {
+            sqlite3_bind_double(stmt, pos, tuning.proximityBoost); pos += 1
+            bind(stmt, pos, near); pos += 1
+        }
+        bind(stmt, pos, Int64(limit)); pos += 1
+        bind(stmt, pos, Int64(Swift.max(0, offset)))
+
+        return try collectRankedHits(stmt, includeSnippet: includeSnippet)
+    }
+
+    /// `.newestFirst` / `.oldestFirst` ranked search — date order, still
+    /// attaching a snippet of the best-matching column. No BM25 blend.
+    private func searchRankedByDate(
+        plan: RelevancePlan,
+        limit: Int,
+        offset: Int,
+        sort: SearchSort,
+        includeSnippet: Bool,
+        snippetTokens: Int,
+        tuning: RelevanceTuning
+    ) throws -> [RankedHit] {
+        let orderBy = (sort == .oldestFirst) ? "m.date_received ASC" : "m.date_received DESC"
+        let snippetExpr = includeSnippet ? ", \(Self.snippetExpr(tokens: snippetTokens))" : ", NULL"
+        let residual = plan.residualSQL.map { " AND (\($0))" } ?? ""
+        let bulkFilter = tuning.includeBulk ? "" : " AND m.is_bulk = 0"
+        let sql = """
+        SELECT \(Self.messageHeaderSelectList)\(snippetExpr)
+        FROM messages_fts
+        JOIN messages m ON m.apple_rowid = messages_fts.rowid
+        WHERE messages_fts MATCH ?\(residual)
+          AND \(Self.systemMailboxExcludeFilter)\(bulkFilter)
+        ORDER BY \(orderBy) LIMIT ? OFFSET ?
+        """
+
+        var stmt: OpaquePointer?
+        try prepare(sql, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        var pos: Int32 = 1
+        bind(stmt, pos, plan.ftsMatch); pos += 1
+        for b in plan.residualBindings { bindSQL(stmt, pos, b); pos += 1 }
+        bind(stmt, pos, Int64(limit)); pos += 1
+        bind(stmt, pos, Int64(Swift.max(0, offset)))
+
+        return try collectRankedHits(stmt, includeSnippet: includeSnippet)
+    }
+
+    /// The `snippet(messages_fts, …)` SQL fragment. `-1` lets FTS5 pick the
+    /// best-matching column for the excerpt; the markers + clamped token count
+    /// are constants, so this carries no injectable input.
+    private static func snippetExpr(tokens: Int) -> String {
+        let n = Swift.max(SearchSnippet.minTokens, Swift.min(SearchSnippet.maxTokens, tokens))
+        return "snippet(messages_fts, -1, '\(SearchSnippet.open)', '\(SearchSnippet.close)', '\(SearchSnippet.ellipsis)', \(n))"
+    }
+
+    /// Bind one `SQLBinding` at `pos` (int or text).
+    private func bindSQL(_ stmt: OpaquePointer?, _ pos: Int32, _ b: SQLBinding) {
+        switch b {
+        case .int(let v): sqlite3_bind_int64(stmt, pos, v)
+        case .text(let s): bind(stmt, pos, s)
+        }
+    }
+
+    /// Decode a ranked-search result set: a 12-column header select list with
+    /// the snippet as the column right after it (col 12).
+    private func collectRankedHits(_ stmt: OpaquePointer?, includeSnippet: Bool) throws -> [RankedHit] {
+        let snippetCol: Int32 = 12
+        var out: [RankedHit] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            let header = Self.decodeMessageHeader(stmt)
+            let snip = includeSnippet ? sqlite3_column_text(stmt, snippetCol).map { String(cString: $0) } : nil
+            out.append(RankedHit(header: header, snippet: snip))
+            rc = sqlite3_step(stmt)
+        }
+        try checkRowLoopDone(rc)
+        return out
     }
 
     // MARK: — Read API for UI

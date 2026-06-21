@@ -253,6 +253,8 @@ final class MCPTests: XCTestCase {
             "list_accounts",
             "get_thread",
             "get_email",
+            "export_thread",
+            "sender_stats",
             "get_attachment",
             "get_attachments_for_rowids",
             "fetch_from_server",

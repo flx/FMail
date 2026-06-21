@@ -43,6 +43,9 @@ enum MIMEParser {
         let decoded = decodeTransferEncoding(body, encoding: transferEncoding)
         let charset = contentType.parameters["charset"] ?? "utf-8"
         let ctLabel = "\(contentType.major)/\(contentType.minor)"
+        // Present only on parts whose bytes Apple Mail offloaded; lets the
+        // index record a real size even when `decoded` is empty.
+        let declared = declaredContentLength(in: partHeaders)
 
         switch (contentType.major, contentType.minor) {
         case ("text", "plain"):
@@ -50,7 +53,7 @@ enum MIMEParser {
             if let name = attachmentName(in: partHeaders) {
                 return MIMEContent(
                     plainText: text, html: nil,
-                    attachments: [Attachment(name: name, contentType: ctLabel, data: decoded)]
+                    attachments: [Attachment(name: name, contentType: ctLabel, data: decoded, declaredByteCount: declared)]
                 )
             }
             return MIMEContent(plainText: text, html: nil, attachments: [])
@@ -59,7 +62,7 @@ enum MIMEParser {
             if let name = attachmentName(in: partHeaders) {
                 return MIMEContent(
                     plainText: nil, html: text,
-                    attachments: [Attachment(name: name, contentType: ctLabel, data: decoded)]
+                    attachments: [Attachment(name: name, contentType: ctLabel, data: decoded, declaredByteCount: declared)]
                 )
             }
             return MIMEContent(plainText: nil, html: text, attachments: [])
@@ -67,9 +70,18 @@ enum MIMEParser {
             let name = attachmentName(in: partHeaders) ?? defaultAttachmentName(for: contentType)
             return MIMEContent(
                 plainText: nil, html: nil,
-                attachments: [Attachment(name: name, contentType: ctLabel, data: decoded)]
+                attachments: [Attachment(name: name, contentType: ctLabel, data: decoded, declaredByteCount: declared)]
             )
         }
+    }
+
+    /// Parse the `X-Apple-Content-Length` placeholder header Apple Mail leaves
+    /// on an offloaded attachment part. nil when absent or non-numeric.
+    private static func declaredContentLength(in headers: ParsedHeaders) -> Int? {
+        guard let raw = headers["x-apple-content-length"]?.trimmingCharacters(in: .whitespaces),
+              let n = Int(raw), n >= 0
+        else { return nil }
+        return n
     }
 
     /// `depth` is the nesting level of this multipart container (1 for the

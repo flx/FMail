@@ -259,6 +259,124 @@ extension IndexDB {
         return out
     }
 
+    /// Aggregate sender volume for the `sender_stats` tool — "who emails me
+    /// most" and the inverse. Groups every message by lowercased sender
+    /// address over an optional date range, excluding drafts/trash/junk.
+    ///
+    /// `direction`:
+    ///   - `.incoming` (default for the tool): senders that are NOT one of
+    ///     our own account addresses — correspondents writing to us.
+    ///   - `.outgoing`: messages we sent (sender IS one of our addresses),
+    ///     grouped by recipient is more useful but we group by sender here,
+    ///     so this collapses to our own addresses — kept for completeness.
+    ///   - `.all`: no sender filter.
+    ///
+    /// The representative display name is the one from each sender's most
+    /// recent message: we take `MAX(zero-padded-date || display)` and strip
+    /// the 20-char date prefix back off in Swift — an "argmax by date" that
+    /// avoids a per-group correlated subquery (there's no index on
+    /// `sender_address`, so a correlated lookup would be a full scan each).
+    func senderStats(
+        since: Date?, until: Date?, direction: SenderDirection, limit: Int
+    ) throws -> [SenderStatRow] {
+        var clauses: [String] = ["m.sender_address IS NOT NULL", "m.sender_address <> ''"]
+        var binds: [SQLBinding] = []
+        if let since {
+            clauses.append("m.date_received >= ?")
+            binds.append(.int(Int64(since.timeIntervalSince1970)))
+        }
+        if let until {
+            clauses.append("m.date_received <= ?")
+            binds.append(.int(Int64(until.timeIntervalSince1970)))
+        }
+        let ourAddrs = "SELECT LOWER(email_address) FROM accounts WHERE email_address IS NOT NULL"
+        switch direction {
+        case .incoming: clauses.append("LOWER(m.sender_address) NOT IN (\(ourAddrs))")
+        case .outgoing: clauses.append("LOWER(m.sender_address) IN (\(ourAddrs))")
+        case .all:      break
+        }
+        clauses.append(Self.systemMailboxExcludeFilter)
+
+        let sql = """
+        SELECT LOWER(m.sender_address) AS addr,
+               COUNT(*) AS cnt,
+               SUM(CASE WHEN m.is_read = 0 THEN 1 ELSE 0 END) AS unread,
+               MAX(m.date_received) AS latest,
+               MAX(printf('%020d', COALESCE(m.date_received, 0)) || COALESCE(m.sender_display, '')) AS latest_disp
+        FROM messages m
+        WHERE \(clauses.joined(separator: "\n          AND "))
+        GROUP BY addr
+        ORDER BY cnt DESC, latest DESC
+        LIMIT ?
+        """
+        binds.append(.int(Int64(limit)))
+
+        var stmt: OpaquePointer?
+        try prepare(sql, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        for (i, b) in binds.enumerated() {
+            switch b {
+            case .int(let v): sqlite3_bind_int64(stmt, Int32(i + 1), v)
+            case .text(let s): bind(stmt, Int32(i + 1), s)
+            }
+        }
+
+        var out: [SenderStatRow] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            let addr = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+            let cnt = Int(sqlite3_column_int64(stmt, 1))
+            let unread = Int(sqlite3_column_int64(stmt, 2))
+            let latestTs = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 3)
+            let combined = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? ""
+            // Strip the 20-char zero-padded date prefix to recover the display
+            // name from the most recent message; empty → no display.
+            let disp = combined.count > 20 ? String(combined.dropFirst(20)) : ""
+            out.append(SenderStatRow(
+                address: addr,
+                displayName: disp.isEmpty ? nil : disp,
+                count: cnt,
+                unread: unread,
+                latest: latestTs.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+            ))
+            rc = sqlite3_step(stmt)
+        }
+        try checkRowLoopDone(rc)
+        return out
+    }
+
+    /// Bulk `apple_rowid → rfc_message_id`, omitting rows with no Message-ID.
+    /// Backs the MCP `dedupe` flag for `list_threads`: collapse threads whose
+    /// representative (latest) message shares a Message-ID — i.e. the same
+    /// conversation mirrored across accounts — without N round-trips.
+    func rfcMessageIds(rowids: [Int]) throws -> [Int: String] {
+        guard !rowids.isEmpty else { return [:] }
+        let placeholders = rowids.map { _ in "?" }.joined(separator: ",")
+        let sql = """
+        SELECT apple_rowid, rfc_message_id
+        FROM messages
+        WHERE apple_rowid IN (\(placeholders))
+          AND rfc_message_id IS NOT NULL AND rfc_message_id <> ''
+        """
+        var stmt: OpaquePointer?
+        try prepare(sql, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        for (i, id) in rowids.enumerated() {
+            bind(stmt, Int32(i + 1), Int64(id))
+        }
+        var out: [Int: String] = [:]
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            let rowid = Int(sqlite3_column_int64(stmt, 0))
+            if let cstr = sqlite3_column_text(stmt, 1) {
+                out[rowid] = String(cString: cstr)
+            }
+            rc = sqlite3_step(stmt)
+        }
+        try checkRowLoopDone(rc)
+        return out
+    }
+
     /// Mailbox path lookup for a single rowid — convenience wrapper.
     /// Returns nil for unknown mailboxes.
     func mailboxPath(rowid: Int) throws -> String? {
@@ -285,4 +403,18 @@ struct MCPMessageEnrichment: Sendable, Hashable {
     let hasAttachment: Bool
     let bodyOnDisk: Bool
     let accountEmail: String?
+}
+
+/// Sender-volume filter for `senderStats`. See that method for semantics.
+enum SenderDirection: String, Sendable {
+    case incoming, outgoing, all
+}
+
+/// One aggregated sender row from `senderStats`.
+struct SenderStatRow: Sendable {
+    let address: String
+    let displayName: String?
+    let count: Int
+    let unread: Int
+    let latest: Date?
 }

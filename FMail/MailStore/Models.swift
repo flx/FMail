@@ -115,6 +115,11 @@ struct Attachment {
     let name: String
     let contentType: String
     let data: Data
+    /// Size Apple Mail declared in the `.partial.emlx` (`X-Apple-Content-Length`)
+    /// for an attachment whose bytes it offloaded ("Optimise Mac Storage").
+    /// nil when the bytes are present (use `data.count`) or no header was
+    /// found. Lets the index record a real size for offloaded attachments.
+    var declaredByteCount: Int? = nil
 }
 
 /// Fully-parsed message body for display in the reader.

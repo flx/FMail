@@ -25,25 +25,44 @@ enum BodyCleaner {
 
     /// Apply all cleaning passes. Returns the cleaned text.
     static func clean(_ text: String) -> String {
-        var working = text
-        working = truncateAtReplyChain(working)
-        working = truncateAtSignature(working)
-        working = collapseTrackingURLs(working)
+        split(text).clean
+    }
+
+    /// Split a body into the part worth ranking (`clean`) and the
+    /// reply-chain / signature tail that was stripped off (`quoted`). The
+    /// cut point is the first line that is either a reply-chain marker or a
+    /// signature delimiter — the same boundary `clean(_:)` used to truncate
+    /// at, so `split(text).clean` reproduces the old `clean(text)` output
+    /// exactly. The body indexer stores both halves: `clean` as the primary
+    /// ranking column, `quoted` as a near-zero-weight column kept for recall
+    /// (so the offending quoted signature in the eBay/FT failure mode is still
+    /// searchable but can't dominate BM25).
+    static func split(_ text: String) -> (clean: String, quoted: String) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var cut: Int?
+        for (i, line) in lines.enumerated() {
+            if isReplyChainMarker(line, peekNext: lines[safe: i + 1]) || isSignatureMarker(line) {
+                cut = i
+                break
+            }
+        }
+        guard let cut else {
+            return (postProcess(text), "")
+        }
+        let cleanRaw = lines.prefix(cut).joined(separator: "\n")
+        let quotedRaw = lines.suffix(from: cut).joined(separator: "\n")
+        return (postProcess(cleanRaw), quotedRaw.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// The cosmetic passes `clean(_:)` applied after truncation: collapse
+    /// tracking-URL wrappers and runs of blank lines, then trim.
+    private static func postProcess(_ text: String) -> String {
+        var working = collapseTrackingURLs(text)
         working = collapseBlankLines(working)
         return working.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: — Reply-chain detection
-
-    private static func truncateAtReplyChain(_ text: String) -> String {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        for (i, line) in lines.enumerated() {
-            if isReplyChainMarker(line, peekNext: lines[safe: i + 1]) {
-                return lines.prefix(i).joined(separator: "\n")
-            }
-        }
-        return text
-    }
 
     private static func isReplyChainMarker(_ line: String, peekNext: String?) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -70,16 +89,6 @@ enum BodyCleaner {
     }
 
     // MARK: — Signature detection
-
-    private static func truncateAtSignature(_ text: String) -> String {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        for (i, line) in lines.enumerated() {
-            if isSignatureMarker(line) {
-                return lines.prefix(i).joined(separator: "\n")
-            }
-        }
-        return text
-    }
 
     private static func isSignatureMarker(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)

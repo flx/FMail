@@ -336,7 +336,12 @@ actor MCPServer {
             return denial
         }
 
-        let result = await dispatcher.dispatch(rawBody: request.body)
+        // Local (loopback Host) requests may write attachments anywhere the
+        // process can; tunnel requests stay confined to the save root. The
+        // Host has already been validated as loopback-or-tunnel by
+        // `hostIsAllowed`, so a loopback Host here means a local client.
+        let isLocal = Self.isLoopbackHost((request.headers["host"] ?? "").trimmingCharacters(in: .whitespaces))
+        let result = await dispatcher.dispatch(rawBody: request.body, isLocal: isLocal)
         switch result {
         case .response(let body):
             return HTTPParser.formatResponse(status: 200, body: body)

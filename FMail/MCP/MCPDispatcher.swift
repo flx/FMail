@@ -18,7 +18,19 @@ actor MCPDispatcher {
     /// Dispatch a raw HTTP body containing a JSON-RPC request.
     /// Returns either a JSON response (for requests) or a notification ack
     /// (for notifications — caller maps to HTTP 202).
-    func dispatch(rawBody: Data) async -> MCPDispatchResult {
+    ///
+    /// `isLocal` marks whether the request arrived from a loopback client
+    /// (local Claude Code) vs the configured tunnel host. It's published as a
+    /// task-local for the duration of the handler so the attachment handler
+    /// can decide whether an unconfined `save_to_path` is permitted, without
+    /// every tool's handler signature having to carry request metadata.
+    func dispatch(rawBody: Data, isLocal: Bool = false) async -> MCPDispatchResult {
+        await MCPRequestContext.$isLocal.withValue(isLocal) {
+            await self.dispatchBody(rawBody: rawBody)
+        }
+    }
+
+    private func dispatchBody(rawBody: Data) async -> MCPDispatchResult {
         // Decode envelope
         let req: JSONRPCRequest
         do {
@@ -201,4 +213,16 @@ enum MCPDispatchResult: Sendable {
     case response(Data)
     /// A JSON-RPC notification — no response (HTTP 202 with empty body).
     case notification
+}
+
+/// Per-request context published as a task-local for the duration of a
+/// `tools/call`. Lets a handler read request-scoped facts (currently just the
+/// local-vs-tunnel origin) without threading them through `MCPTool.handler`.
+enum MCPRequestContext {
+    /// True when the request came from a loopback client (local Claude Code),
+    /// false when it arrived over the configured tunnel host. Bound per
+    /// request by `MCPDispatcher.dispatch`. Defaults to the safe (treated-as-
+    /// remote) value so an un-wrapped dispatch can't accidentally grant
+    /// unconfined filesystem writes.
+    @TaskLocal static var isLocal: Bool = false
 }

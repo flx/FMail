@@ -29,8 +29,29 @@ enum MCPHandlers {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "search_emails: `query` is required")
         }
         let limit = MCPHelpers.clampInt(obj["limit"]?.intValue ?? 50, min: 1, max: 500)
+        let offset = max(0, obj["offset"]?.intValue ?? 0)
         let sort = try SearchSort.parseStrict(obj["sort"]?.stringValue)
         let includeAttachments = obj["include_attachment_metadata"]?.boolValue ?? false
+        let includeSnippets = obj["include_snippets"]?.boolValue ?? false
+        let dedupe = obj["dedupe"]?.boolValue ?? false
+        let snippetTokens = MCPHelpers.clampInt(
+            obj["snippet_max_tokens"]?.intValue ?? SearchSnippet.defaultTokens,
+            min: SearchSnippet.minTokens, max: SearchSnippet.maxTokens
+        )
+        // Relevance tuning (all optional; only consulted for sort:relevance).
+        // include_bulk hard-filters newsletter/list mail when false; recency
+        // lambda/tau shape the date-blend (lambda 0 = pure textual relevance).
+        var tuning = RelevanceTuning.default
+        tuning.includeBulk = obj["include_bulk"]?.boolValue ?? true
+        if let lambda = obj["recency_lambda"]?.doubleValue {
+            tuning.lambda = max(0.0, min(10.0, lambda))
+        }
+        if let tau = obj["recency_tau_days"]?.doubleValue {
+            tuning.tauDays = max(1.0, tau)
+        }
+        // When collapsing duplicates we over-fetch so the post-collapse result
+        // can still fill `limit`; we trim back down after deduping.
+        let fetchLimit = dedupe ? min(limit * 3, 500) : limit
 
         // Optional since/until — fold into the DSL by prefixing with after:/before:.
         var compiled = rawQuery
@@ -47,9 +68,38 @@ enum MCPHandlers {
             return try JSONValue.encoding(SearchEmailsResult(results: []))
         }
 
-        let messages = try await context.indexDB.search(compiledQ, limit: limit, sort: sort)
-        let rowids = messages.map(\.rowId)
-        let enrichments = try await context.indexDB.enrichForMCP(rowids: rowids)
+        // BM25 ranking and snippets both need the FTS table joined (not hidden
+        // in an IN-subquery), which only works when the query reduces to a
+        // single positive MATCH + FTS-free residual (`relevancePlan`). When it
+        // doesn't, relevance degrades to newest-first and snippets are absent.
+        // `include_bulk:false` also routes here so the hard-filter applies even
+        // under a date sort (the plain `search()` path has no is_bulk filter).
+        let wantsRanked = (sort == .relevance || includeSnippets || !tuning.includeBulk)
+        var snippetsByRowid: [Int: String] = [:]
+        var messages: [MessageHeader]
+        if wantsRanked, let plan = compiledQ.relevancePlan {
+            let hits = try await context.indexDB.searchRanked(
+                plan: plan, limit: fetchLimit, offset: offset, sort: sort,
+                includeSnippet: includeSnippets, snippetTokens: snippetTokens, tuning: tuning
+            )
+            messages = hits.map(\.header)
+            for h in hits where h.snippet != nil { snippetsByRowid[h.header.rowId] = h.snippet }
+        } else {
+            messages = try await context.indexDB.search(compiledQ, limit: fetchLimit, offset: offset, sort: sort)
+        }
+        let enrichments = try await context.indexDB.enrichForMCP(rowids: messages.map(\.rowId))
+
+        // Cross-account dedup: collapse messages that share an RFC Message-ID
+        // (the same mail indexed under several accounts), keeping the copy
+        // whose body is on disk where there's a choice. Messages with no
+        // Message-ID can't be matched and stay distinct. Done before the
+        // attachment-metadata pass so we don't body-load rows we'll drop. The
+        // trimmed set is a subset of the rowids already enriched above, so no
+        // re-enrichment is needed.
+        if dedupe {
+            messages = Self.dedupedByMessageID(messages, enrichments: enrichments)
+            if messages.count > limit { messages = Array(messages.prefix(limit)) }
+        }
 
         // Optional pass to load per-message attachment metadata. Costs
         // one body-load per result row; gated to avoid blowing up
@@ -96,7 +146,8 @@ enum MCPHandlers {
                 rfc_message_id: m.rfcMessageId,
                 body_on_disk: e?.bodyOnDisk ?? false,
                 attachments: attachmentsByRowid[m.rowId],
-                attachments_unavailable: attachmentsUnavailable.contains(m.rowId) ? true : nil
+                attachments_unavailable: attachmentsUnavailable.contains(m.rowId) ? true : nil,
+                snippet: snippetsByRowid[m.rowId]
             )
         }
         return try JSONValue.encoding(SearchEmailsResult(results: refs))
@@ -118,22 +169,31 @@ enum MCPHandlers {
     static func listThreads(_ args: JSONValue, context: MCPContext) async throws -> JSONValue {
         let obj = args.objectValue ?? [:]
         let limit = MCPHelpers.clampInt(obj["limit"]?.intValue ?? 100, min: 1, max: 600)
+        let offset = max(0, obj["offset"]?.intValue ?? 0)
         let unreadOnly = obj["unread_only"]?.boolValue ?? false
+        let dedupe = obj["dedupe"]?.boolValue ?? false
 
         // since/until are post-filtered in Swift since loadAllThreadSummaries /
         // loadThreadSummaries don't accept date predicates. Fine at limit ≤ 600.
         let sinceDate = try obj["since"]?.stringValue.flatMap { try requireValidDate($0, field: "since") }
         let untilDate = try obj["until"]?.stringValue.flatMap { try requireValidDate($0, field: "until") }
 
+        // Pagination: over-fetch `offset + limit` (bounded) so we can skip the
+        // first `offset` threads and still return up to `limit` after the
+        // Swift-side filters/dedup. Deep paging is intentionally bounded — the
+        // summary queries fetch headroom of their own on top of this. Dedup
+        // collapses rows, so it gets extra headroom.
+        let fetchLimit = MCPHelpers.clampInt((offset + limit) * (dedupe ? 2 : 1), min: 1, max: 1200)
+
         let summaries: [ThreadSummary]
         switch obj["scope"] {
         case .some(.string("all_mailboxes")), .none:
-            summaries = try await context.indexDB.loadAllThreadSummaries(limit: limit)
+            summaries = try await context.indexDB.loadAllThreadSummaries(limit: fetchLimit)
         case .some(.object(let scopeObj)):
             guard let mailboxRowId = scopeObj["mailbox_rowid"]?.intValue else {
                 throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "list_threads: scope.mailbox_rowid must be an integer")
             }
-            summaries = try await context.indexDB.loadThreadSummaries(mailboxRowId: mailboxRowId, limit: limit)
+            summaries = try await context.indexDB.loadThreadSummaries(mailboxRowId: mailboxRowId, limit: fetchLimit)
         case .some(let other):
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "list_threads: invalid scope: \(other)")
         }
@@ -145,7 +205,22 @@ enum MCPHandlers {
             return true
         }
 
-        let refs = filtered.map { s in
+        // Cross-account dedup: collapse threads whose representative (latest)
+        // message shares a Message-ID — the same conversation mirrored under
+        // two accounts. Threads whose rep has no Message-ID stay distinct.
+        var deduped = filtered
+        if dedupe {
+            let repRowids = filtered.map(\.latestMessageRowId).filter { $0 > 0 }
+            let idByRowid = try await context.indexDB.rfcMessageIds(rowids: repRowids)
+            var seen = Set<String>()
+            deduped = filtered.filter { s in
+                guard let key = Self.normalizedMessageID(idByRowid[s.latestMessageRowId]) else { return true }
+                return seen.insert(key).inserted
+            }
+        }
+        let paged = Array(deduped.dropFirst(offset).prefix(limit))
+
+        let refs = paged.map { s in
             ThreadRef(
                 thread_id: s.threadId,
                 latest_subject: s.latestSubject,
@@ -393,14 +468,58 @@ enum MCPHandlers {
             }
         )
     }
+
+    // MARK: — Cross-account dedup (the `dedupe` flag)
+
+    /// Normalised RFC Message-ID dedup key: trimmed, angle-brackets stripped,
+    /// lowercased. nil for an absent/empty id (such rows can't be matched and
+    /// are kept distinct by callers).
+    static func normalizedMessageID(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let s = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+            .lowercased()
+        return s.isEmpty ? nil : s
+    }
+
+    /// Collapse messages sharing an RFC Message-ID, preserving input order.
+    /// The first copy seen holds the slot; a later copy replaces it only when
+    /// it's a "better" representative — currently: prefer a copy whose body is
+    /// on disk (so a follow-up `get_email`/`get_attachment` won't need a
+    /// Mail.app round-trip). Rows without a Message-ID pass through untouched.
+    static func dedupedByMessageID(
+        _ messages: [MessageHeader],
+        enrichments: [Int: MCPMessageEnrichment]
+    ) -> [MessageHeader] {
+        var slotForKey: [String: Int] = [:]
+        var out: [MessageHeader] = []
+        out.reserveCapacity(messages.count)
+        for m in messages {
+            guard let key = normalizedMessageID(m.rfcMessageId) else {
+                out.append(m)
+                continue
+            }
+            if let idx = slotForKey[key] {
+                let incumbentOnDisk = enrichments[out[idx].rowId]?.bodyOnDisk ?? false
+                let challengerOnDisk = enrichments[m.rowId]?.bodyOnDisk ?? false
+                if challengerOnDisk && !incumbentOnDisk { out[idx] = m }
+            } else {
+                slotForKey[key] = out.count
+                out.append(m)
+            }
+        }
+        return out
+    }
 }
 
 // MARK: — Helpers
 
 /// Parse a date supplied by the client; throw an `invalidParams` error
 /// when the string is non-empty but unparseable so callers don't silently
-/// degrade to nil (and skip the filter entirely).
-private func requireValidDate(_ s: String, field: String) throws -> Date? {
+/// degrade to nil (and skip the filter entirely). Module-internal so the
+/// other handler files (e.g. sender_stats) share one date-validation path.
+func requireValidDate(_ s: String, field: String) throws -> Date? {
     guard !s.isEmpty else { return nil }
     guard let date = MCPHelpers.parseISODate(s) else {
         throw JSONRPCErrorPayload(

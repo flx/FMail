@@ -15,11 +15,102 @@ struct CompiledQuery {
     let bindings: [SQLBinding]
     /// Human-readable reconstruction shown in the "Interpreted as" strip.
     let interpretation: String
+    /// Non-nil when the query can be reshaped for BM25 ranking / snippets —
+    /// i.e. it reduces to a single positive FTS5 MATCH plus an FTS-free
+    /// residual predicate. nil for metadata-only queries (no text to rank)
+    /// and for shapes that straddle the MATCH/SQL boundary (negated text,
+    /// text OR-ed with a date/flag). See `Evaluator.relevancePlan`.
+    let relevancePlan: RelevancePlan?
 
     var hasAnyConstraint: Bool { !whereClause.isEmpty }
 }
 
-enum SQLBinding {
+/// A query reshaped for `IndexDB.searchRanked` — a single positive FTS5
+/// MATCH expression plus an optional FTS-free residual predicate on `m.*`.
+/// This is what lets `bm25()` / `snippet()` run against `messages_fts`
+/// directly (a JOIN), instead of the `apple_rowid IN (SELECT …)` subquery
+/// shape that hides the FTS table from the outer query.
+struct RelevancePlan: Sendable {
+    /// The fused FTS5 MATCH expression — bound as the single `?` immediately
+    /// after `messages_fts MATCH`.
+    let ftsMatch: String
+    /// FTS-free SQL predicate on `m.*`, ANDed after the MATCH. nil when the
+    /// query is pure text.
+    let residualSQL: String?
+    /// Bindings for `residualSQL`, in order. Empty when `residualSQL` is nil.
+    let residualBindings: [SQLBinding]
+    /// An FTS5 `NEAR()` MATCH expression over the high-value columns
+    /// (`{subject body_clean}`), built from the query's free-text tokens when
+    /// there are ≥2 of them. The ranker adds a fixed bonus to rows that also
+    /// match this — terms clustering in real body/subject text signals an
+    /// on-topic message, and scoping it away from `body_quoted` keeps a quoted
+    /// signature from earning the boost. nil when the query has <2 free-text
+    /// tokens (nothing to measure proximity between).
+    let proximityMatch: String?
+
+    init(ftsMatch: String, residualSQL: String?, residualBindings: [SQLBinding], proximityMatch: String? = nil) {
+        self.ftsMatch = ftsMatch
+        self.residualSQL = residualSQL
+        self.residualBindings = residualBindings
+        self.proximityMatch = proximityMatch
+    }
+}
+
+/// Tunable knobs for `IndexDB.searchRanked`'s `.relevance` ordering. The
+/// column weights feed `bm25()` positionally in `messages_fts` column order
+/// (subject, body_clean, body_quoted, sender, recipients, attachment_names);
+/// the rest shape the blended final score:
+///
+///   final = (bm25_normalized * bulkMultiplier)
+///         + lambda * exp(-age_days / tauDays)
+///         + proximityBoost * [row also matches NEAR()]
+///
+/// `bm25_normalized` divides the negated BM25 (higher = better) by the top
+/// score in the matched set, so `lambda` / `proximityBoost` live on a
+/// comparable 0…1 scale. `.default` is what the MCP tool uses out of the box;
+/// `.textOnly` drops recency/proximity/bulk effects (pure weighted BM25); the
+/// eval harness compares `.uniform` (every lever off — the old "all text
+/// equal" behaviour) against `.default`.
+struct RelevanceTuning: Sendable {
+    var subjectWeight: Double = 10.0
+    var bodyCleanWeight: Double = 5.0
+    var bodyQuotedWeight: Double = 0.3
+    var senderWeight: Double = 8.0
+    var recipientsWeight: Double = 2.0
+    var attachmentWeight: Double = 2.0
+
+    /// Weight of the recency term in the blended score.
+    var lambda: Double = 0.2
+    /// Exponential-decay time constant for recency, in days.
+    var tauDays: Double = 180.0
+    /// Score multiplier applied to rows flagged `is_bulk`.
+    var bulkMultiplier: Double = 0.3
+    /// When false, bulk rows are hard-filtered out instead of just discounted.
+    var includeBulk: Bool = true
+    /// Bonus added to rows that match the plan's `NEAR()` proximity expression.
+    var proximityBoost: Double = 0.15
+
+    /// Column weights in `messages_fts` order — the argument list for `bm25()`.
+    var columnWeights: [Double] {
+        [subjectWeight, bodyCleanWeight, bodyQuotedWeight, senderWeight, recipientsWeight, attachmentWeight]
+    }
+
+    static let `default` = RelevanceTuning()
+
+    /// Weighted BM25 only — no recency, proximity, or bulk discount.
+    static let textOnly = RelevanceTuning(lambda: 0, bulkMultiplier: 1.0, proximityBoost: 0)
+
+    /// Every lever neutralised: equal column weights, no recency / proximity /
+    /// bulk discount. Reproduces the pre-overhaul "rank the raw blob, all text
+    /// equal" behaviour for the eval harness's baseline.
+    static let uniform = RelevanceTuning(
+        subjectWeight: 1, bodyCleanWeight: 1, bodyQuotedWeight: 1,
+        senderWeight: 1, recipientsWeight: 1, attachmentWeight: 1,
+        lambda: 0, bulkMultiplier: 1.0, proximityBoost: 0
+    )
+}
+
+enum SQLBinding: Sendable {
     case int(Int64)
     case text(String)
 }
@@ -28,18 +119,157 @@ enum Evaluator {
     static func compile(_ node: QueryNode) -> CompiledQuery {
         let compiled = compileNode(node)
         let interpretation = humanize(node)
+        let plan = relevancePlan(node)
         switch compiled {
         case .empty:
-            return CompiledQuery(whereClause: "", bindings: [], interpretation: interpretation)
+            return CompiledQuery(whereClause: "", bindings: [], interpretation: interpretation, relevancePlan: plan)
         case .text(let expr):
             // Top-level pure-text query: wrap in a single MATCH subquery.
             return CompiledQuery(
                 whereClause: ftsSubquery(positive: true),
                 bindings: [.text(expr)],
-                interpretation: interpretation
+                interpretation: interpretation,
+                relevancePlan: plan
             )
         case .sql(let frag, let bs):
-            return CompiledQuery(whereClause: frag, bindings: bs, interpretation: interpretation)
+            return CompiledQuery(whereClause: frag, bindings: bs, interpretation: interpretation, relevancePlan: plan)
+        }
+    }
+
+    // MARK: — Relevance-plan extraction (BM25 / snippets)
+
+    /// Reshape `node` into a `RelevancePlan` when it separates cleanly into a
+    /// single positive FTS5 MATCH plus an FTS-free `m.*` residual. Returns nil
+    /// when there's no text to rank, or when the boolean structure can't be
+    /// expressed as `MATCH ? AND <sql>` — specifically:
+    ///   * negated text (`NOT from:x`) — can't be the positive match,
+    ///   * text OR-ed with a date/flag (`from:x OR after:2024`) — the OR
+    ///     straddles the MATCH/SQL boundary.
+    /// Callers fall back to `search()` (date order, no snippet) when nil.
+    static func relevancePlan(_ node: QueryNode) -> RelevancePlan? {
+        let ex = extract(node)
+        guard ex.supported, let fts = ex.fts else { return nil }
+        return RelevancePlan(
+            ftsMatch: fts,
+            residualSQL: ex.sql,
+            residualBindings: ex.bindings,
+            proximityMatch: proximityExpr(node)
+        )
+    }
+
+    /// Build the `NEAR()` proximity expression for the ranker from the query's
+    /// free-text tokens (barewords + phrases) in positive (non-negated)
+    /// position. Returns nil with fewer than two tokens — proximity needs at
+    /// least a pair to measure. Scoped to `{subject body_clean}` so a quoted
+    /// signature in `body_quoted` can't earn the bonus.
+    static func proximityExpr(_ node: QueryNode) -> String? {
+        var tokens: [String] = []
+        collectFreeText(node, negated: false, into: &tokens)
+        guard tokens.count >= 2 else { return nil }
+        return "{subject body_clean}: NEAR(\(tokens.joined(separator: " ")), 10)"
+    }
+
+    /// Collect the FTS forms of free-text terms (`anyText` → `tok*`, `phrase`
+    /// → `"tok"`), skipping anything under a `NOT`. Field-scoped terms
+    /// (`from:` / `subject:` / dates / flags) are ignored — proximity is a
+    /// bag-of-topic-words signal.
+    private static func collectFreeText(_ node: QueryNode, negated: Bool, into tokens: inout [String]) {
+        switch node {
+        case .empty:
+            break
+        case .not(let inner):
+            collectFreeText(inner, negated: !negated, into: &tokens)
+        case .and(let children), .or(let children):
+            for c in children { collectFreeText(c, negated: negated, into: &tokens) }
+        case .term(let t):
+            guard !negated else { return }
+            switch t {
+            case .anyText(let w):
+                let safe = sanitize(w)
+                if !safe.isEmpty { tokens.append("\(safe)*") }
+            case .phrase(let p):
+                let safe = sanitize(p)
+                if !safe.isEmpty { tokens.append("\"\(safe)\"") }
+            default:
+                break
+            }
+        }
+    }
+
+    /// Intermediate result of separating a subtree into its FTS part (a
+    /// MATCH expression) and its FTS-free SQL part. `bindings` are for `sql`
+    /// only — the `fts` string is embedded as the single MATCH bind value by
+    /// the caller. `supported == false` marks a shape we won't rank.
+    private struct Extraction {
+        var fts: String?
+        var sql: String?
+        var bindings: [SQLBinding]
+        var supported: Bool
+        static let empty = Extraction(fts: nil, sql: nil, bindings: [], supported: true)
+        static let unsupported = Extraction(fts: nil, sql: nil, bindings: [], supported: false)
+    }
+
+    private static func extract(_ node: QueryNode) -> Extraction {
+        switch node {
+        case .empty:
+            return .empty
+        case .term(let t):
+            // `compileTerm` already maps text/field terms to `.text` (an FTS
+            // expression) and everything else to `.sql` (always FTS-free at the
+            // term level — FTS subqueries only appear via the combinators).
+            switch compileTerm(t) {
+            case .empty: return .empty
+            case .text(let expr): return Extraction(fts: expr, sql: nil, bindings: [], supported: true)
+            case .sql(let f, let b): return Extraction(fts: nil, sql: f, bindings: b, supported: true)
+            }
+        case .not(let inner):
+            let e = extract(inner)
+            if !e.supported { return .unsupported }
+            if e.fts != nil { return .unsupported }            // can't negate the positive match
+            if let sql = e.sql {
+                return Extraction(fts: nil, sql: "NOT (\(sql))", bindings: e.bindings, supported: true)
+            }
+            return .empty
+        case .and(let children):
+            var ftsParts: [String] = []
+            var sqlParts: [String] = []
+            var binds: [SQLBinding] = []
+            for c in children {
+                let e = extract(c)
+                if !e.supported { return .unsupported }
+                if let f = e.fts { ftsParts.append(f) }
+                if let s = e.sql { sqlParts.append("(\(s))"); binds.append(contentsOf: e.bindings) }
+            }
+            return Extraction(
+                fts: ftsParts.isEmpty ? nil : ftsParts.joined(separator: " AND "),
+                sql: sqlParts.isEmpty ? nil : sqlParts.joined(separator: " AND "),
+                bindings: binds,
+                supported: true
+            )
+        case .or(let children):
+            var branches: [Extraction] = []
+            for c in children {
+                let e = extract(c)
+                if !e.supported { return .unsupported }
+                if e.fts != nil || e.sql != nil { branches.append(e) }
+            }
+            if branches.isEmpty { return .empty }
+            // An OR can't straddle the MATCH/SQL boundary: every branch must
+            // be all-FTS or all-SQL, and the branches must agree.
+            if branches.contains(where: { $0.fts != nil && $0.sql != nil }) { return .unsupported }
+            let anyFTS = branches.contains { $0.fts != nil }
+            let anySQL = branches.contains { $0.sql != nil }
+            if anyFTS && anySQL { return .unsupported }
+            if anyFTS {
+                let parts = branches.compactMap { $0.fts }
+                return Extraction(fts: "(" + parts.joined(separator: " OR ") + ")", sql: nil, bindings: [], supported: true)
+            }
+            var sqlParts: [String] = []
+            var binds: [SQLBinding] = []
+            for e in branches {
+                if let s = e.sql { sqlParts.append("(\(s))"); binds.append(contentsOf: e.bindings) }
+            }
+            return Extraction(fts: nil, sql: "(" + sqlParts.joined(separator: " OR ") + ")", bindings: binds, supported: true)
         }
     }
 
@@ -88,9 +318,24 @@ enum Evaluator {
         case .subject(let v):
             return ftsField("subject", v)
         case .body(let v):
-            return ftsField("body_text", v)
+            // Search both body columns so `body:` keeps full recall after the
+            // clean/quoted split (the column weights only matter for ranking).
+            return ftsField("body_clean body_quoted", v)
         case .attachmentName(let v):
             return ftsField("attachment_names", v)
+        case .attachmentType(let t):
+            // Substring match on content-type so `pdf` hits `application/pdf`.
+            // `t` is already lowercased by the parser.
+            return .sql(
+                fragment: "EXISTS (SELECT 1 FROM attachments a WHERE a.message_rowid = m.apple_rowid AND LOWER(a.content_type) LIKE ?)",
+                bindings: [.text("%\(t)%")]
+            )
+        case .attachmentSize(let cmp, let bytes):
+            // `cmp.sql` is a fixed enum rawValue (>, >=, …), not user input.
+            return .sql(
+                fragment: "EXISTS (SELECT 1 FROM attachments a WHERE a.message_rowid = m.apple_rowid AND a.byte_count \(cmp.sql) ?)",
+                bindings: [.int(Int64(bytes))]
+            )
         case .dateBefore(let d):
             return .sql(
                 fragment: "m.date_received < ?",
@@ -320,6 +565,8 @@ enum Evaluator {
         case .subject(let v):  return "\(pre)subject:\(quoteIfNeeded(v))"
         case .body(let v):     return "\(pre)body:\(quoteIfNeeded(v))"
         case .attachmentName(let v): return "\(pre)attachment:\(quoteIfNeeded(v))"
+        case .attachmentType(let t): return "\(pre)attachment-type:\(t)"
+        case .attachmentSize(let cmp, let bytes): return "\(pre)attachment-size:\(cmp.rawValue)\(bytes)"
         case .dateBefore(let d): return "\(pre)before:\(iso(d))"
         case .dateAfter(let d):  return "\(pre)after:\(iso(d))"
         case .dateInRange(let s, let e):

@@ -119,6 +119,11 @@ struct QueryParser {
         case "subject", "subj": return .subject(v)
         case "body", "content", "text": return .body(v)
         case "attachment", "filename": return .attachmentName(v)
+        case "attachment-type", "attachmenttype", "atype":
+            let t = v.lowercased()
+            if !t.isEmpty { return .attachmentType(t) }
+        case "attachment-size", "attachmentsize", "asize":
+            if let (cmp, bytes) = AttachmentSizeValue.parse(v) { return .attachmentSize(cmp, bytes) }
         case "in": return .mailboxKind(v.lowercased())
         case "account": return .account(v)
         case "thread":

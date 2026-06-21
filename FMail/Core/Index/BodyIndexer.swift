@@ -57,8 +57,20 @@ actor BodyIndexer {
                 }
                 do {
                     if let body = try await bodyLoader.loadBody(messageRowId: entry.rowid, mailbox: mb) {
-                        let text = body.displayText
-                        try await indexDB.setBodyText(messageRowId: entry.rowid, bodyText: text)
+                        // Split into the rankable body (body_clean) and the
+                        // stripped reply-chain/signature tail (body_quoted), and
+                        // classify list/newsletter mail from the headers — both
+                        // feed the relevance ranker. setBodyContent also replaces
+                        // the message's attachment rows (content-type/size for
+                        // the DSL filters).
+                        let split = BodyCleaner.split(body.displayText)
+                        try await indexDB.setBodyContent(
+                            messageRowId: entry.rowid,
+                            bodyClean: split.clean,
+                            bodyQuoted: split.quoted,
+                            isBulk: BulkHeuristic.isBulk(body.headers),
+                            attachments: body.attachments
+                        )
                     } else {
                         // No .emlx on disk yet; mark with empty body so we move
                         // on. A later sync re-runs this sweep (and now drops the

@@ -19,6 +19,8 @@ enum MCPTools {
         await dispatcher.register(listAccountsTool(context: context))
         await dispatcher.register(getThreadTool(context: context))
         await dispatcher.register(getEmailTool(context: context))
+        await dispatcher.register(exportThreadTool(context: context))
+        await dispatcher.register(senderStatsTool(context: context))
         await dispatcher.register(getAttachmentTool(context: context))
         await dispatcher.register(getAttachmentsForRowidsTool(context: context))
         await dispatcher.register(fetchFromServerTool(context: context))
@@ -45,6 +47,12 @@ enum MCPTools {
                         "default": .int(50),
                         "description": .string("Max results to return.")
                     ]),
+                    "offset": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(0),
+                        "default": .int(0),
+                        "description": .string("Skip this many results before returning — page past the `limit` cap on a large mailbox. Pair with a stable `sort` (newest_first/oldest_first); paging under `relevance` is best-effort since scores shift as the index updates.")
+                    ]),
                     "since": .object([
                         "type": .string("string"),
                         "description": .string("Optional ISO date (YYYY-MM-DD or YYYY-MM or YYYY). Folded into the query as `after:`.")
@@ -61,12 +69,46 @@ enum MCPTools {
                             .string("relevance")
                         ]),
                         "default": .string("newest_first"),
-                        "description": .string("Result ordering. newest_first is the default. `relevance` currently falls back to newest_first (FTS5 BM25 isn't surfaced through our IN-subquery shape yet).")
+                        "description": .string("Result ordering. newest_first is the default. `relevance` ranks by column-weighted FTS5 BM25 (best match first) when the query has text to match — natural for targeted lookups (\"the email where X sent the contract\"). Subject and sender outweigh body text; quoted reply chains / signatures are near-zero weight (so a quoted block can't hijack the ranking); newsletter/list mail is down-ranked; and a small recency tie-breaker is blended in (see recency_lambda / include_bulk). A relevance sort on a metadata-only query (e.g. just `is:unread after:2024`), or one whose text is negated / OR-ed with a date, falls back to newest_first.")
+                    ]),
+                    "include_snippets": .object([
+                        "type": .string("boolean"),
+                        "default": .bool(false),
+                        "description": .string("When true, each result row includes a `snippet`: a short excerpt of the best-matching column with matched terms wrapped in «…». Lets you triage/rank without a get_email round-trip. Only produced for queries with text to match (same restriction as relevance sort).")
+                    ]),
+                    "snippet_max_tokens": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(Int64(SearchSnippet.minTokens)),
+                        "maximum": .int(Int64(SearchSnippet.maxTokens)),
+                        "default": .int(Int64(SearchSnippet.defaultTokens)),
+                        "description": .string("Approximate width (in tokens) of each `snippet`. Only used when include_snippets is true.")
                     ]),
                     "include_attachment_metadata": .object([
                         "type": .string("boolean"),
                         "default": .bool(false),
                         "description": .string("When true, each result row includes `attachments: [{name, content_type, byte_count}]`. Costs one body load per result, so only enable when needed (e.g. 'find the email where Anita sent the contract PDF' workflows).")
+                    ]),
+                    "dedupe": .object([
+                        "type": .string("boolean"),
+                        "default": .bool(false),
+                        "description": .string("Collapse the same message indexed under multiple accounts into one result, keyed by RFC Message-ID (keeps the copy whose body is on disk). Messages without a Message-ID stay distinct.")
+                    ]),
+                    "include_bulk": .object([
+                        "type": .string("boolean"),
+                        "default": .bool(true),
+                        "description": .string("When true (default), newsletter / mailing-list mail (List-Unsubscribe or Precedence: bulk/list) stays in results but is down-ranked under `sort: relevance`. Set false to hard-filter it out entirely — useful when you only want personal correspondence.")
+                    ]),
+                    "recency_lambda": .object([
+                        "type": .string("number"),
+                        "minimum": .int(0),
+                        "default": .double(0.2),
+                        "description": .string("Only for `sort: relevance`. Weight of the recency tie-breaker blended into the BM25 score (BM25 is normalised to 0…1 first, so this is on a comparable scale). 0 = pure textual relevance; ~0.2 nudges ties toward recent mail without letting fresh newsletters beat strong older matches.")
+                    ]),
+                    "recency_tau_days": .object([
+                        "type": .string("number"),
+                        "minimum": .int(1),
+                        "default": .int(180),
+                        "description": .string("Only for `sort: relevance`. Time constant (days) of the recency decay exp(-age/tau). Larger = recency stays relevant for older mail. Ignored when recency_lambda is 0.")
                     ])
                 ]),
                 "required": .array([.string("query")])
@@ -96,6 +138,101 @@ enum MCPTools {
                 "properties": .object([:])
             ]),
             handler: { args in try await MCPHandlers.listAccounts(args, context: context) }
+        )
+    }
+
+    // MARK: — export_thread
+
+    private static func exportThreadTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "export_thread",
+            description: """
+            Render a whole conversation to Markdown — title, then one section
+            per message (headers, cleaned body, attachment list), oldest first.
+            Good for archiving or sharing a thread outside mail.
+
+            With `save_to_path`, the Markdown is written to that file and the
+            response returns `{thread_id, message_count, saved_path,
+            byte_count}` (same local-vs-tunnel path rules as get_attachment:
+            local connections write anywhere, tunnel connections are confined
+            to ~/Downloads/FMail). Without it, the Markdown comes back inline
+            in `markdown`.
+
+            `body_format` defaults to `clean` (strip quoted reply chains /
+            signatures / tracking URLs) — pass `plain` to keep them.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "thread_id": .object(["type": .string("integer")]),
+                    "save_to_path": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional. Write the Markdown here instead of returning it inline. Tilde-expanded; absolute honoured verbatim (local) / confined to ~/Downloads/FMail (tunnel); relative resolved against $HOME. Parent dirs created.")
+                    ]),
+                    "body_format": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("plain"), .string("clean"), .string("raw")]),
+                        "default": .string("clean")
+                    ]),
+                    "max_body_chars": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(0),
+                        "maximum": .int(200000),
+                        "default": .int(50000),
+                        "description": .string("Per-message body truncation cap. 0 = headers/attachments only.")
+                    ])
+                ]),
+                "required": .array([.string("thread_id")])
+            ]),
+            handler: { args in try await MCPHandlers.exportThread(args, context: context) }
+        )
+    }
+
+    // MARK: — sender_stats
+
+    private static func senderStatsTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "sender_stats",
+            description: """
+            Correspondent analytics: count messages grouped by sender over an
+            optional date range, newest-volume first. Answers "who emails me
+            most", powers unsubscribe sweeps, and gives relationship summaries.
+
+            Each row: `{address, display_name, message_count, unread_count,
+            latest_date_received}`. Drafts/trash/junk are excluded.
+
+            `direction`:
+              - `incoming` (default): senders that are NOT your own account
+                addresses — people writing to you.
+              - `outgoing`: messages you sent (grouped by your own address).
+              - `all`: no sender filter.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "direction": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("incoming"), .string("outgoing"), .string("all")]),
+                        "default": .string("incoming")
+                    ]),
+                    "since": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional ISO date (YYYY / YYYY-MM / YYYY-MM-DD). Only messages on/after this date count.")
+                    ]),
+                    "until": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional ISO date. Only messages on/before this date count.")
+                    ]),
+                    "limit": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(1),
+                        "maximum": .int(200),
+                        "default": .int(20),
+                        "description": .string("Max senders to return.")
+                    ])
+                ])
+            ]),
+            handler: { args in try await MCPHandlers.senderStats(args, context: context) }
         )
     }
 
@@ -133,6 +270,17 @@ enum MCPTools {
                         "minimum": .int(1),
                         "maximum": .int(600),
                         "default": .int(100)
+                    ]),
+                    "offset": .object([
+                        "type": .string("integer"),
+                        "minimum": .int(0),
+                        "default": .int(0),
+                        "description": .string("Skip this many threads before returning — page past the `limit` cap. Deep paging is bounded (offset + limit ≤ 1200).")
+                    ]),
+                    "dedupe": .object([
+                        "type": .string("boolean"),
+                        "default": .bool(false),
+                        "description": .string("Collapse threads whose latest message shares a Message-ID — the same conversation mirrored across accounts. Threads whose latest message has no Message-ID stay distinct.")
                     ])
                 ])
             ]),
@@ -268,9 +416,11 @@ enum MCPTools {
             no per-call size cap, no truncation. Use this for any PDF /
             image / archive — base64-in-JSON tends to push anything
             above ~150 KB past MCP-client result-size caps. The path may
-            start with `~` (expanded to your home) or be relative
-            (resolved against your home). Missing parent directories are
-            created.
+            start with `~` (expanded to your home), be absolute, or be
+            relative (resolved against your home). Missing parent
+            directories are created. When you're connected locally the
+            destination is unrestricted; over the tunnel, writes are
+            confined to `~/Downloads/FMail`.
 
             **No `save_to_path`** — bytes returned in `data_base64`, capped
             by `max_bytes` (default 10 MB). Convenient for small text /
@@ -305,7 +455,7 @@ enum MCPTools {
                     ]),
                     "save_to_path": .object([
                         "type": .string("string"),
-                        "description": .string("Filesystem path to write the decoded bytes to. Tilde-expanded; relative paths are resolved against $HOME. When set, the response omits data_base64 and includes saved_path. Recommended for any non-trivial binary.")
+                        "description": .string("Filesystem path to write the decoded bytes to. Tilde-expanded; absolute paths honoured verbatim; relative paths resolved against $HOME. Local connections can write anywhere; tunnel connections are confined to ~/Downloads/FMail. When set, the response omits data_base64 and includes saved_path. Recommended for any non-trivial binary.")
                     ]),
                     "max_bytes": .object([
                         "type": .string("integer"),
@@ -368,7 +518,7 @@ enum MCPTools {
                     ]),
                     "save_to_path": .object([
                         "type": .string("string"),
-                        "description": .string("Optional. Requires `attachment_index`. Filesystem path to write the decoded bytes to; tilde-expanded, relative resolved against $HOME.")
+                        "description": .string("Optional. Requires `attachment_index`. Filesystem path to write the decoded bytes to; tilde-expanded, absolute honoured verbatim, relative resolved against $HOME. Local connections unrestricted; tunnel connections confined to ~/Downloads/FMail.")
                     ]),
                     "timeout_seconds": .object([
                         "type": .string("integer"),
@@ -403,8 +553,10 @@ enum MCPTools {
             error}` and means *that message* (or that one attachment)
             couldn't be fetched — the rest of the batch keeps going.
 
-            `save_dir` may start with `~` (expanded to your home) or be
-            relative (resolved against $HOME). Created if missing.
+            `save_dir` may start with `~` (expanded to your home), be
+            absolute, or be relative (resolved against $HOME). Created if
+            missing. Local connections can write anywhere; tunnel
+            connections are confined to `~/Downloads/FMail`.
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -491,6 +643,15 @@ enum MCPTools {
       subject:    subject line
       body:       body text (aliases: content:, text:)
       attachment: attachment filename
+      attachment-type: attachment content-type substring (pdf, image, zip)
+      attachment-size: attachment byte size with a comparator (>1mb, <500kb,
+                  >=2m, =0). Units b/kb/mb/gb (1024-based), default bytes,
+                  default comparator >=. Offloaded attachments use their
+                  declared size where Apple Mail recorded one.
+                  NOTE: attachment-type and attachment-size each match a
+                  message that HAS such an attachment, independently — so
+                  `attachment-type:pdf attachment-size:>1mb` means "has a PDF
+                  and has a >1MB file", not necessarily the same file.
       account:    account display name (e.g. "icloud", "gmail")
       in:         mailbox kind ("inbox", "sent", "archive", "all", or any path)
       thread:     numeric thread_id (from previous search/get_thread results) —
@@ -546,14 +707,21 @@ enum MCPTools {
       thread:1234 body:"550k"            (grep within a conversation)
       (alice OR bob) school -homework
       "exact phrase" has:attachment
+      from:bank attachment-type:pdf attachment-size:>1mb
       isunread last 7d
 
     INPUTS
     ------
-      query     (required) the DSL string above
-      limit     1–500, default 50
-      since     optional ISO date — folded in as after:
-      until     optional ISO date — folded in as before:
+      query            (required) the DSL string above
+      limit            1–500, default 50
+      offset           skip N results before returning (pagination), default 0
+      sort             newest_first (default) / oldest_first / relevance
+      include_snippets attach a matched-text excerpt per row, default false
+      include_bulk     keep newsletter/list mail (default true; false hard-filters)
+      recency_lambda   relevance recency tie-breaker weight (default 0.2; 0 = off)
+      recency_tau_days relevance recency decay constant in days (default 180)
+      since            optional ISO date — folded in as after:
+      until            optional ISO date — folded in as before:
 
     NOTES
     -----

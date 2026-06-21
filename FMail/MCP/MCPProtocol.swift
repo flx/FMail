@@ -112,6 +112,13 @@ extension JSONValue: Codable {
         default: return nil
         }
     }
+    var doubleValue: Double? {
+        switch self {
+        case .double(let d): return d
+        case .int(let i): return Double(i)
+        default: return nil
+        }
+    }
     var boolValue: Bool? {
         if case .bool(let b) = self { return b } else { return nil }
     }

@@ -46,6 +46,12 @@ struct EmailRef: Codable, Sendable {
     ///     interpret "missing" as "none".
     let attachments: [AttachmentRef]?
     let attachments_unavailable: Bool?
+    /// Excerpt of the best-matching column with matched terms wrapped in
+    /// `«…»`. Present only when `include_snippets: true` (or `sort:
+    /// relevance`) was requested AND the query had text to match against —
+    /// metadata-only queries (`is:unread after:2024`) carry no snippet.
+    /// Omitted (key absent) otherwise.
+    let snippet: String?
 }
 
 struct AttachmentRef: Codable, Sendable {
@@ -161,6 +167,27 @@ struct UnansweredThread: Codable, Sendable {
     let recipient_addresses: [String]
 }
 
+/// One aggregated correspondent in `sender_stats`.
+struct SenderStat: Codable, Sendable {
+    /// Lowercased sender address.
+    let address: String
+    /// Display name from this sender's most recent message, when present.
+    let display_name: String?
+    /// Number of messages from this sender in the requested window/direction.
+    let message_count: Int
+    /// How many of those are still unread.
+    let unread_count: Int
+    /// Date of this sender's most recent message in the window.
+    let latest_date_received: String?
+}
+
+struct SenderStatsResult: Codable, Sendable {
+    /// Echoes the requested direction (incoming / outgoing / all).
+    let direction: String
+    /// Senders ordered by message_count descending.
+    let senders: [SenderStat]
+}
+
 /// One row in `list_accounts` — the introspection tool that tells MCP
 /// clients which `account:` values they can filter `search_emails` on.
 struct AccountRef: Codable, Sendable {
@@ -258,6 +285,18 @@ enum ThreadDirection: String, Sendable {
 
 struct FindUnansweredThreadsResult: Codable, Sendable {
     let threads: [UnansweredThread]
+}
+
+/// Outcome of `export_thread`. When `save_to_path` was supplied, `markdown`
+/// is nil and `saved_path` / `byte_count` describe the on-disk file;
+/// otherwise the rendered `markdown` is returned inline.
+struct ExportThreadResult: Codable, Sendable {
+    let thread_id: Int
+    let message_count: Int
+    let format: String
+    let markdown: String?
+    let saved_path: String?
+    let byte_count: Int?
 }
 
 /// Outcome of `fetch_from_server`. When `attachment_index` + `save_to_path`

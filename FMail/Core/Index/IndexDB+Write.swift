@@ -165,6 +165,7 @@ extension IndexDB {
                     "DELETE FROM recipients WHERE message_rowid IN (\(placeholders))",
                     "DELETE FROM message_labels WHERE message_rowid IN (\(placeholders))",
                     "DELETE FROM message_links WHERE from_message_rowid IN (\(placeholders))",
+                    "DELETE FROM attachments WHERE message_rowid IN (\(placeholders))",
                     "DELETE FROM messages_fts WHERE rowid IN (\(placeholders))",
                     "DELETE FROM messages WHERE apple_rowid IN (\(placeholders))"
                 ]
@@ -205,6 +206,7 @@ extension IndexDB {
             try exec("DELETE FROM recipients WHERE message_rowid IN (\(staleSubquery))")
             try exec("DELETE FROM message_labels WHERE message_rowid IN (\(staleSubquery))")
             try exec("DELETE FROM message_links WHERE from_message_rowid IN (\(staleSubquery))")
+            try exec("DELETE FROM attachments WHERE message_rowid IN (\(staleSubquery))")
             try exec("DELETE FROM messages WHERE apple_rowid NOT IN (SELECT apple_rowid FROM _keep_rowids)")
             try exec("DELETE FROM _keep_rowids")
         }
@@ -315,9 +317,10 @@ extension IndexDB {
     func incrementalUpdateFTS() throws {
         try inTransaction {
             try exec("""
-            INSERT INTO messages_fts(rowid, subject, body_text, sender, recipients, attachment_names)
+            INSERT INTO messages_fts(rowid, subject, body_clean, body_quoted, sender, recipients, attachment_names)
             SELECT m.apple_rowid,
                    COALESCE(m.subject_prefix, '') || COALESCE(m.subject, ''),
+                   '',
                    '',
                    COALESCE(m.sender_address, '') || ' ' || COALESCE(m.sender_display, ''),
                    COALESCE((
@@ -335,45 +338,122 @@ extension IndexDB {
         }
     }
 
-    /// Update one message's body text in FTS. Called by BodyIndexer.
-    /// Performs DELETE+INSERT (FTS5 doesn't support partial UPDATEs cleanly).
+    /// Update one message's body text in FTS. Called by BodyIndexer on the
+    /// paths where a parsed body isn't available (body not on disk, parse
+    /// failure) — the whole string lands in `body_clean` and `is_bulk` is left
+    /// untouched. Does NOT touch the `attachments` table — use
+    /// `setBodyContent` when a parsed body is in hand.
     func setBodyText(messageRowId: Int, bodyText: String) throws {
         try inTransaction {
-            // Pull current FTS row contents to preserve other columns.
-            var sel: OpaquePointer?
-            try prepare("SELECT subject, sender, recipients, attachment_names FROM messages_fts WHERE rowid = ?", into: &sel)
-            defer { sqlite3_finalize(sel) }
-            bind(sel, 1, Int64(messageRowId))
-            var subject = "", sender = "", recipients = "", atts = ""
-            if sqlite3_step(sel) == SQLITE_ROW {
-                subject = sqlite3_column_text(sel, 0).map { String(cString: $0) } ?? ""
-                sender = sqlite3_column_text(sel, 1).map { String(cString: $0) } ?? ""
-                recipients = sqlite3_column_text(sel, 2).map { String(cString: $0) } ?? ""
-                atts = sqlite3_column_text(sel, 3).map { String(cString: $0) } ?? ""
-            }
+            try writeBodyFTS(messageRowId: messageRowId, bodyClean: bodyText, bodyQuoted: "")
+        }
+    }
 
-            var del: OpaquePointer?
-            try prepare("DELETE FROM messages_fts WHERE rowid = ?", into: &del)
-            defer { sqlite3_finalize(del) }
-            bind(del, 1, Int64(messageRowId))
-            try stepDone(del)
+    /// Update the body columns in FTS *and* replace the message's
+    /// `attachments` rows from the parsed body, in one transaction so FTS and
+    /// the attachment rows stay consistent. `bodyClean` is the ranking column;
+    /// `bodyQuoted` holds the stripped reply-chain / signature tail (low
+    /// weight, kept for recall); `isBulk` flags newsletter / list mail for the
+    /// ranker's discount. The success path of `BodyIndexer` calls this.
+    func setBodyContent(messageRowId: Int, bodyClean: String, bodyQuoted: String, isBulk: Bool, attachments: [Attachment]) throws {
+        try inTransaction {
+            try writeBodyFTS(messageRowId: messageRowId, bodyClean: bodyClean, bodyQuoted: bodyQuoted)
+            try setIsBulk(messageRowId: messageRowId, isBulk: isBulk)
+            try replaceAttachments(messageRowId: messageRowId, attachments: attachments)
+        }
+    }
 
-            var ins: OpaquePointer?
-            try prepare("INSERT INTO messages_fts(rowid, subject, body_text, sender, recipients, attachment_names) VALUES (?,?,?,?,?,?)", into: &ins)
-            defer { sqlite3_finalize(ins) }
+    /// Convenience overload: treat the whole string as clean body, no quoted
+    /// tail, not bulk. Kept for callers (and tests) that only have a single
+    /// body blob and attachment list.
+    func setBodyContent(messageRowId: Int, bodyText: String, attachments: [Attachment]) throws {
+        try setBodyContent(messageRowId: messageRowId, bodyClean: bodyText, bodyQuoted: "", isBulk: false, attachments: attachments)
+    }
+
+    /// FTS5 body update (DELETE+INSERT, since FTS5 has no clean partial
+    /// UPDATE) plus the `body_indexed` flag flip. Preserves the metadata
+    /// columns (subject / sender / recipients / attachment_names) that the
+    /// sync populated. Assumes it runs inside a transaction opened by the
+    /// caller.
+    private func writeBodyFTS(messageRowId: Int, bodyClean: String, bodyQuoted: String) throws {
+        // Pull current FTS row contents to preserve the metadata columns.
+        var sel: OpaquePointer?
+        try prepare("SELECT subject, sender, recipients, attachment_names FROM messages_fts WHERE rowid = ?", into: &sel)
+        defer { sqlite3_finalize(sel) }
+        bind(sel, 1, Int64(messageRowId))
+        var subject = "", sender = "", recipients = "", atts = ""
+        if sqlite3_step(sel) == SQLITE_ROW {
+            subject = sqlite3_column_text(sel, 0).map { String(cString: $0) } ?? ""
+            sender = sqlite3_column_text(sel, 1).map { String(cString: $0) } ?? ""
+            recipients = sqlite3_column_text(sel, 2).map { String(cString: $0) } ?? ""
+            atts = sqlite3_column_text(sel, 3).map { String(cString: $0) } ?? ""
+        }
+
+        var del: OpaquePointer?
+        try prepare("DELETE FROM messages_fts WHERE rowid = ?", into: &del)
+        defer { sqlite3_finalize(del) }
+        bind(del, 1, Int64(messageRowId))
+        try stepDone(del)
+
+        var ins: OpaquePointer?
+        try prepare("INSERT INTO messages_fts(rowid, subject, body_clean, body_quoted, sender, recipients, attachment_names) VALUES (?,?,?,?,?,?,?)", into: &ins)
+        defer { sqlite3_finalize(ins) }
+        bind(ins, 1, Int64(messageRowId))
+        bind(ins, 2, subject)
+        bind(ins, 3, bodyClean)
+        bind(ins, 4, bodyQuoted)
+        bind(ins, 5, sender)
+        bind(ins, 6, recipients)
+        bind(ins, 7, atts)
+        try stepDone(ins)
+
+        var upd: OpaquePointer?
+        try prepare("UPDATE messages SET body_indexed = 1 WHERE apple_rowid = ?", into: &upd)
+        defer { sqlite3_finalize(upd) }
+        bind(upd, 1, Int64(messageRowId))
+        try stepDone(upd)
+    }
+
+    /// Set the `is_bulk` flag on a message row. Assumes a caller-opened
+    /// transaction.
+    private func setIsBulk(messageRowId: Int, isBulk: Bool) throws {
+        var stmt: OpaquePointer?
+        try prepare("UPDATE messages SET is_bulk = ? WHERE apple_rowid = ?", into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, isBulk ? 1 : 0)
+        bind(stmt, 2, Int64(messageRowId))
+        try stepDone(stmt)
+    }
+
+    /// Replace every `attachments` row for one message. `byte_count` is the
+    /// decoded local size, falling back to the declared `X-Apple-Content-Length`
+    /// for offloaded attachments; `locally_available` reflects whether the
+    /// bytes are on disk right now. Assumes a caller-opened transaction.
+    private func replaceAttachments(messageRowId: Int, attachments: [Attachment]) throws {
+        var del: OpaquePointer?
+        try prepare("DELETE FROM attachments WHERE message_rowid = ?", into: &del)
+        defer { sqlite3_finalize(del) }
+        bind(del, 1, Int64(messageRowId))
+        try stepDone(del)
+
+        guard !attachments.isEmpty else { return }
+        var ins: OpaquePointer?
+        try prepare("""
+            INSERT INTO attachments(message_rowid, idx, name, content_type, byte_count, locally_available)
+            VALUES (?,?,?,?,?,?)
+            """, into: &ins)
+        defer { sqlite3_finalize(ins) }
+        for (i, att) in attachments.enumerated() {
+            sqlite3_reset(ins)
+            let local = !att.data.isEmpty
+            let bytes = local ? att.data.count : (att.declaredByteCount ?? 0)
             bind(ins, 1, Int64(messageRowId))
-            bind(ins, 2, subject)
-            bind(ins, 3, bodyText)
-            bind(ins, 4, sender)
-            bind(ins, 5, recipients)
-            bind(ins, 6, atts)
+            bind(ins, 2, Int64(i))
+            bind(ins, 3, att.name)
+            bind(ins, 4, att.contentType)
+            bind(ins, 5, Int64(bytes))
+            bind(ins, 6, Int64(local ? 1 : 0))
             try stepDone(ins)
-
-            var upd: OpaquePointer?
-            try prepare("UPDATE messages SET body_indexed = 1 WHERE apple_rowid = ?", into: &upd)
-            defer { sqlite3_finalize(upd) }
-            bind(upd, 1, Int64(messageRowId))
-            try stepDone(upd)
         }
     }
 
