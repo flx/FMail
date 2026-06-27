@@ -324,11 +324,18 @@ enum Evaluator {
         case .attachmentName(let v):
             return ftsField("attachment_names", v)
         case .attachmentType(let t):
-            // Substring match on content-type so `pdf` hits `application/pdf`.
-            // `t` is already lowercased by the parser.
+            // `t` is already lowercased by the parser. Accept a curated family
+            // name (pdf, word, excel, archive, …) by expanding it to the
+            // content-type substrings that identify the family; always also try
+            // the literal value as a substring, so a power user can still match
+            // a raw content-type fragment (e.g. `attachment-type:octet`). A
+            // plain `pdf` collapses to a single `LIKE %pdf%` as before.
+            var tokens = AttachmentType.likeTokens(forFamily: t)
+            if !tokens.contains(t) { tokens.append(t) }
+            let likes = tokens.map { _ in "LOWER(a.content_type) LIKE ?" }.joined(separator: " OR ")
             return .sql(
-                fragment: "EXISTS (SELECT 1 FROM attachments a WHERE a.message_rowid = m.apple_rowid AND LOWER(a.content_type) LIKE ?)",
-                bindings: [.text("%\(t)%")]
+                fragment: "EXISTS (SELECT 1 FROM attachments a WHERE a.message_rowid = m.apple_rowid AND (\(likes)))",
+                bindings: tokens.map { .text("%\($0)%") }
             )
         case .attachmentSize(let cmp, let bytes):
             // `cmp.sql` is a fixed enum rawValue (>, >=, …), not user input.
@@ -384,6 +391,14 @@ enum Evaluator {
                 fragment: "(m.thread_id = ? OR (m.thread_id = 0 AND m.apple_rowid = ?))",
                 bindings: [.int(Int64(id)), .int(Int64(id))]
             )
+        case .ownerFrom(let owners):
+            return ownerSenderSQL(owners)
+        case .ownerTo(let owners):
+            return ownerRecipientSQL(kind: 0, owners)   // recipients.kind 0 = To
+        case .ownerCc(let owners):
+            return ownerRecipientSQL(kind: 1, owners)   // recipients.kind 1 = Cc
+        case .sentMailbox(let owners):
+            return sentMailboxSQL(owners)
         case .unknownField(_, let value):
             // Surface unknown fields as bag-of-words so the user still gets
             // results — matches the original behavior.
@@ -415,6 +430,62 @@ enum Evaluator {
         }
         let inner = tokens.map { "\($0)*" }.joined(separator: " AND ")
         return .text("{\(column)}: (\(inner))")
+    }
+
+    // MARK: — Owner-identity predicates (`from:me` / `to:me` / `cc:me` / `in:sent`)
+
+    /// Lowercased, trimmed, de-duplicated, stably-ordered owner identities.
+    /// Stable order keeps the compiled SQL (and bindings) deterministic for the
+    /// `interpretation` strip and the test suite.
+    private static func normalizedOwners(_ owners: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for o in owners {
+            let n = o.trimmingCharacters(in: .whitespaces).lowercased()
+            if !n.isEmpty, seen.insert(n).inserted { out.append(n) }
+        }
+        return out.sorted()
+    }
+
+    /// `LOWER(m.sender_address) IN (?, …)` — an exact match on the structured
+    /// sender column, unlike the fuzzy FTS `from:` path. An empty owner set
+    /// compiles to the always-false `0`, so `from:me` matches nothing when no
+    /// identity is known rather than everything.
+    private static func ownerSenderSQL(_ owners: [String]) -> Compiled {
+        let ids = normalizedOwners(owners)
+        guard !ids.isEmpty else { return .sql(fragment: "0", bindings: []) }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ", ")
+        return .sql(
+            fragment: "LOWER(m.sender_address) IN (\(placeholders))",
+            bindings: ids.map { .text($0) }
+        )
+    }
+
+    /// `EXISTS (… recipients r … r.kind = <kind> AND LOWER(r.address) IN (…))`
+    /// — the owner is a To (kind 0) or Cc (kind 1) recipient. Empty owner set
+    /// ⇒ always-false.
+    private static func ownerRecipientSQL(kind: Int, _ owners: [String]) -> Compiled {
+        let ids = normalizedOwners(owners)
+        guard !ids.isEmpty else { return .sql(fragment: "0", bindings: []) }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ", ")
+        // `kind` is a fixed integer literal chosen by the caller, never input.
+        return .sql(
+            fragment: "EXISTS (SELECT 1 FROM recipients r WHERE r.message_rowid = m.apple_rowid AND r.kind = \(kind) AND LOWER(r.address) IN (\(placeholders)))",
+            bindings: ids.map { .text($0) }
+        )
+    }
+
+    /// `in:sent` — a `\Sent`-class mailbox OR mail authored by an owner
+    /// identity. With no owner identities it degrades to the mailbox-only test.
+    private static func sentMailboxSQL(_ owners: [String]) -> Compiled {
+        let mailbox = "m.mailbox_rowid IN (SELECT apple_rowid FROM mailboxes WHERE kind = 'sent')"
+        let ids = normalizedOwners(owners)
+        guard !ids.isEmpty else { return .sql(fragment: mailbox, bindings: []) }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ", ")
+        return .sql(
+            fragment: "(\(mailbox) OR LOWER(m.sender_address) IN (\(placeholders)))",
+            bindings: ids.map { .text($0) }
+        )
     }
 
     // MARK: — Combinators
@@ -585,6 +656,10 @@ enum Evaluator {
         case .mailboxKind(let kind): return "\(pre)in:\(kind)"
         case .account(let acc):      return "\(pre)account:\(quoteIfNeeded(acc))"
         case .thread(let id):        return "\(pre)thread:\(id)"
+        case .ownerFrom:   return "\(pre)from:me"
+        case .ownerTo:     return "\(pre)to:me"
+        case .ownerCc:     return "\(pre)cc:me"
+        case .sentMailbox: return "\(pre)in:sent"
         case .unknownField(let name, let value): return "\(pre)\(name)?:\(quoteIfNeeded(value))"
         }
     }

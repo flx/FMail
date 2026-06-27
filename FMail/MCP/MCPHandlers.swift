@@ -62,7 +62,16 @@ enum MCPHandlers {
             compiled = "before:\(until) " + compiled
         }
 
-        let ast = QueryParser.parse(compiled)
+        var ast = QueryParser.parse(compiled)
+        // Resolve `from:me`/`to:me`/`cc:me` and `in:sent` against the live
+        // owner-identity set. Only pay for the owner-identity query when the
+        // query actually uses one of those tokens (the common case doesn't).
+        if OwnerExpansion.referencesOwner(ast) {
+            let owners = try await context.indexDB.ownerIdentities(
+                excludingAccounts: MCPSettings.nonOwnerAccounts()
+            )
+            ast = OwnerExpansion.rewrite(ast, owners: owners)
+        }
         let compiledQ = Evaluator.compile(ast)
         guard compiledQ.hasAnyConstraint else {
             return try JSONValue.encoding(SearchEmailsResult(results: []))

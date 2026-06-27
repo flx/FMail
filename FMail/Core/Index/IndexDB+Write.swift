@@ -506,15 +506,50 @@ extension IndexDB {
     }
 
     func mailboxKind(for m: Mailbox) -> MailboxKind {
-        switch m.displayName {
-        case "INBOX": return .inbox
-        case "Sent Messages", "Sent Mail": return .sent
-        case "Drafts": return .drafts
-        case "Junk", "Spam": return .junk
-        case "Deleted Messages", "Trash": return .trash
-        case "Archive": return .archive
-        case "All Mail": return .all
-        default: return .other
+        Self.mailboxKind(displayName: m.displayName)
+    }
+
+    /// Classify a mailbox into a canonical `MailboxKind` from its leaf name,
+    /// generically across providers and UI languages: a case-insensitive table
+    /// of the English system names plus common localized / provider variants
+    /// (Gmail "Sent Mail", iCloud "Sent Messages", Outlook "Sent Items", German
+    /// "Gesendet", …). Nothing here is specific to one user's mailbox.
+    ///
+    /// This is a best-effort *naming* heuristic, computed once at sync time and
+    /// stored in `mailboxes.kind`. It is deliberately NOT the last word on
+    /// `in:sent`: that query additionally unions mail authored by an owner
+    /// identity (see `Evaluator.sentMailboxSQL` / `OwnerExpansion`), so sent
+    /// mail is still found when a provider's folder name isn't in this table,
+    /// the folder is a flat Gmail label, or the stored `kind` predates a table
+    /// update.
+    static func mailboxKind(displayName: String) -> MailboxKind {
+        switch displayName.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "inbox",
+             "posteingang", "bandeja de entrada", "boîte de réception",
+             "posta in arrivo", "postvak in", "受信トレイ", "收件箱":
+            return .inbox
+        case "sent", "sent messages", "sent mail", "sent items",
+             "gesendet", "gesendete objekte", "enviados", "envoyés",
+             "posta inviata", "verzonden", "skickat", "送信済み", "已发送":
+            return .sent
+        case "drafts", "entwürfe", "borradores", "brouillons", "bozze",
+             "concepten", "utkast", "草稿", "下書き":
+            return .drafts
+        case "junk", "spam", "junk email", "werbung", "correo no deseado",
+             "courrier indésirable", "posta indesiderata", "ongewenste e-mail",
+             "skräppost":
+            return .junk
+        case "trash", "deleted messages", "deleted items", "bin", "papierkorb",
+             "papelera", "corbeille", "cestino", "prullenbak", "ゴミ箱", "已删除":
+            return .trash
+        case "archive", "archiv", "archivo", "archives", "archivio", "arkiv",
+             "archiwum":
+            return .archive
+        case "all mail", "alle nachrichten", "todos los mensajes",
+             "tous les messages", "tutti i messaggi":
+            return .all
+        default:
+            return .other
         }
     }
 }

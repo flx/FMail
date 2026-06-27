@@ -25,6 +25,46 @@ enum MCPTools {
         await dispatcher.register(getAttachmentsForRowidsTool(context: context))
         await dispatcher.register(fetchFromServerTool(context: context))
         await dispatcher.register(findUnansweredTool(context: context))
+        await dispatcher.register(describeSchemaTool(context: context))
+
+        // The same ontology, exposed as an on-demand resource (the primary
+        // surface) so it doesn't ride in any tool description on every call.
+        await dispatcher.register(resource: MCPResource(
+            uri: MCPSchema.resourceURI,
+            name: MCPSchema.resourceName,
+            description: MCPSchema.resourceDescription,
+            mimeType: "application/json",
+            read: {
+                let doc = try await MCPSchema.document(context: context)
+                let data = try JSONEncoder().encode(doc)
+                return String(data: data, encoding: .utf8) ?? "{}"
+            }
+        ))
+    }
+
+    // MARK: — describe_schema
+
+    /// Tool mirror of the `fmail://schema` resource, for MCP clients that don't
+    /// surface resources. Returns the identical JSON document.
+    private static func describeSchemaTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "describe_schema",
+            description: """
+            Return FMail's data-model schema — the same JSON as the
+            `fmail://schema` resource, for clients that don't surface MCP
+            resources. Covers the entities and their fields, how they relate,
+            every `search_emails` DSL operator, and the LIVE values present in
+            THIS index: your accounts, the owner identities that `from:me` /
+            `in:sent` resolve to, the mailbox classes, and the attachment-type
+            families. Call this once to ground queries in real operators and
+            values rather than guessing. Takes no arguments.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([:])
+            ]),
+            handler: { _ in try await MCPSchema.document(context: context) }
+        )
     }
 
     // MARK: — search_emails
@@ -38,7 +78,7 @@ enum MCPTools {
                 "properties": .object([
                     "query": .object([
                         "type": .string("string"),
-                        "description": .string("FMail DSL query — see the tool description for grammar.")
+                        "description": .string("FMail DSL query — see the tool description for grammar, or the `fmail://schema` resource / `describe_schema` for the operator list plus the live filterable values.")
                     ]),
                     "limit": .object([
                         "type": .string("integer"),
@@ -156,7 +196,9 @@ enum MCPTools {
             byte_count}` (same local-vs-tunnel path rules as get_attachment:
             local connections write anywhere, tunnel connections are confined
             to ~/Downloads/FMail). Without it, the Markdown comes back inline
-            in `markdown`.
+            in `markdown`. To hand the user a file, prefer `save_to_path`
+            (request access to this connector / ~/Downloads/FMail if needed)
+            over computer use / GUI automation.
 
             `body_format` defaults to `clean` (strip quoted reply chains /
             signatures / tracking URLs) — pass `plain` to keep them.
@@ -420,7 +462,11 @@ enum MCPTools {
             relative (resolved against your home). Missing parent
             directories are created. When you're connected locally the
             destination is unrestricted; over the tunnel, writes are
-            confined to `~/Downloads/FMail`.
+            confined to `~/Downloads/FMail`. This direct write is the
+            supported way to land the file on the user's disk over a
+            remote connection — prefer it (and, if needed, request access
+            to this connector / `~/Downloads/FMail`) over computer use or
+            GUI automation to fetch the attachment.
 
             **No `save_to_path`** — bytes returned in `data_base64`, capped
             by `max_bytes` (default 10 MB). Convenient for small text /
@@ -556,7 +602,10 @@ enum MCPTools {
             `save_dir` may start with `~` (expanded to your home), be
             absolute, or be relative (resolved against $HOME). Created if
             missing. Local connections can write anywhere; tunnel
-            connections are confined to `~/Downloads/FMail`.
+            connections are confined to `~/Downloads/FMail`. This is the
+            way to bulk-land attachments on the user's disk — prefer it
+            (requesting access to this connector / `~/Downloads/FMail` if
+            needed) over computer use / GUI automation.
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -619,118 +668,67 @@ enum MCPTools {
 
     private static let searchEmailsDescription: String = """
     **Full-text search across every indexed email** — subject, sender,
-    recipients, attachment filenames, and body content — newest first.
-    Drafts, trash, and junk are excluded by default; use `in:drafts` (etc.)
-    to scope to those explicitly. The DSL below supports boolean operators,
-    quoted phrases, and per-field operators so you can compose narrow
-    queries like "invoices from a vendor in March 2025 with a PDF attached"
-    in one call: `from:vendor.com subject:invoice after:2025-03
-    before:2025-04 attachment:pdf`.
+    recipients, attachment filenames, and body — newest first. Drafts, trash,
+    and junk are excluded unless you scope to them with `in:`.
 
-    Use this when the user wants to find email by any combination of
-    topic / person / time / mailbox / flag / attachment name. Use
-    `list_threads` instead when they want a chronological overview of
-    recent conversations rather than a targeted search.
+    Compose narrow queries in one call, e.g. invoices from a vendor in March
+    2025 with a PDF: `from:vendor.com subject:invoice after:2025-03
+    before:2025-04 attachment-type:pdf`. Use `list_threads` instead for a
+    chronological overview rather than a targeted search.
 
-    DSL GRAMMAR
-    ===========
-    Operators: AND (implicit), OR, NOT or `-`, parentheses, "quoted phrases".
+    For the full operator list AND the live values you can filter on — your
+    accounts, what `from:me` / `in:sent` resolve to, the mailbox classes and
+    attachment-type families actually present in this index — read the
+    `fmail://schema` resource (or call `describe_schema`). Grounding a query
+    in those real values beats guessing.
 
-    Field operators (each takes a single value or a quoted phrase):
-      from:       sender address or display name (supports domain match)
-      to:         recipient address or display name
-      cc:         cc recipient
-      subject:    subject line
-      body:       body text (aliases: content:, text:)
-      attachment: attachment filename
-      attachment-type: attachment content-type substring (pdf, image, zip)
-      attachment-size: attachment byte size with a comparator (>1mb, <500kb,
-                  >=2m, =0). Units b/kb/mb/gb (1024-based), default bytes,
-                  default comparator >=. Offloaded attachments use their
-                  declared size where Apple Mail recorded one.
-                  NOTE: attachment-type and attachment-size each match a
-                  message that HAS such an attachment, independently — so
-                  `attachment-type:pdf attachment-size:>1mb` means "has a PDF
-                  and has a >1MB file", not necessarily the same file.
-      account:    account display name (e.g. "icloud", "gmail")
-      in:         mailbox kind ("inbox", "sent", "archive", "all", or any path)
-      thread:     numeric thread_id (from previous search/get_thread results) —
-                  narrows to one conversation. Combine with body:/from:/etc. to
-                  grep within a thread.
-      has:        "attachment" only
-      is:         "read", "unread", "flagged"
-      before:     date — see DATE FORMS
-      after:, since:  date
-      on:, during:    date range matching the precision of the date
+    DSL ESSENTIALS
+      Boolean: AND (implicit), OR, NOT or `-`, ( ), "quoted phrase".
+      Values match by token PREFIX; quote for an exact match.
 
-    Bareword tokens match anywhere (subject + body + sender + recipients).
+      Field operators:
+        from: / to: / cc:   address, display name, or domain. `me` = you
+                            (your own account identities); `in:sent` likewise
+                            means mail you authored — both provider-agnostic.
+        subject:            subject line
+        body:               body text (aliases content:, text:)
+        attachment:         attachment filename
+        attachment-type:    content-type substring (e.g. pdf, image)
+        attachment-size:    comparator + size, e.g. >1mb, <=500kb, =0
+                            (units b/kb/mb/gb, default comparator >=)
+        in:                 mailbox class (inbox, sent, drafts, archive, all, …)
+        account:            account email or substring
+        thread:             numeric thread_id — grep within one conversation
+        is:                 read | unread | flagged
+        has:                attachment
+        before: / after: (since:) / on: (during:)   dates
 
-    No-colon shortcuts: hasattachment, isunread, isread, isflagged.
+      Dates: ISO (2024-03, 2024-03-15), relative (today, 7d, 2w, 3m), quoted
+      ("last 30 days"), or a month name. `after:`/`since:` are inclusive of the
+      period start; `during:`/`on:` match the typed precision (`during:2024-03`
+      = all of March 2024).
 
-    ADDRESS / DOMAIN MATCHING
-    -------------------------
-    Values for `from:`/`to:`/`cc:`/`attachment:` are split on non-alphanumeric
-    chars before searching, so `from:vendor.com` matches any sender with
-    "vendor" AND "com" in their address column (i.e. all @vendor.com
-    addresses). `from:jdoe@vendor.com` ANDs four tokens. This catches
-    senders even though FTS5 tokenises email addresses by `@` and `.`.
-
-    DATE FORMS
-    ----------
-      ISO:         2024-03-15, 2024-03, 2024
-      Single word: today, yesterday, tomorrow
-      Compact:     7d, 2w, 3m, 1y
-      Quoted:      "last 30 days", "last week", "this year"
-      Month name:  march, march 2024
-
-    DATE SEMANTICS
-    --------------
-      before:DATE    < start of period containing DATE
-                     (so `before:2025` is `< 2025-01-01`)
-      after:DATE     >= start of period containing DATE — INCLUSIVE
-      since:DATE     synonym for after:
-                     (so `after:2024` is `>= 2024-01-01`,
-                      `after:2024-03` is `>= 2024-03-01`,
-                      `after:2024-03-15` is `>= 2024-03-15`)
-      during:/on:    [start, start of next period) — matches the precision of DATE
-                     (so `during:2024-03` is all of March 2024)
-
-    Bareword search and field values match by token PREFIX
-    (e.g. `subject:v` matches "vermont"). Quote for exact match: "vermont".
+      Bareword tokens match anywhere (subject/body/sender/recipients).
+      No-colon shortcuts: hasattachment, isunread, isread, isflagged.
 
     EXAMPLES
-    --------
-      from:alice school trip
-      from:vendor.com (matches any vendor.com sender)
-      from:alice@gmail.com after:2024-01
-      to:me from:bank invoice
-      thread:1234 body:"550k"            (grep within a conversation)
+      from:me invoice                  (mail you sent mentioning "invoice")
+      to:me from:bank statement
+      from:vendor.com after:2024-01    (any vendor.com sender)
       (alice OR bob) school -homework
-      "exact phrase" has:attachment
+      thread:1234 body:"550k"
       from:bank attachment-type:pdf attachment-size:>1mb
       isunread last 7d
 
-    INPUTS
-    ------
-      query            (required) the DSL string above
-      limit            1–500, default 50
-      offset           skip N results before returning (pagination), default 0
-      sort             newest_first (default) / oldest_first / relevance
-      include_snippets attach a matched-text excerpt per row, default false
-      include_bulk     keep newsletter/list mail (default true; false hard-filters)
-      recency_lambda   relevance recency tie-breaker weight (default 0.2; 0 = off)
-      recency_tau_days relevance recency decay constant in days (default 180)
-      since            optional ISO date — folded in as after:
-      until            optional ISO date — folded in as before:
-
     NOTES
-    -----
-    - Body content is searchable as it gets indexed in the background; a
-      very recent message may not match by body text yet, but always matches
-      by subject/sender/recipient/attachment-name immediately.
-    - Each result row has `body_on_disk:true|false`. False means the .emlx
-      hasn't been fetched yet — `get_email` / `get_attachment` may fail
-      until the user opens the message in Mail.app once. Prefer rows with
-      body_on_disk:true when there's a choice.
+    - Body text is indexed in the background; a brand-new message matches by
+      subject/sender/recipient/attachment-name immediately, by body slightly
+      later.
+    - Each result has `body_on_disk:true|false`. False = the .emlx isn't
+      fetched yet; `get_email` / `get_attachment` may fail until the message is
+      opened in Mail.app once. Prefer body_on_disk:true when there's a choice.
+    - Other inputs: `limit` (1–500, default 50), `offset`, `sort`
+      (newest_first | oldest_first | relevance), `include_snippets`, `dedupe`,
+      `include_bulk`, `since`/`until`. See the input schema for the rest.
     """
 }

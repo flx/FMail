@@ -23,6 +23,12 @@ actor IndexDB {
     // and lets every call site use `db` directly instead of `db!`.
     nonisolated(unsafe) private let db: OpaquePointer
 
+    /// Memoised `fmail://schema` enums (see `schemaEnums` / IndexDB+Schema.swift).
+    /// Keyed by the connection's change-counter (busts on any write) and the
+    /// configured non-owner set (busts on a config change). Actor-isolated, so
+    /// the cache itself needs no extra locking.
+    private var cachedSchema: (changes: Int64, excluded: Set<String>, enums: SchemaEnums)?
+
     /// Returns `~/Library/Application Support/FMail/index.sqlite`. Creates the
     /// directory if needed.
     static func defaultPath() throws -> String {
@@ -60,6 +66,30 @@ actor IndexDB {
     deinit {
         sqlite3_close(db)
     }
+
+    // MARK: — Schema (ontology) enums — cached, busts on any index write
+
+    /// Index-derived enum values backing the `fmail://schema` resource. Computed
+    /// from the live index and memoised: the cache key is `sqlite3_total_changes`,
+    /// which advances on every insert/update/delete on this connection, so any
+    /// sync that touches the index invalidates it with no explicit hook. The
+    /// configured non-owner `excluded` set is part of the key, so a settings
+    /// change is reflected too. The build itself (see `buildSchemaEnums` in
+    /// IndexDB+Schema.swift) is read-only and therefore doesn't bump the counter.
+    func schemaEnums(excludingAccounts excluded: Set<String> = []) throws -> SchemaEnums {
+        let changes = changeCounter()
+        if let cached = cachedSchema, cached.changes == changes, cached.excluded == excluded {
+            return cached.enums
+        }
+        let enums = try buildSchemaEnums(excludingAccounts: excluded)
+        cachedSchema = (changes, excluded, enums)
+        return enums
+    }
+
+    /// Monotonic count of row mutations on this connection — a cheap, self-
+    /// contained staleness token for derived caches. Increments on every
+    /// insert/update/delete; never decreases for the connection's lifetime.
+    func changeCounter() -> Int64 { Int64(sqlite3_total_changes(db)) }
 
     // MARK: — Metadata
 

@@ -6,9 +6,17 @@ import Foundation
 /// populates it once per server start.
 actor MCPDispatcher {
     private var tools: [String: MCPTool] = [:]
+    private var resources: [String: MCPResource] = [:]
 
     func register(_ tool: MCPTool) {
         tools[tool.name] = tool
+    }
+
+    /// Register an MCP resource (keyed by URI). Resources are read-only blobs
+    /// the client can fetch on demand — used for the `fmail://schema` ontology,
+    /// which is too large to ride in a tool description on every call.
+    func register(resource: MCPResource) {
+        resources[resource.uri] = resource
     }
 
     func registeredToolNames() -> [String] {
@@ -66,6 +74,14 @@ actor MCPDispatcher {
                 result = handleToolsList()
             case "tools/call":
                 result = try await handleToolsCall(req.params)
+            case "resources/list":
+                result = handleResourcesList()
+            case "resources/read":
+                result = try await handleResourcesRead(req.params)
+            case "resources/templates/list":
+                // No templated resources — return an empty list rather than
+                // method-not-found so spec-conformant clients don't log an error.
+                result = .object(["resourceTemplates": .array([])])
             default:
                 throw JSONRPCErrorPayload(
                     code: JSONRPCErrorCode.methodNotFound,
@@ -97,12 +113,13 @@ actor MCPDispatcher {
         // how do you use it" — claude.ai-style connectors surface a summary
         // of it on first connection. We lead with the search capability so
         // the LLM sees it at a glance rather than discovering it by digging
-        // through tools/list. We advertise tools support but no
-        // listChanged events (the registry is fixed at app boot).
+        // through tools/list. We advertise tools + resources support but no
+        // listChanged events (both registries are fixed at app boot).
         .object([
             "protocolVersion": .string(MCPProtocol.version),
             "capabilities": .object([
-                "tools": .object(["listChanged": .bool(false)])
+                "tools": .object(["listChanged": .bool(false)]),
+                "resources": .object(["listChanged": .bool(false), "subscribe": .bool(false)])
             ]),
             "serverInfo": .object([
                 "name": .string(MCPProtocol.serverName),
@@ -123,6 +140,45 @@ actor MCPDispatcher {
                 ])
             }
         return .object(["tools": .array(entries)])
+    }
+
+    private func handleResourcesList() -> JSONValue {
+        let entries: [JSONValue] = resources.values
+            .sorted(by: { $0.uri < $1.uri })
+            .map { r in
+                .object([
+                    "uri": .string(r.uri),
+                    "name": .string(r.name),
+                    "description": .string(r.description),
+                    "mimeType": .string(r.mimeType)
+                ])
+            }
+        return .object(["resources": .array(entries)])
+    }
+
+    private func handleResourcesRead(_ params: JSONValue?) async throws -> JSONValue {
+        guard let uri = params?.objectValue?["uri"]?.stringValue else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.invalidParams,
+                message: "resources/read requires `uri`"
+            )
+        }
+        guard let resource = resources[uri] else {
+            throw JSONRPCErrorPayload(
+                code: JSONRPCErrorCode.resourceNotFound,
+                message: "Unknown resource: \(uri)"
+            )
+        }
+        let text = try await resource.read()
+        return .object([
+            "contents": .array([
+                .object([
+                    "uri": .string(uri),
+                    "mimeType": .string(resource.mimeType),
+                    "text": .string(text)
+                ])
+            ])
+        ])
     }
 
     private func handleToolsCall(_ params: JSONValue?) async throws -> JSONValue {
@@ -206,6 +262,17 @@ struct MCPTool: Sendable {
     let description: String
     let inputSchema: JSONValue
     let handler: @Sendable (JSONValue) async throws -> JSONValue
+}
+
+/// One registered resource: a stable URI, list metadata the client shows, and
+/// an async `read` that produces the body text on demand (recomputed per read,
+/// so it always reflects the live index).
+struct MCPResource: Sendable {
+    let uri: String
+    let name: String
+    let description: String
+    let mimeType: String
+    let read: @Sendable () async throws -> String
 }
 
 enum MCPDispatchResult: Sendable {

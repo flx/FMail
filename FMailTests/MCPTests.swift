@@ -258,7 +258,8 @@ final class MCPTests: XCTestCase {
             "get_attachment",
             "get_attachments_for_rowids",
             "fetch_from_server",
-            "find_unanswered_threads"
+            "find_unanswered_threads",
+            "describe_schema"
         ])
     }
 

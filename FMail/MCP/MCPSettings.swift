@@ -17,6 +17,7 @@ enum MCPSettings {
     static let cloudflaredPathKey = "mcp.cloudflared.path"
     static let tunnelNameKey = "mcp.tunnel.name"
     static let tunnelPublicURLKey = "mcp.tunnel.publicURL"
+    static let nonOwnerAccountsKey = "mcp.owner.nonOwnerAccounts"
 
     /// On by default after a fresh start; an explicit toggle-off persists.
     /// (The server is loopback-only and, once a tunnel is configured, requires
@@ -82,5 +83,21 @@ enum MCPSettings {
     /// (URL-safe alphabet, no padding). ~43 chars long.
     static func generateAuthToken() -> String {
         OAuthPKCE.randomToken(byteCount: 32)
+    }
+
+    /// Accounts the user has marked as NOT their own identity (e.g. a shared
+    /// family or role mailbox, or a child's account they read but don't own).
+    /// Each entry is an account **UUID or email address** — whichever the user
+    /// finds easier; matching is case-insensitive and tries both. Flagged
+    /// accounts are excluded from owner-identity derivation — so `from:me` /
+    /// `in:sent` and the schema's `owner_identities` ignore them — and reported
+    /// with `is_owner: false` in `fmail://schema`.
+    ///
+    /// Default empty: every configured account is an owner. This is the only
+    /// owner-related input that is configurable. It lives entirely in user
+    /// config (an account uuid/email the user picked); no address is ever baked
+    /// into the source.
+    static func nonOwnerAccounts() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: nonOwnerAccountsKey) ?? [])
     }
 }

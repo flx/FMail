@@ -42,6 +42,21 @@ enum Term: Equatable {
     case account(String)            // account:you@example.com or short prefix
     case thread(Int)                // thread:<id> — narrow to one conversation
 
+    /// `from:me` / `to:me` / `cc:me` after owner-identity expansion (see
+    /// `OwnerExpansion`). The associated value is the runtime owner-identity
+    /// set — every address that identifies the mailbox's owner. Matched
+    /// precisely against the structured `sender_address` / `recipients`
+    /// columns (not FTS), so `from:me` can't over-match a stranger. An empty
+    /// set compiles to match-nothing rather than match-everything.
+    case ownerFrom([String])
+    case ownerTo([String])
+    case ownerCc([String])
+    /// `in:sent` generalised: a `\Sent`-class mailbox OR mail authored by an
+    /// owner identity. The owner-sender union is the provider-agnostic part —
+    /// sent mail is authored by the owner regardless of which (possibly
+    /// non-English, possibly flat-Gmail-label) folder holds it.
+    case sentMailbox([String])
+
     /// Field we didn't recognize — pass through as bag-of-words on value
     /// so the user still gets results.
     case unknownField(name: String, value: String)
