@@ -155,43 +155,6 @@ final class IndexDBPriorityTests: XCTestCase {
                        "updatePrioritySet replaces, not appends")
     }
 
-    // MARK: — rowidsMatching
-
-    func testRowidsMatchingFiltersByPriorityBlockAndReadState() async throws {
-        let env = try await makeDB(); defer { env.cleanup() }
-        let base = 1_700_000_000
-        try await env.db.upsertMessages([
-            message(rowid: 50, mailbox: env.inbox, sender: "boss@work.com", date: base, isRead: false),     // priority, unread
-            message(rowid: 51, mailbox: env.inbox, sender: "boss@work.com", date: base - 1, isRead: true),  // priority, read
-            message(rowid: 52, mailbox: env.inbox, sender: "other@x.com", date: base - 2, isRead: false),   // other, unread
-        ])
-        try await env.db.incrementalUpdateFTS()
-        try await env.db.updatePrioritySet(exact: ["boss@work.com"], patterns: [])
-
-        let q = matchAllQuery()
-        let priorityUnread = try await env.db.rowidsMatching(q, priority: true, isRead: false)
-        XCTAssertEqual(Set(priorityUnread), [50], "priority + unread only")
-
-        let priorityRead = try await env.db.rowidsMatching(q, priority: true, isRead: true)
-        XCTAssertEqual(Set(priorityRead), [51], "priority + read only")
-
-        let otherUnread = try await env.db.rowidsMatching(q, priority: false, isRead: false)
-        XCTAssertEqual(Set(otherUnread), [52], "other + unread only")
-    }
-
-    func testRowidsMatchingEmptyQueryReturnsNothing() async throws {
-        let env = try await makeDB(); defer { env.cleanup() }
-        try await env.db.upsertMessages([
-            message(rowid: 60, mailbox: env.inbox, sender: "a@x.com", date: 1_700_000_000)
-        ])
-        try await env.db.incrementalUpdateFTS()
-        // An unconstrained query (hasAnyConstraint == false) is a guard no-op.
-        let empty = Evaluator.compile(QueryParser.parse(""))
-        XCTAssertFalse(empty.hasAnyConstraint)
-        let rows = try await env.db.rowidsMatching(empty, priority: true, isRead: false)
-        XCTAssertTrue(rows.isEmpty)
-    }
-
     // MARK: — sentToAddresses
 
     /// `sentToAddresses` returns the To/Cc/Bcc addresses of messages whose

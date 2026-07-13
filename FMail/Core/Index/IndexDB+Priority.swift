@@ -112,37 +112,6 @@ extension IndexDB {
         return (priority, other)
     }
 
-    /// Rowids matching `q` in the given block and read state — the working set
-    /// for "Mark all Priority/Other Messages as read/unread". Not capped to the
-    /// display limit: marking acts on every matching message, not just the
-    /// visible rows.
-    func rowidsMatching(
-        _ q: CompiledQuery, priority: Bool, isRead: Bool, limit: Int = 5000
-    ) throws -> [Int] {
-        guard q.hasAnyConstraint else { return [] }
-        let sql = """
-        SELECT m.apple_rowid
-        FROM messages m
-        WHERE (\(q.whereClause))
-          AND \(Self.systemMailboxExcludeFilter)
-          AND m.is_read = ?
-          AND \(Self.priorityMembership(priority))
-        ORDER BY m.date_received DESC LIMIT ?
-        """
-        var stmt: OpaquePointer?
-        try prepare(sql, into: &stmt)
-        defer { sqlite3_finalize(stmt) }
-        bindAll(stmt, q.bindings, trailing: [.int(isRead ? 1 : 0), .int(Int64(limit))])
-        var out: [Int] = []
-        var rc = sqlite3_step(stmt)
-        while rc == SQLITE_ROW {
-            out.append(Int(sqlite3_column_int64(stmt, 0)))
-            rc = sqlite3_step(stmt)
-        }
-        try checkRowLoopDone(rc)
-        return out
-    }
-
     // MARK: — Helpers
 
     private func searchClassified(

@@ -90,10 +90,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
 
-        configureMarkItem(markPriorityReadItem, "Mark all Priority Messages as read", #selector(markPriorityRead))
-        configureMarkItem(markPriorityUnreadItem, "Mark all Priority Messages as unread", #selector(markPriorityUnread))
-        configureMarkItem(markOtherReadItem, "Mark all Other Messages as read", #selector(markOtherRead))
-        configureMarkItem(markOtherUnreadItem, "Mark all Other Messages as unread", #selector(markOtherUnread))
+        configureMarkItem(markPriorityReadItem, "Mark displayed Priority Messages as read", #selector(markPriorityRead))
+        configureMarkItem(markPriorityUnreadItem, "Mark displayed Priority Messages as unread", #selector(markPriorityUnread))
+        configureMarkItem(markOtherReadItem, "Mark displayed Other Messages as read", #selector(markOtherRead))
+        configureMarkItem(markOtherUnreadItem, "Mark displayed Other Messages as unread", #selector(markOtherUnread))
         configureMarkItem(markSelReadItem, "Mark as read", #selector(markSelectionRead))
         configureMarkItem(markSelUnreadItem, "Mark as unread", #selector(markSelectionUnread))
         for item in [markPriorityReadItem, markPriorityUnreadItem,
@@ -154,11 +154,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     // MARK: — NSMenuDelegate
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        // Fresh start every open: clear the search field (programmatic set
-        // doesn't fire controlTextDidChange) so the list shows unread, and
-        // drop any prior tick selection.
-        searchView.field.stringValue = ""
-        currentSearchText = ""
+        // The search survives the menu closing (e.g. after "Open in Mail") so
+        // a query with several interesting hits can be worked through across
+        // opens. The field's own ⓧ cancel button — or retyping over the
+        // selected-on-focus text — dismisses it. Tick selections do reset:
+        // they act immediately, so a stale tick set would be surprising.
         selectedRowIds.removeAll()
 
         let tunnelLive = model.tunnel.state.isLive
@@ -589,15 +589,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func markSelectionRead() { markSelection(isRead: true) }
     @objc private func markSelectionUnread() { markSelection(isRead: false) }
 
-    /// Flip *every* message in the given block (not just the visible rows) that
-    /// matches the active source and is in the opposite state. The rowids are
-    /// re-queried so "Mark all" really means all, even past the display cap.
+    /// Flip the block's *displayed* rows (the same up-to-`maxPerBlock` set the
+    /// user is looking at) that are in the opposite state. Deliberately not a
+    /// re-query: matches beyond the display cap are left untouched, so the
+    /// command never does more than what's visible.
     private func markBlock(priority: Bool, isRead: Bool) {
-        guard let db = model.indexDB, let compiled = compiledSource() else { return }
+        let emails = priority ? priorityEmails : otherEmails
+        let rowids = emails.filter { $0.isRead != isRead }.map(\.rowId)
+        guard !rowids.isEmpty else { return }
         selectedRowIds.removeAll()
         Task { @MainActor in
-            let rowids = (try? await db.rowidsMatching(compiled, priority: priority, isRead: !isRead)) ?? []
-            guard !rowids.isEmpty else { return }
             _ = await model.readStatus.setReadStatus(rowids: rowids, isRead: isRead)
             self.refreshEmails()
             self.updateStatusBadge()
