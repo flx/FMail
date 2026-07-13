@@ -32,16 +32,6 @@ struct Mailbox: Identifiable, Hashable {
 
     var displayName: String { pathComponents.last ?? "(unnamed)" }
 
-    /// Copy with adjusted counts (the only fields optimistic flips touch).
-    func with(totalCount: Int? = nil, unreadCount: Int? = nil) -> Mailbox {
-        Mailbox(
-            rowId: rowId, accountUUID: accountUUID, pathComponents: pathComponents,
-            totalCount: totalCount ?? self.totalCount,
-            unreadCount: unreadCount ?? self.unreadCount,
-            hidden: hidden, kind: kind
-        )
-    }
-
     /// Filesystem path to the .mbox directory tree for this mailbox.
     func diskURL(under accountRoot: URL) -> URL {
         var url = accountRoot
@@ -57,25 +47,6 @@ struct Mailbox: Identifiable, Hashable {
 /// keep working unchanged.
 enum MailboxKind: String, Sendable, Hashable, CaseIterable {
     case inbox, sent, drafts, trash, junk, archive, all, other
-
-    /// "System-isolated" kinds — drafts/trash/junk — that we hide from
-    /// other mailboxes' thread views unless the user is browsing one of
-    /// these mailboxes directly.
-    var isSystemIsolated: Bool {
-        switch self {
-        case .drafts, .trash, .junk: return true
-        case .inbox, .sent, .archive, .all, .other: return false
-        }
-    }
-
-    /// Decide which `IndexDB.ThreadViewScope` applies for the current
-    /// sidebar state. `selectedKind == nil` is treated as a non-system
-    /// mailbox (default to `.excludeDrafts`).
-    static func viewScope(forSelectedKind selectedKind: MailboxKind?, allMailboxesScope: Bool) -> IndexDB.ThreadViewScope {
-        if allMailboxesScope { return .excludeAllSystem }
-        if let kind = selectedKind, kind.isSystemIsolated { return .includeAll }
-        return .excludeDrafts
-    }
 }
 
 /// Lightweight header-only message info, suitable for showing in a list.
@@ -95,17 +66,6 @@ struct MessageHeader: Identifiable, Hashable {
     let imapUID: Int?             // Apple Mail's per-mailbox IMAP UID; lets
                                   // AppleScript do O(1) `whose id is N` lookups
     var id: Int { rowId }
-
-    /// Copy with a flipped read flag.
-    func withIsRead(_ isRead: Bool) -> MessageHeader {
-        MessageHeader(
-            rowId: rowId, mailboxRowId: mailboxRowId, subject: subject,
-            senderAddress: senderAddress, senderDisplay: senderDisplay,
-            dateSent: dateSent, dateReceived: dateReceived,
-            isRead: isRead, isFlagged: isFlagged, hasAttachment: hasAttachment,
-            rfcMessageId: rfcMessageId, imapUID: imapUID
-        )
-    }
 }
 
 /// One attachment extracted from an `.emlx`. `data` holds the decoded bytes

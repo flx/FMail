@@ -1,12 +1,14 @@
 import AppKit
 import Foundation
 
-/// Owns the menu's Mark-as-read / Mark-as-unread commands. The single entry
-/// point (`setReadStatus(rowids:isRead:)`) applies the change optimistically
-/// (DB + every visible counter updates immediately), then awaits one
+/// Owns the menu's Mark-as-read / Mark-as-unread commands. Production code
+/// enters through `setReadStatus(rowids:isRead:)`, which applies the change
+/// optimistically (badge counter + DB update immediately), then awaits one
 /// AppleScript at Mail.app. The next FSEvent-driven sync reconciles in case
 /// Mail.app couldn't apply the change; failures surface via
-/// `MailModel.bulkActionError`.
+/// `MailModel.bulkActionError`. (`applyOptimisticReadFlip` is `internal`
+/// only so tests can drive the optimistic flip directly — see its doc
+/// comment — it is never a second production entry point.)
 @MainActor
 final class ReadStatusController {
     // `unowned`: the entry point is invoked from the menu while the model is
@@ -82,34 +84,40 @@ final class ReadStatusController {
 
     // MARK: — Pipeline
 
-    /// Group `messages` by thread id (via IndexDB) and apply the optimistic
-    /// read flip. Falls back to a per-message visible-array flip when the DB
-    /// lookup is unavailable, so the reader/search views still update.
-    private func applyOptimisticReadFlip(messages: [MessageHeader], isRead: Bool) async {
-        let perThread = await groupByThread(messages)
-        if !perThread.isEmpty {
-            applyOptimisticThreadBulkRead(perThread: perThread, isRead: isRead)
-        } else {
-            applyOptimisticReadFlags(messageRowIds: messages.map(\.rowId), isRead: isRead)
-        }
+    /// Flip the badge/index for the messages that actually change state.
+    /// Dedupes by `rowId` first so passing the same message twice can't
+    /// double-count the delta, then filters to `isRead != $0.isRead` (D3) so
+    /// the delta and the DB write are correct even if a caller passes
+    /// messages already in the target state — `setReadStatus`'s `resolved`
+    /// (unfiltered) still feeds the AppleScript dispatch and the return
+    /// value, so its contract is unchanged.
+    ///
+    /// `internal`, not `private`, **only** so tests can drive the optimistic
+    /// flip directly without going through `setReadStatus` — and therefore
+    /// without ever dispatching AppleScript at Mail.app. This method never
+    /// talks to Mail.app itself; production code must always go through
+    /// `setReadStatus`.
+    func applyOptimisticReadFlip(messages: [MessageHeader], isRead: Bool) async {
+        var seenRowIds = Set<Int>()
+        let deduped = messages.filter { seenRowIds.insert($0.rowId).inserted }
+        let toFlip = deduped.filter { $0.isRead != isRead }
+        guard !toFlip.isEmpty else { return }
+
+        // Nothing to persist to — bail before mutating the counter so it
+        // never drifts from the (unwritten) DB state.
+        guard let db = model.indexDB else { return }
+
+        // Global counter.
+        let totalDelta = toFlip.count * unreadDelta(isRead: isRead)
+        model.allUnreadCount = max(0, model.allUnreadCount + totalDelta)
+
+        // Persist to DB.
+        persistIsRead(rowids: toFlip.map(\.rowId), isRead: isRead, db: db)
     }
 
-    /// Bucket `messages` by their thread id. Returns `[]` when the index is
-    /// unavailable or the lookup fails (callers treat that as "fall back to a
-    /// per-message flip").
-    private func groupByThread(
-        _ messages: [MessageHeader]
-    ) async -> [(threadId: Int, messages: [MessageHeader])] {
-        guard let db = model.indexDB,
-              let map = try? await db.threadIds(forMessages: messages.map(\.rowId)) else {
-            return []
-        }
-        var byThread: [Int: [MessageHeader]] = [:]
-        for msg in messages {
-            if let tid = map[msg.rowId] { byThread[tid, default: []].append(msg) }
-        }
-        return byThread.map { (threadId: $0.key, messages: $0.value) }
-    }
+    /// Signed count change applied per message when flipping to `isRead`:
+    /// marking read removes one unread (-1); marking unread adds one (+1).
+    private func unreadDelta(isRead: Bool) -> Int { isRead ? -1 : 1 }
 
     /// Build AppleScript entries from messages, looking up each message's
     /// canonical mailbox + account so MailScripter can use the fast
@@ -129,145 +137,30 @@ final class ReadStatusController {
         }
     }
 
-    // MARK: — Optimistic flips
-
-    /// Thread-aware optimistic flip. Updates every selected thread's
-    /// summary by the count of its flipped messages — works even for
-    /// threads whose messages aren't loaded into `messagesInSelectedThread`
-    /// (i.e., closed threads in a multi-select).
-    private func applyOptimisticThreadBulkRead(
-        perThread: [(threadId: Int, messages: [MessageHeader])],
-        isRead: Bool
-    ) {
-        let allMessages = perThread.flatMap { $0.messages }
-
-        // Thread summaries — decrement/increment each by its flipped count.
-        let flippedCountByThread = Dictionary(
-            perThread.map { ($0.threadId, $0.messages.count) }, uniquingKeysWith: +
-        )
-        model.threadsForSelectedMailbox = OptimisticUpdate.applyingReadFlip(
-            to: model.threadsForSelectedMailbox,
-            flippedCountByThread: flippedCountByThread,
-            isRead: isRead
-        )
-
-        // Sidebar mailbox unread counts.
-        applyMailboxUnreadDeltas(
-            OptimisticUpdate.mailboxUnreadDeltas(forFlipping: allMessages, isRead: isRead)
-        )
-
-        // Flip the per-message read dot wherever these messages are visible.
-        flipReadInVisibleArrays(rowIds: Set(allMessages.map(\.rowId)), isRead: isRead)
-
-        // Global counter.
-        let totalDelta = allMessages.count * OptimisticUpdate.unreadDelta(isRead: isRead)
-        model.allUnreadCount = max(0, model.allUnreadCount + totalDelta)
-
-        // Persist to DB.
-        if let db = model.indexDB {
-            persistIsRead(rowids: allMessages.map(\.rowId), isRead: isRead, db: db)
-        }
-    }
-
-    /// Per-message fallback when the thread-id lookup failed. Discovers each
-    /// message's previous read state and mailbox from the visible arrays
-    /// (`messagesInSelectedThread`, `searchResults`) — the only places it can
-    /// see them without the DB — and updates counts from there.
-    private func applyOptimisticReadFlags(messageRowIds: [Int], isRead: Bool) {
-        guard !messageRowIds.isEmpty else { return }
-
-        var newSearchResults = model.searchResults
-        var newMessagesInThread = model.messagesInSelectedThread
-
-        var unreadCountDelta = 0
-        var mailboxDeltas: [Int: Int] = [:]
-        var flippedRowIds: [Int] = []
-        let perMessage = OptimisticUpdate.unreadDelta(isRead: isRead)
-
-        for rowId in messageRowIds {
-            var prevIsRead: Bool? = nil
-            var mailboxRowId: Int? = nil
-
-            if let idx = newMessagesInThread.firstIndex(where: { $0.rowId == rowId }) {
-                prevIsRead = newMessagesInThread[idx].isRead
-                mailboxRowId = newMessagesInThread[idx].mailboxRowId
-                newMessagesInThread[idx] = newMessagesInThread[idx].withIsRead(isRead)
-            }
-            if let idx = newSearchResults.firstIndex(where: { $0.rowId == rowId }) {
-                if prevIsRead == nil { prevIsRead = newSearchResults[idx].isRead }
-                if mailboxRowId == nil { mailboxRowId = newSearchResults[idx].mailboxRowId }
-                newSearchResults[idx] = newSearchResults[idx].withIsRead(isRead)
-            }
-
-            if let prev = prevIsRead, prev != isRead {
-                unreadCountDelta += perMessage
-                if let mid = mailboxRowId { mailboxDeltas[mid, default: 0] += perMessage }
-                flippedRowIds.append(rowId)
-            }
-        }
-
-        model.searchResults = newSearchResults
-        model.messagesInSelectedThread = newMessagesInThread
-
-        applyMailboxUnreadDeltas(mailboxDeltas)
-
-        // Open thread's summary — count how many flipped messages belong
-        // to it (may differ when bulk-marking from search results that
-        // span multiple threads).
-        if !flippedRowIds.isEmpty,
-           let tid = model.selectedThreadId,
-           let summaryIdx = model.threadsForSelectedMailbox.firstIndex(where: { $0.threadId == tid }) {
-            let inThreadCount = flippedRowIds.filter { id in
-                newMessagesInThread.contains(where: { $0.rowId == id })
-            }.count
-            if inThreadCount > 0 {
-                let s = model.threadsForSelectedMailbox[summaryIdx]
-                model.threadsForSelectedMailbox[summaryIdx] =
-                    s.with(unreadCount: max(0, s.unreadCount + inThreadCount * perMessage))
-            }
-        }
-
-        model.allUnreadCount = max(0, model.allUnreadCount + unreadCountDelta)
-
-        if let db = model.indexDB, !flippedRowIds.isEmpty {
-            persistIsRead(rowids: flippedRowIds, isRead: isRead, db: db)
-        }
-    }
-
-    // MARK: — Shared model mutations
-
-    /// Apply per-mailbox unread deltas to the sidebar, in one assignment.
-    private func applyMailboxUnreadDeltas(_ deltas: [Int: Int]) {
-        guard !deltas.isEmpty else { return }
-        model.mailboxes = model.mailboxes.map { mb in
-            guard let delta = deltas[mb.rowId], delta != 0 else { return mb }
-            return mb.with(unreadCount: max(0, mb.unreadCount + delta))
-        }
-    }
-
-    /// Flip the read flag on `rowIds` wherever they appear in the open thread
-    /// or the search results, reassigning each array at most once.
-    private func flipReadInVisibleArrays(rowIds: Set<Int>, isRead: Bool) {
-        if model.messagesInSelectedThread.contains(where: { rowIds.contains($0.rowId) && $0.isRead != isRead }) {
-            model.messagesInSelectedThread = model.messagesInSelectedThread.map {
-                rowIds.contains($0.rowId) && $0.isRead != isRead ? $0.withIsRead(isRead) : $0
-            }
-        }
-        if model.searchResults.contains(where: { rowIds.contains($0.rowId) && $0.isRead != isRead }) {
-            model.searchResults = model.searchResults.map {
-                rowIds.contains($0.rowId) && $0.isRead != isRead ? $0.withIsRead(isRead) : $0
-            }
-        }
-    }
+    /// Tail of the chain of spawned persist `Task`s. Each new write awaits the
+    /// previous one, so awaiting this single handle drains *every* outstanding
+    /// write, not just the last (same pattern as `MailModel.applyMCPSettings`).
+    ///
+    /// Exposed **only** so tests can deterministically drain the fire-and-forget
+    /// DB write before tearing down their tmp fixture — without the drain, the
+    /// write lands after the fixture directory is deleted and fails with a disk
+    /// I/O error that no assertion catches. Production callers (`setReadStatus`)
+    /// must keep NOT awaiting this: the write intentionally races Mail.app's own
+    /// commit and is reconciled by the next sync.
+    private(set) var pendingPersist: Task<Void, Never>?
 
     /// One-transaction batch write of `is_read`. Failures show up as a
     /// `bulkActionError` alert — without surfacing, the optimistic in-memory
     /// flip would silently revert on the next sync, leaving the user with
     /// no idea what happened.
     private func persistIsRead(rowids: [Int], isRead: Bool, db: IndexDB) {
-        // Inherits MainActor isolation from this @MainActor method, so the
-        // catch block runs back on the main actor without an explicit hop.
-        Task { [weak model] in
+        // Chain after any in-flight write so two rapid mark actions commit in
+        // call order rather than racing, and so `pendingPersist` is a handle to
+        // all of them. Inherits MainActor isolation from this @MainActor method,
+        // so the catch block runs back on the main actor without an explicit hop.
+        let previous = pendingPersist
+        pendingPersist = Task { [weak model] in
+            await previous?.value
             do {
                 try await db.setIsReadBatch(rowids: rowids, isRead: isRead)
             } catch {

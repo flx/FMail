@@ -77,19 +77,4 @@ struct ThreadSummary: Identifiable, Hashable {
     let latestMessageRowId: Int
     let latestIsOutgoing: Bool
     var id: Int { threadId }
-
-    /// Copy with adjusted counts (the only fields optimistic flips touch).
-    func with(messageCount: Int? = nil, unreadCount: Int? = nil) -> ThreadSummary {
-        ThreadSummary(
-            threadId: threadId,
-            latestDateReceived: latestDateReceived,
-            messageCount: messageCount ?? self.messageCount,
-            unreadCount: unreadCount ?? self.unreadCount,
-            flaggedCount: flaggedCount,
-            latestSubject: latestSubject,
-            latestSenderDisplay: latestSenderDisplay,
-            latestMessageRowId: latestMessageRowId,
-            latestIsOutgoing: latestIsOutgoing
-        )
-    }
 }

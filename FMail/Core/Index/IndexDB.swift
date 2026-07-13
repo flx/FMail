@@ -180,33 +180,6 @@ actor IndexDB {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    /// One-shot rowid → effective-thread-id map. Used by the optimistic-flip
-    /// path to update every affected thread's summary in
-    /// `threadsForSelectedMailbox`, not just the currently open one. Returns
-    /// the synthetic singleton id (apple_rowid) for unthreaded messages so
-    /// the keys match the ids displayed in the thread list.
-    func threadIds(forMessages rowids: [Int]) throws -> [Int: Int] {
-        guard !rowids.isEmpty else { return [:] }
-        let placeholders = rowids.map { _ in "?" }.joined(separator: ",")
-        let sql = "SELECT apple_rowid, \(Self.effectiveThreadIdExpr) FROM messages m WHERE apple_rowid IN (\(placeholders))"
-        var stmt: OpaquePointer?
-        try prepare(sql, into: &stmt)
-        defer { sqlite3_finalize(stmt) }
-        for (i, id) in rowids.enumerated() {
-            bind(stmt, Int32(i + 1), Int64(id))
-        }
-        var out: [Int: Int] = [:]
-        var rc = sqlite3_step(stmt)
-        while rc == SQLITE_ROW {
-            let rowid = Int(sqlite3_column_int64(stmt, 0))
-            let tid = Int(sqlite3_column_int64(stmt, 1))
-            out[rowid] = tid
-            rc = sqlite3_step(stmt)
-        }
-        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
-        return out
-    }
-
     /// Run a compiled search query and return matched messages. The
     /// compiled query is a single SQL boolean expression on `messages m`;
     /// text predicates compile to `apple_rowid IN (SELECT rowid FROM messages_fts ...)`

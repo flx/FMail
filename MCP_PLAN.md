@@ -163,7 +163,7 @@ Reuses: `loadAllThreadSummaries` / `loadThreadSummaries`. May need a thin overlo
 }
 ```
 
-Reuses: `loadThreadMessages` (with `MailboxKind.viewScope(forSelectedKind: nil, allMailboxesScope: false)` → `.excludeDrafts` as default), then `BodyLoader.loadBody` per message.
+Reuses: `loadThreadMessages` (with `.excludeDrafts`, its default scope), then `BodyLoader.loadBody` per message.
 
 ### `get_email`
 

@@ -20,23 +20,12 @@ final class MailModel {
     var bodyIndexProgress: BodyIndexProgress = .idle
     var accounts: [MailAccount] = []
     var mailboxes: [Mailbox] = []
-    /// Either the synthetic "All Mailboxes" view or a specific mailbox.
-    var selection: SidebarSelection?
     /// Cached count of unread, non-draft messages across the entire index.
     /// Refreshed by `refreshFromIndexDB`.
     var allUnreadCount: Int = 0
     /// Error from a bulk action (Mark Read/Unread across multiple messages).
     /// Set by `ReadStatusController`, surfaced by `StatusItemController`.
     var bulkActionError: String?
-
-    // Backing state for `ReadStatusController`'s optimistic read-flip. The
-    // menu-bar build drives its list straight off `IndexDB.search`, so it
-    // never populates these — but the flip code reads/writes them, so they
-    // stay (empty) here.
-    var selectedThreadId: Int?
-    var threadsForSelectedMailbox: [ThreadSummary] = []
-    var messagesInSelectedThread: [MessageHeader] = []
-    var searchResults: [MessageHeader] = []
 
     /// Visible to ReadStatusController (which mutates DB rows on optimistic
     /// flips) and other in-module collaborators.
@@ -59,7 +48,8 @@ final class MailModel {
     /// `applyMCPSettings()`.
     var mcpServerStatus: MCPServerStatus = .stopped
 
-    /// Owns Mark Read / Unread for messages, threads, and search results.
+    /// Owns Mark Read / Unread for messages: badge counter + DB update,
+    /// then the Mail.app write-back.
     @ObservationIgnored
     private(set) lazy var readStatus = ReadStatusController(model: self)
 
@@ -85,16 +75,6 @@ final class MailModel {
     /// listeners on one port. Each call awaits the previous one.
     @ObservationIgnored
     private var applyMCPTask: Task<Void, Never>?
-
-    var selectedMailbox: Mailbox? {
-        guard case .mailbox(let id) = selection else { return nil }
-        return mailboxes.first { $0.rowId == id }
-    }
-
-    var isAllMailboxesScope: Bool {
-        if case .allMailboxes = selection { return true }
-        return false
-    }
 
     func boot() async {
         switch loadState {
@@ -156,11 +136,6 @@ final class MailModel {
 
             try await refreshFromIndexDB()
             loadState = .ready
-
-            // Default scope: the "All Mailboxes" view.
-            if selection == nil {
-                selectAllMailboxes()
-            }
 
             // Background: refresh sync to catch anything new since last run.
             Task { [weak coordinator] in
@@ -285,28 +260,6 @@ final class MailModel {
         try? await db.updatePrioritySet(exact: Array(exact), patterns: Array(patterns))
     }
 
-    func selectAllMailboxes() {
-        select(.allMailboxes)
-    }
-
-    /// Switches scope and clears the optimistic-flip backing state. Silently
-    /// no-ops on a `.mailbox(id)` for a mailbox that's not in `mailboxes`
-    /// (stale id guard).
-    ///
-    /// The menu-bar build drives its list straight off `IndexDB.search`
-    /// (see `StatusItemController`), so this no longer eagerly loads thread
-    /// summaries — that work fed only the window-UI reader.
-    func select(_ newSelection: SidebarSelection) {
-        if case .mailbox(let id) = newSelection,
-           !mailboxes.contains(where: { $0.rowId == id }) {
-            return
-        }
-        selection = newSelection
-        threadsForSelectedMailbox = []
-        selectedThreadId = nil
-        messagesInSelectedThread = []
-    }
-
     /// Open `message` in Mail.app via the `message://` URL scheme. Returns
     /// false when the message has no Message-ID or macOS refuses to open it.
     @discardableResult
@@ -314,11 +267,6 @@ final class MailModel {
         guard let rfcId = message.rfcMessageId, !rfcId.isEmpty else { return false }
         return MailAppOpener.openMessage(rfcMessageId: rfcId)
     }
-}
-
-enum SidebarSelection: Hashable, Sendable {
-    case allMailboxes
-    case mailbox(Int)
 }
 
 /// MainActor-side view of the MCP server's lifecycle state.
