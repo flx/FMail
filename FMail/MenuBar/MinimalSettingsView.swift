@@ -35,6 +35,7 @@ private struct ConnectionSettingsView: View {
     @State private var tunnelName = MCPSettings.tunnelName
     @State private var publicURL = MCPSettings.tunnelPublicURL
     @State private var cloudflaredPath = MCPSettings.cloudflaredPath
+    @State private var launchAtLogin = LaunchAtLogin.isEnabled
 
     /// Read live from the (now `@Observable`) store so a pairing or revoke
     /// updates the row immediately — no `.onAppear` re-sampling needed.
@@ -42,6 +43,22 @@ private struct ConnectionSettingsView: View {
 
     var body: some View {
         Form {
+            Section("General") {
+                Toggle("Launch FMail at login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, new in
+                        // Snap the toggle back if the service call fails
+                        // (e.g. the bundle moved since registration).
+                        if !LaunchAtLogin.setEnabled(new) {
+                            launchAtLogin = LaunchAtLogin.isEnabled
+                        }
+                    }
+                if LaunchAtLogin.requiresApproval {
+                    Text("FMail is disabled under System Settings → General → Login Items. Re-enable it there to finish turning this on.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("MCP") {
                 // Store only a valid port as you type (ignore garbage like
                 // "87a"); restart the running server on commit (⏎) so the
