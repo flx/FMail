@@ -429,8 +429,18 @@ extension MCPHandlers {
     /// past the bearer token is confined here so that primitive stays closed.
     /// Local (loopback) callers — the user's own machine — are NOT confined;
     /// see ``resolveSavePath(_:)``.
+    ///
+    /// The root lives inside iCloud Drive so tunnel saves sync to the user's
+    /// other devices (Files app on iOS) with no extra transport: ask from the
+    /// phone, the Mac writes here, iCloud delivers it. Writing directly into
+    /// `~/Library/Mobile Documents/com~apple~CloudDocs` is fine for a
+    /// non-sandboxed app; the folder exists whenever iCloud Drive is enabled.
     static let attachmentSaveRoot = (NSHomeDirectory() as NSString)
-        .appendingPathComponent("Downloads/FMail")
+        .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/FMail")
+
+    /// User-facing name for ``attachmentSaveRoot`` in tool descriptions and
+    /// error messages ("iCloud Drive/FMail" — how the Files app shows it).
+    static let attachmentSaveRootDisplayName = "iCloud Drive/FMail"
 
     /// Resolve a caller-supplied `save_to_path`, honouring the request origin
     /// (a per-request task-local set by `MCPDispatcher`). Local (loopback)
@@ -458,14 +468,14 @@ extension MCPHandlers {
     }
 
     /// Resolve and *confine* a user-supplied save path to ``attachmentSaveRoot``
-    /// (`~/Downloads/FMail`). The returned absolute path is guaranteed to be
+    /// (`iCloud Drive/FMail`). The returned absolute path is guaranteed to be
     /// the root itself or a descendant of it, even in the presence of `..`
     /// segments, tilde expansion, or symlinks anywhere along an existing
     /// prefix of the path.
     ///
     /// Resolution rules:
     ///   * A relative path is resolved relative to the root (NOT the home
-    ///     dir), so `foo/bar.pdf` lands at `~/Downloads/FMail/foo/bar.pdf`.
+    ///     dir), so `foo/bar.pdf` lands at `iCloud Drive/FMail/foo/bar.pdf`.
     ///   * An absolute (or `~`-expanded) path must already point inside the
     ///     root; otherwise it is rejected.
     ///   * The candidate's deepest *existing* ancestor is canonicalised with
@@ -473,8 +483,8 @@ extension MCPHandlers {
     ///     the result must still be contained in the canonicalised root. This
     ///     defeats symlink-escape (e.g. a symlinked subdir pointing at `/`)
     ///     and `..` tricks uniformly. Containment is compared by path
-    ///     components, never by string prefix, so `~/Downloads/FMailEvil`
-    ///     can't masquerade as living under `~/Downloads/FMail`.
+    ///     components, never by string prefix, so a sibling `.../FMailEvil`
+    ///     can't masquerade as living under `.../FMail`.
     ///
     /// The root is created (with intermediate dirs) so the canonicalisation
     /// below always has a real, symlink-resolved anchor to compare against.
@@ -485,7 +495,7 @@ extension MCPHandlers {
         }
 
         // Materialise the root so we have a canonical anchor. If the user
-        // has replaced ~/Downloads/FMail with a symlink to somewhere else,
+        // has replaced the root with a symlink to somewhere else,
         // realpath() will follow it — that's their own deliberate choice for
         // the root and is out of scope; we only defend against escapes *via*
         // an attacker-controlled save path, not against the user pointing
@@ -603,7 +613,7 @@ enum PathSafetyError: Error, CustomStringConvertible {
         case .parentReference(let p):
             return "path contains a `..` segment (\(p)) — re-express without parent references"
         case .outsideRoot(let p):
-            return "path (\(p)) resolves outside the allowed directory — attachment writes must stay inside ~/Downloads/FMail (pass a relative path, or an absolute path already under that folder)"
+            return "path (\(p)) resolves outside the allowed directory — attachment writes must stay inside iCloud Drive/FMail (~/Library/Mobile Documents/com~apple~CloudDocs/FMail; pass a relative path, or an absolute path already under that folder)"
         }
     }
 }

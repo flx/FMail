@@ -195,9 +195,9 @@ enum MCPTools {
             response returns `{thread_id, message_count, saved_path,
             byte_count}` (same local-vs-tunnel path rules as get_attachment:
             local connections write anywhere, tunnel connections are confined
-            to ~/Downloads/FMail). Without it, the Markdown comes back inline
+            to iCloud Drive/FMail). Without it, the Markdown comes back inline
             in `markdown`. To hand the user a file, prefer `save_to_path`
-            (request access to this connector / ~/Downloads/FMail if needed)
+            (request access to this connector / iCloud Drive/FMail if needed)
             over computer use / GUI automation.
 
             `body_format` defaults to `clean` (strip quoted reply chains /
@@ -209,7 +209,7 @@ enum MCPTools {
                     "thread_id": .object(["type": .string("integer")]),
                     "save_to_path": .object([
                         "type": .string("string"),
-                        "description": .string("Optional. Write the Markdown here instead of returning it inline. Tilde-expanded; absolute honoured verbatim (local) / confined to ~/Downloads/FMail (tunnel); relative resolved against $HOME. Parent dirs created.")
+                        "description": .string("Optional. Write the Markdown here instead of returning it inline. Tilde-expanded; absolute honoured verbatim (local) / confined to iCloud Drive/FMail (tunnel); relative resolved against $HOME. Parent dirs created.")
                     ]),
                     "body_format": .object([
                         "type": .string("string"),
@@ -462,10 +462,10 @@ enum MCPTools {
             relative (resolved against your home). Missing parent
             directories are created. When you're connected locally the
             destination is unrestricted; over the tunnel, writes are
-            confined to `~/Downloads/FMail`. This direct write is the
+            confined to `iCloud Drive/FMail`. This direct write is the
             supported way to land the file on the user's disk over a
             remote connection — prefer it (and, if needed, request access
-            to this connector / `~/Downloads/FMail`) over computer use or
+            to this connector / `iCloud Drive/FMail`) over computer use or
             GUI automation to fetch the attachment.
 
             **No `save_to_path`** — bytes returned in `data_base64`, capped
@@ -501,7 +501,7 @@ enum MCPTools {
                     ]),
                     "save_to_path": .object([
                         "type": .string("string"),
-                        "description": .string("Filesystem path to write the decoded bytes to. Tilde-expanded; absolute paths honoured verbatim; relative paths resolved against $HOME. Local connections can write anywhere; tunnel connections are confined to ~/Downloads/FMail. When set, the response omits data_base64 and includes saved_path. Recommended for any non-trivial binary.")
+                        "description": .string("Filesystem path to write the decoded bytes to. Tilde-expanded; absolute paths honoured verbatim; relative paths resolved against $HOME. Local connections can write anywhere; tunnel connections are confined to iCloud Drive/FMail. When set, the response omits data_base64 and includes saved_path. Recommended for any non-trivial binary.")
                     ]),
                     "max_bytes": .object([
                         "type": .string("integer"),
@@ -564,7 +564,7 @@ enum MCPTools {
                     ]),
                     "save_to_path": .object([
                         "type": .string("string"),
-                        "description": .string("Optional. Requires `attachment_index`. Filesystem path to write the decoded bytes to; tilde-expanded, absolute honoured verbatim, relative resolved against $HOME. Local connections unrestricted; tunnel connections confined to ~/Downloads/FMail.")
+                        "description": .string("Optional. Requires `attachment_index`. Filesystem path to write the decoded bytes to; tilde-expanded, absolute honoured verbatim, relative resolved against $HOME. Local connections unrestricted; tunnel connections confined to iCloud Drive/FMail.")
                     ]),
                     "timeout_seconds": .object([
                         "type": .string("integer"),
@@ -602,9 +602,9 @@ enum MCPTools {
             `save_dir` may start with `~` (expanded to your home), be
             absolute, or be relative (resolved against $HOME). Created if
             missing. Local connections can write anywhere; tunnel
-            connections are confined to `~/Downloads/FMail`. This is the
+            connections are confined to `iCloud Drive/FMail`. This is the
             way to bulk-land attachments on the user's disk — prefer it
-            (requesting access to this connector / `~/Downloads/FMail` if
+            (requesting access to this connector / `iCloud Drive/FMail` if
             needed) over computer use / GUI automation.
             """,
             inputSchema: .object([

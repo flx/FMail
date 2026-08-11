@@ -267,11 +267,13 @@ Read-only by design so it's safe to expose over a tunnel.
 
 > **Attachment writes are confined.** Because attachment bytes are
 > attacker-controlled (anyone can email you a file) and FMail isn't sandboxed,
-> every `save_to_path` / `save_dir` target must resolve **inside `~/Downloads/FMail`**
-> (the folder is created on first use). Relative paths anchor there; absolute
-> paths outside it — and any `..` / symlink escape — are rejected. This keeps a
-> compromised or malicious MCP client from writing arbitrary files (`~/.zshrc`,
-> `~/Library/LaunchAgents/…`).
+> every `save_to_path` / `save_dir` target from a tunnel connection must resolve
+> **inside `iCloud Drive/FMail`** (`~/Library/Mobile Documents/com~apple~CloudDocs/FMail`,
+> created on first use). Relative paths anchor there; absolute paths outside it —
+> and any `..` / symlink escape — are rejected. This keeps a compromised or
+> malicious MCP client from writing arbitrary files (`~/.zshrc`,
+> `~/Library/LaunchAgents/…`). The root lives in iCloud Drive deliberately:
+> a save requested from the phone syncs back to the phone's Files app.
 
 ### Authentication model
 
