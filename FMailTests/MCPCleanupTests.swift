@@ -64,17 +64,17 @@ final class MCPCleanupTests: XCTestCase {
     }
 
     func testSafeAbsolutePathAcceptsRelativeInsideRoot() throws {
-        // A relative path is anchored on the allowed root (~/Downloads/FMail),
+        // A relative path is anchored on the allowed root (iCloud Drive/FMail),
         // not the home dir.
         let path = try MCPHandlers.safeAbsolutePath("fmail-test-clean.pdf")
-        XCTAssertTrue(path.contains("/Downloads/FMail/"), "got \(path)")
+        XCTAssertTrue(path.contains("/com~apple~CloudDocs/FMail/"), "got \(path)")
         XCTAssertTrue(path.hasSuffix("fmail-test-clean.pdf"), "got \(path)")
     }
 
     func testSafeAbsolutePathAcceptsAbsoluteInsideRoot() throws {
         let inside = MCPHandlers.attachmentSaveRoot + "/sub/fmail-test.pdf"
         let path = try MCPHandlers.safeAbsolutePath(inside)
-        XCTAssertTrue(path.contains("/Downloads/FMail/"), "got \(path)")
+        XCTAssertTrue(path.contains("/com~apple~CloudDocs/FMail/"), "got \(path)")
     }
 
     func testSafeAbsolutePathRejectsOutsideRoot() {
@@ -83,6 +83,7 @@ final class MCPCleanupTests: XCTestCase {
         // so a malicious MCP client can't write attachment bytes anywhere.
         for p in ["/tmp/fmail-test-clean.pdf",
                   "~/Downloads/fmail-test.pdf",
+                  "~/Downloads/FMail/fmail-test.pdf",  // the old root is now outside
                   "~/Library/LaunchAgents/com.evil.plist"] {
             do {
                 _ = try MCPHandlers.safeAbsolutePath(p)

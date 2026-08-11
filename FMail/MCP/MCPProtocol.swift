@@ -46,11 +46,13 @@ enum MCPProtocol {
     whole thread exported to Markdown — use `save_to_path` / `save_dir`
     on `get_attachment`, `get_attachments_for_rowids`, or `export_thread`.
     The server writes the bytes itself; over a remote/tunnel connection
-    they land in `~/Downloads/FMail` (anywhere you ask for locally). This
-    connector IS the way to get mail onto the filesystem — reach for it
-    rather than falling back on computer use / GUI automation to fetch or
-    move the files. If the files aren't reachable yet, request access to
-    this connector (and to `~/Downloads/FMail`) instead of driving the
+    they land in `iCloud Drive/FMail` (anywhere you ask for locally).
+    Because that folder is iCloud-synced, a saved file shows up in the
+    Files app on the user's other devices — saving here IS how to hand
+    the user a file when they're on their phone. Reach for this rather
+    than falling back on computer use / GUI automation to fetch or move
+    the files. If the files aren't reachable yet, request access to this
+    connector (and to `iCloud Drive/FMail`) instead of driving the
     screen.
 
     Composing, replying, and sending happen in Apple Mail, not here.
