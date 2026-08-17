@@ -26,11 +26,13 @@ envelope icon and a dropdown gives you:
   a search surfaces already-read mail. "Mark all" acts on *every* matching message in the block, not
   only the rows currently visible.
 - A per-email **submenu** (click the title or the `›`): **Open in Mail**, **Reply**, **Reply All**,
-  **Forward**, then the full **subject**, the From / To / Date details, and a **📎 Has attachments**
-  line for messages with a real file attachment (inline signature images don't count).
+  **Forward**, a one-click **Add … to Priority Mail** / **Remove … from Priority Mail**
+  ([see below](#priority-vs-other-messages)), then the full **subject**, the From / To / Date
+  details, and a **📎 Has attachments** line for messages with a real file attachment (inline
+  signature images don't count).
 - An **MCP/Tunnel** submenu for the optional local MCP server and Cloudflare tunnel.
-- **Settings…** — a **Connection** tab (MCP / token / tunnel) and a **Priority Messages** tab — and
-  **Quit**.
+- **Settings…** — a **Connection** tab (launch at login / MCP / token / tunnel / paired sessions)
+  and a **Priority Messages** tab — and **Quit**.
 
 The menu-bar icon carries the global unread count as a badge.
 
@@ -41,9 +43,10 @@ message than re-rendering it would be. Reply / Reply All / Forward drive Mail.ap
 commands, so Mail opens its familiar compose window with the original properly quoted. Nothing is
 sent by FMail; no SMTP, no sync layer, no cloud.
 
-> **Two UIs, two branches.** This (`master`) is the minimal menu-bar build. The earlier full
-> three-pane window app — sidebar, thread reader, in-app HTML rendering, per-contact preferred-address
-> handling — lives on the [`window-UI`](../../tree/window-UI) branch. Both read the same index.
+> **There used to be a window.** FMail started as a three-pane window app — sidebar, thread reader,
+> in-app HTML rendering, per-contact preferred-address handling. That UI was removed on `master` in
+> commit `361dbbd`; it isn't maintained on a branch, but it's recoverable from git history if you
+> want it. The index / search / threading / MCP layer underneath is the same one it used.
 
 ## Priority vs. Other messages
 
@@ -71,6 +74,12 @@ containing it), or an explicit **wildcard pattern** using `*` / `?` (e.g. `*@ven
 at once separated by `;`, or pick from a **dropdown of the 20 most recent senders you've received
 from**.
 
+You can also edit the list straight from a message's submenu. On a row in **Other Messages** it
+offers **Add `<address>` to Priority Mail**; on a row in **Priority Messages** it offers to remove
+whichever supplemental entries put them there — shown verbatim, so a wildcard reads
+*Remove `*vendor.com` from Priority Mail*. When a sender is priority only because you've emailed
+them, the submenu says so as a disabled note rather than offering a removal that wouldn't work.
+
 Each block carries its own **Mark all … as read / as unread** commands (acting on every matching
 message, not just the visible rows); per-row checkboxes still let you mark an arbitrary selection.
 
@@ -96,10 +105,17 @@ year. So: build something tiny and personal.
 
 FMail runs as an `LSUIElement` accessory. On launch it mirrors Apple's Envelope Index into
 `~/Library/Application Support/FMail/index.sqlite` (full index on first run; incremental afterwards,
-driven by an `FSEventStream` on the mail store plus a periodic safety-net sync). Opening the menu also
+driven by an `FSEventStream` on the mail store plus a 60-second safety-net sync). Opening the menu also
 runs a **fast read/unread reconcile** — it reads just the `read` flags from Apple's Envelope Index and
 updates the changed rows, so marking something read/unread in Mail.app shows up the next time you open
 the menu instead of waiting for a full sync.
+
+Message *bodies* are filled in by a background sweep over the `.emlx` files rather than at mirror
+time, so a brand-new message is findable by subject, sender, recipient and attachment name
+immediately, and by its body text shortly after.
+
+For the internals — schema, sync paths, relevance ranking, the MCP security model — see
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Search syntax
 
@@ -128,6 +144,8 @@ to unread.
 | `subject:` *(or `subj:`)* | subject only | `subject:invoice` |
 | `body:` *(or `content:`, `text:`)* | body content only | `body:meeting` |
 | `attachment:` *(or `filename:`)* | attachment filename | `attachment:invoice.pdf` |
+| `attachment-type:` *(or `attachmenttype:`, `atype:`)* | attachment family: `pdf`, `word`, `excel`, `presentation`, `archive`, `calendar`, `email`, `image`, `audio`, `video`, `text`. Anything else matches the content-type as a substring. | `attachment-type:pdf` |
+| `attachment-size:` *(or `attachmentsize:`, `asize:`)* | attachment byte size: a comparator (`>`, `>=`, `<`, `<=`, `=`; default `>=`) plus a number and optional unit (`b`, `kb`, `mb`, `gb`) | `attachment-size:>1mb`, `asize:<=500kb` |
 | `thread:<id>` | scope to one conversation — useful with `body:` to grep within a thread | `thread:1234 body:"550k"` |
 | `account:` | scope to one account (email, or UUID prefix) | `account:gmail.com` |
 | `in:` | scope to mailbox kind: `inbox`, `sent`, `drafts`, `trash`, `junk`, `archive`, `all` | `in:sent` |
@@ -144,6 +162,15 @@ search would miss them.)
 
 **No-colon shortcuts** also work as bare words: `hasattachment` (or `hasattachments`), `isunread`,
 `isread`, `isflagged` (or `isstarred`).
+
+**`me` means you — over MCP.** `from:me` / `to:me` / `cc:me` resolve against the identities of the
+accounts FMail has indexed, and `in:sent` additionally matches anything you authored rather than just
+the Sent mailbox (which matters for Gmail, whose folders are flat). This resolution runs on the
+**MCP path only**. In the menu's own search box `in:sent` still means the Sent mailbox, but `from:me`
+is matched literally — it will match senders like *me*lissa@… rather than you. Use your address there
+(`from:you@example.com`).
+
+Drafts, trash and junk are excluded from results unless you scope to them with `in:`.
 
 ### Date forms
 
@@ -179,6 +206,7 @@ from:alice ("school trip" OR "ski trip")         # quoted phrases inside OR
 account:gmail.com (subject:invoice OR subject:receipt) after:2024
 in:sent has:attachment after:"last 30 days"      # multi-word date needs quotes
 since:march from:alice                           # `since:` is `after:` alias; month name
+from:bank attachment-type:pdf attachment-size:>1mb
 ```
 
 ## Requirements
@@ -214,8 +242,8 @@ The single most common issue — **"Build input files cannot be found"** listing
 (e.g. `AppShell.swift`, `ReaderView.swift`, `SidebarView.swift`), or stale compile errors after a
 `git pull` or branch switch — means your generated `FMail.xcodeproj` is out of date. Because it's
 git-ignored, git never touches it across branch switches or pulls, so it can keep pointing at files
-from another branch (those names belong to the [`window-UI`](../../tree/window-UI) branch, not
-`master`). Regenerate it on the current branch:
+that no longer exist (those three names are from the removed window UI). Regenerate it on the current
+branch:
 
 ```bash
 rm -rf FMail.xcodeproj          # drop the stale generated project
@@ -251,19 +279,35 @@ or on from the menu under **MCP/Tunnel → MCP**.
 
 ### What's exposed
 
-Eight tools, all non-destructive — Mail state changes happen through Mail.app, never through MCP.
+Twelve tools, all non-destructive — Mail state changes happen through Mail.app, never through MCP.
 Read-only by design so it's safe to expose over a tunnel.
 
 | Tool | Purpose |
 |---|---|
-| `search_emails` | The DSL above. Returns `account_email` / `rfc_message_id` / `body_on_disk` per row. Optional `include_attachment_metadata`, `sort`. |
+| `search_emails` | The DSL above, plus `limit` / `offset` paging, `sort`, `include_snippets`, `dedupe`, `include_bulk`, `include_attachment_metadata`. Returns `account_email` / `rfc_message_id` / `body_on_disk` per row. |
+| `describe_schema` | The live data model: entities, every DSL operator, and the actual values in *this* index — your accounts, what `from:me` / `in:sent` resolve to, the mailbox classes and attachment-type families present. Same document as the `fmail://schema` resource, for clients that don't surface MCP resources. |
 | `list_threads` | Thread summaries (mailbox-scoped or All Mailboxes). |
 | `list_accounts` | Which accounts FMail has indexed — the valid `account:` filter values. |
 | `get_thread` | All messages in a thread. `body_format: "clean"` strips quoted chains/signatures/tracking-URL wrappers; `max_total_chars` budgets the whole thread. |
 | `get_email` | One message by rowid. Same `body_format`. |
-| `get_attachment` | One attachment by rowid + index. `save_to_path` writes to disk (no size cap); otherwise returns base64 (10 MB cap). |
-| `get_attachments_for_rowids` | Bulk variant — writes every attachment of every supplied rowid to `save_dir/<rowid>/<filename>`. |
+| `export_thread` | A whole conversation rendered to Markdown, oldest first. `save_to_path` writes the file; otherwise it comes back inline. |
+| `sender_stats` | Message counts grouped by correspondent over an optional date range — who emails you most, unsubscribe sweeps, relationship summaries. |
 | `find_unanswered_threads` | Threads where you sent the latest message and haven't heard back. |
+| `get_attachment` | One attachment by rowid + index. `save_to_path` writes to disk (no size cap); otherwise returns base64 (10 MB cap). `download_if_missing` refetches an offloaded attachment first. |
+| `get_attachments_for_rowids` | Bulk variant — writes every attachment of every supplied rowid to `save_dir/<rowid>/<filename>`, reporting per-message errors instead of failing the batch. |
+| `fetch_from_server` | Ask Mail.app to pull a message's body/attachments back from its IMAP/Gmail server, for mail Apple's "Optimise Mac Storage" has offloaded. |
+
+> **Ranked search.** `sort: "relevance"` ranks by column-weighted BM25 rather than date: subject and
+> sender outweigh body text, quoted reply chains and signatures are weighted near zero (so a quoted
+> block can't hijack the ranking), newsletter/mailing-list mail is down-ranked, and a small recency
+> term breaks ties. `include_snippets` returns a matched excerpt per row so a client can triage
+> without a `get_email` round-trip. A relevance sort on a metadata-only query falls back to
+> newest-first.
+
+> **Offloaded attachments.** Apple Mail's "Optimise Mac Storage" evicts attachment bytes while
+> keeping the message body, so `body_on_disk: true` doesn't mean the attachment is there. Every
+> attachment carries a `locally_available` flag, and `download_if_missing` / `fetch_from_server`
+> pull the bytes back before reading them — rather than silently writing a 0-byte file.
 
 > **Attachment writes are confined.** Because attachment bytes are
 > attacker-controlled (anyone can email you a file) and FMail isn't sandboxed,
@@ -274,6 +318,14 @@ Read-only by design so it's safe to expose over a tunnel.
 > malicious MCP client from writing arbitrary files (`~/.zshrc`,
 > `~/Library/LaunchAgents/…`). The root lives in iCloud Drive deliberately:
 > a save requested from the phone syncs back to the phone's Files app.
+
+If one of the accounts in Mail.app isn't *yours* — a shared family or role mailbox you read but don't
+own — exclude it from `from:me` / `in:sent` and from the schema's owner identities. There's no UI for
+this; it's a defaults array of account UUIDs or email addresses:
+
+```bash
+defaults write com.felixmatschke.FMail mcp.owner.nonOwnerAccounts -array shared@example.com
+```
 
 ### Authentication model
 
@@ -421,14 +473,13 @@ a password, and keep the tunnel closed when you're not using it.
   session is the only gate. Close the tunnel when you're not using it — the menu makes its state
   obvious.
 
-## Design docs
+## Docs
 
-- [`FMailSpec.md`](FMailSpec.md) — original design intent (window-UI era): pain points, architecture, phased plan.
-- [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — what shipped, deviations, file inventory.
-- [`MCP_PLAN.md`](MCP_PLAN.md) — MCP server design (loopback HTTP/JSON-RPC for LLM clients).
-
-These three describe the full window-UI build; see each file's header note for what changed in the
-menu-bar build.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — how it's built and why: data sources and their quirks, the
+  index and its schema, the search pipeline and relevance ranking, the MCP security model, and the
+  decisions (including what was deliberately removed).
+- [`TODO.md`](TODO.md) — open work, by slug.
+- [`DONE.md`](DONE.md) — completed items, with what actually changed.
 
 ## License
 

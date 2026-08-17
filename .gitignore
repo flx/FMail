@@ -19,8 +19,8 @@ Package.resolved
 # macOS
 .DS_Store
 
-# Google Cloud Console OAuth downloads — secret lives in
-# FMail/Writeback/Gmail/GmailOAuthConfig.swift; the JSON is redundant.
+# Google Cloud Console OAuth downloads. The Gmail writeback feature that used
+# these is gone; the pattern stays so a stray download can't be committed.
 client_secret_*.json
 
 # Local prefs

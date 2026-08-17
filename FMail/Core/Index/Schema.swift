@@ -238,16 +238,17 @@ enum Schema {
         try runMigration(db, statements: statements)
     }
 
-    /// v7: per-account writeback service preference. Lets the user route
-    /// move/delete/mark-read either through AppleScript (the default,
-    /// existing behaviour) or — once authorized — through a server-direct
-    /// backend (Gmail API for Gmail accounts, IMAP for the rest). Tahoe's
-    /// AppleScript bridge is unreliable for mailbox-resolution operations;
-    /// the server-direct path bypasses it entirely. See WRITEBACK_PLAN.md
-    /// for the full plan. `service` is one of: 'applescript' (default),
-    /// 'gmail_api', 'imap'. `keychain_label` points to the entry holding
-    /// the relevant secret (OAuth refresh token / app-specific password);
-    /// nil for 'applescript' rows.
+    /// v7: per-account writeback service preference — **vestigial**. It was
+    /// added for a Gmail-API/IMAP writeback router that would route
+    /// move/delete/mark-read around Tahoe's broken AppleScript
+    /// mailbox-resolution. That feature shipped and was then removed (the
+    /// per-fork OAuth client / Keychain / refresh-token surface wasn't worth
+    /// one button — see ARCHITECTURE.md §9), so nothing reads this table
+    /// today. The migration stays so version history remains linear; drop it
+    /// only as part of a schema-version bump that rebuilds the index anyway.
+    /// `service` is one of: 'applescript' (default), 'gmail_api', 'imap'.
+    /// `keychain_label` points to the entry holding the relevant secret
+    /// (OAuth refresh token / app-specific password); nil for 'applescript'.
     private static func migrateTo7(_ db: OpaquePointer) throws {
         let statements = [
             """
