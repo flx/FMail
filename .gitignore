@@ -32,3 +32,6 @@ client_secret_*.json
 !default.mode2v3
 *.perspectivev3
 !default.perspectivev3
+
+# Claude Code worktrees
+.claude/worktrees/
