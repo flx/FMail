@@ -18,13 +18,14 @@ envelope icon and a dropdown gives you:
 
 - Your **unread** messages (or **search results** when you type in the search box), split into a
   **Priority Messages** and an **Other Messages** block ([see below](#priority-vs-other-messages)) —
-  each newest-first with **Today / Yesterday / date** separators, and each row carrying an unread dot
-  and a checkbox.
-- Per-block **Mark all Priority/Other Messages as read** / **as unread** commands — or tick a few rows
-  and they collapse to **Mark N as read** / **Mark N as unread** acting on just the ticks. Whichever
-  command would change nothing is disabled: in the default unread-only list "as unread" greys out until
-  a search surfaces already-read mail. "Mark all" acts on *every* matching message in the block, not
-  only the rows currently visible.
+  each newest-first with **Today / Yesterday / date** separators, up to 15 rows per block, and each
+  row carrying an unread dot and a checkbox.
+- Per-block **Mark displayed Priority/Other Messages as read** / **as unread** commands — or tick a
+  few rows and they collapse to **Mark N as read** / **Mark N as unread** acting on just the ticks.
+  Whichever command would change nothing is disabled: in the default unread-only list "as unread"
+  greys out until a search surfaces already-read mail. The block commands act on exactly the rows
+  in front of you — matches past the 15-row cap are left untouched, so the command never does more
+  than what's visible.
 - A per-email **submenu** (click the title or the `›`): **Open in Mail**, **Reply**, **Reply All**,
   **Forward**, a one-click **Add … to Priority Mail** / **Remove … from Priority Mail**
   ([see below](#priority-vs-other-messages)), then the full **subject**, the From / To / Date
@@ -80,8 +81,9 @@ whichever supplemental entries put them there — shown verbatim, so a wildcard 
 *Remove `*vendor.com` from Priority Mail*. When a sender is priority only because you've emailed
 them, the submenu says so as a disabled note rather than offering a removal that wouldn't work.
 
-Each block carries its own **Mark all … as read / as unread** commands (acting on every matching
-message, not just the visible rows); per-row checkboxes still let you mark an arbitrary selection.
+Each block carries its own **Mark displayed … as read / as unread** commands, which act on the rows
+that block is currently showing and nothing beyond them; per-row checkboxes still let you mark an
+arbitrary selection.
 
 ## Why
 
