@@ -325,6 +325,15 @@ actor MCPServer {
         if path != MCPProtocol.mcpPath {
             return HTTPParser.formatResponse(status: 404, body: Data("{}".utf8))
         }
+        // JSON-RPC bodies must be declared JSON. A browser can only send
+        // `application/json` cross-origin after a CORS preflight, which this
+        // server never answers — so this closes the "simple request" path
+        // (`<form enctype=text/plain>` smuggling a JSON body) that the Origin
+        // gate can't see. MCP Streamable HTTP clients always send it.
+        guard Self.isJSONContentType(request.headers["content-type"]) else {
+            Log.mcp.error("MCP rejected request: Content-Type is not application/json")
+            return HTTPParser.formatResponse(status: 415, body: Data(#"{"error":"unsupported_media_type"}"#.utf8))
+        }
 
         // Bearer-token check. The presented token must match either the
         // static `MCPSettings.authToken` (used by Claude Code) or an
@@ -477,9 +486,15 @@ actor MCPServer {
     /// present, its host must be loopback or the tunnel host. Requests without
     /// an `Origin` (the normal MCP/CLI client case) pass. A present-but-
     /// disallowed Origin is rejected (cross-origin browser fetch defence).
+    ///
+    /// `Origin: null` is rejected, not waved through: browsers send it from
+    /// sandboxed iframes, `no-referrer` pages and https→http form POSTs —
+    /// exactly the cross-site requests this gate exists to stop. Real MCP
+    /// clients send no Origin, and the OAuth approval page posts same-origin.
     nonisolated func originIsAllowed(_ request: HTTPRequestLine) -> Bool {
         let origin = (request.headers["origin"] ?? "").trimmingCharacters(in: .whitespaces)
-        guard !origin.isEmpty, origin.lowercased() != "null" else { return true }
+        guard !origin.isEmpty else { return true }
+        if origin.lowercased() == "null" { return false }
         // Origin is `scheme://host[:port]` — reuse the same authority parsing.
         var s = origin.lowercased()
         if let schemeRange = s.range(of: "://") { s = String(s[schemeRange.upperBound...]) }
@@ -487,6 +502,14 @@ actor MCPServer {
         if Self.isLoopbackHost(s) { return true }
         let tunnel = Self.tunnelHostName()
         return !tunnel.isEmpty && Self.hostName(stripping: s) == tunnel
+    }
+
+    /// True when a `Content-Type` value names `application/json` (parameters
+    /// such as `; charset=utf-8` allowed, case-insensitive).
+    nonisolated static func isJSONContentType(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let mediaType = value.split(separator: ";", maxSplits: 1).first.map(String.init) ?? ""
+        return mediaType.trimmingCharacters(in: .whitespaces).lowercased() == "application/json"
     }
 
     /// True for `127.0.0.1`, `localhost`, or `::1`, with or without a port

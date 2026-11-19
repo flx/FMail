@@ -136,6 +136,110 @@ enum MailScripter {
         return result
     }
 
+    // MARK: — Reply drafts (driven by MailReplyDrafter)
+
+    /// AppleScript that opens a native reply / reply-all window for `entry`
+    /// and returns the new outgoing message's `id` (0 when the message wasn't
+    /// found). Internal so tests can inspect the emitted source.
+    static func openReplyScriptSource(_ entry: BatchEntry, replyAll: Bool) -> String? {
+        let replyCmd = replyAll
+            ? "reply msg with opening window and reply to all"
+            : "reply msg with opening window"
+        let action = """
+        if foundCount = 0 then
+            set newDraft to \(replyCmd)
+            set draftId to id of newDraft
+        end if
+        """
+        return buildScriptSource(
+            entries: [entry],
+            accountScopedAction: action,
+            crossAccountAction: action,
+            prelude: "set draftId to 0",
+            returnExpression: "draftId"
+        )
+    }
+
+    /// Open Mail's native reply window and return its outgoing-message id.
+    /// Mail builds the quoted original itself; nothing else touches the body.
+    static func openReply(_ entry: BatchEntry, replyAll: Bool) async -> Swift.Result<Int, ReplyDraftError> {
+        guard let source = openReplyScriptSource(entry, replyAll: replyAll) else {
+            return .failure(.messageNotFound)
+        }
+        let (stdout, stderr, code) = await runOsascript(source)
+        guard code == 0 else { return .failure(.script(stderr.isEmpty ? stdout : stderr)) }
+        let id = Int(stdout.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        return id > 0 ? .success(id) : .failure(.messageNotFound)
+    }
+
+    /// Bring Mail forward and report whether its front window is the draft
+    /// (a compose window is titled with its subject). Uses Mail's own
+    /// dictionary, so it needs no Accessibility permission.
+    static let draftFrontScript = """
+    on run argv
+        set draftId to (item 1 of argv) as integer
+        tell application "Mail"
+            activate
+            set s to subject of (outgoing message id draftId)
+            repeat 30 times
+                try
+                    if name of window 1 is s then return "ready"
+                end try
+                delay 0.1
+            end repeat
+        end tell
+        return "not_ready"
+    end run
+    """
+
+    /// Paste the clipboard into Mail's frontmost window (Cmd-V via System
+    /// Events), but only if that window is still the draft. Requires
+    /// Accessibility for FMail.
+    static let pasteIntoDraftScript = """
+    on run argv
+        set draftId to (item 1 of argv) as integer
+        tell application "Mail"
+            set s to subject of (outgoing message id draftId)
+            if name of window 1 is not s then return "not_ready"
+        end tell
+        tell application "System Events" to tell process "Mail"
+            set frontmost to true
+            keystroke "v" using command down
+        end tell
+        return "pasted"
+    end run
+    """
+
+    /// Fallback fill: replace the draft's content with `item 2 of argv` (draft
+    /// text + a plain-text quote FMail built) and attach each remaining
+    /// argument as a file. Setting `content` discards Mail's native quote —
+    /// that's why this is only the fallback.
+    static let fillDraftScript = """
+    on run argv
+        set draftId to (item 1 of argv) as integer
+        set bodyText to item 2 of argv
+        with timeout of 120 seconds
+            tell application "Mail"
+                set d to outgoing message id draftId
+                set content of d to bodyText
+                repeat with i from 3 to (count of argv)
+                    set p to item i of argv
+                    tell content of d to make new attachment with properties {file name:(POSIX file p)} at after last paragraph
+                end repeat
+            end tell
+        end timeout
+        return "filled"
+    end run
+    """
+
+    static func runDraftScript(_ source: String, draftId: Int, extra: [String] = []) async -> Swift.Result<String, ReplyDraftError> {
+        // draftId goes first: osascript would parse a leading "-…" argument
+        // (e.g. a draft that starts with a dash) as an option.
+        let (stdout, stderr, code) = await runOsascript(source, arguments: [String(draftId)] + extra)
+        guard code == 0 else { return .failure(.script(stderr.isEmpty ? stdout : stderr)) }
+        return .success(stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     // MARK: — Shared scaffold
 
     /// Common AppleScript runner for any per-message action that follows
@@ -175,7 +279,9 @@ enum MailScripter {
     static func buildScriptSource(
         entries: [BatchEntry],
         accountScopedAction: String,
-        crossAccountAction: String
+        crossAccountAction: String,
+        prelude: String = "",
+        returnExpression: String = "foundCount"
     ) -> String? {
         guard !entries.isEmpty else { return nil }
         let bucketed = bucketByMailbox(entries)
@@ -196,8 +302,9 @@ enum MailScripter {
         with timeout of 600 seconds
             tell application "Mail"
                 set foundCount to 0
+                \(prelude)
                 \(blocks.joined(separator: "\n"))
-                return foundCount
+                return \(returnExpression)
             end tell
         end timeout
         """
@@ -541,12 +648,27 @@ enum MailScripter {
     /// Emits the full script + output to the Unified Log so debugging
     /// "Mark as Read silently failed" doesn't require code changes —
     /// `log show --predicate 'subsystem == "FMail.MailScripter"' --last 5m`.
-    private static func runOsascript(_ source: String) async -> (String, String, Int32) {
-        await withCheckedContinuation { continuation in
+    ///
+    /// `arguments` reach the script's `on run argv` handler. Untrusted text
+    /// (draft bodies, file paths) must travel this way rather than being
+    /// spliced into `source`, so it can never be parsed as AppleScript. The
+    /// arguments are deliberately not logged. NB: osascript's option parser
+    /// would read a leading `-…` argument as a flag, so callers put a
+    /// numeric argument first.
+    ///
+    /// Refuses to run under XCTest: a test that reaches here would drive the
+    /// developer's real Mail.app (fixture rowids collide with real ones, and
+    /// the cross-account fallback would then mutate genuine mail).
+    static func runOsascript(_ source: String, arguments: [String] = []) async -> (String, String, Int32) {
+        if isRunningUnderXCTest {
+            Log.mailScripter.error("osascript refused: running under XCTest")
+            return ("", "osascript disabled under XCTest", -1)
+        }
+        return await withCheckedContinuation { continuation in
             serialQueue.async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                process.arguments = ["-e", source]
+                process.arguments = ["-e", source] + arguments
                 let outPipe = Pipe()
                 let errPipe = Pipe()
                 process.standardOutput = outPipe
@@ -592,6 +714,10 @@ enum MailScripter {
             }
         }
     }
+
+    /// True inside an XCTest host process. See ``runOsascript(_:arguments:)``.
+    static let isRunningUnderXCTest: Bool =
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 
     // MARK: — Diagnostics
 

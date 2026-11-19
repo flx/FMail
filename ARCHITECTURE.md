@@ -87,6 +87,23 @@ Mail.app: mark read/unread (`setReadStatusBatch`), reply / reply all / forward
 (`composeViaMailApp`), refetch an offloaded body or attachment (`fetchBodies`), and open a message
 (`openMessage`, via the `message://` URL scheme). Requires **Automation** permission.
 
+Reply drafts with content (`Compose/MailReplyDrafter.swift`, behind MCP `draft_reply`) are a fifth
+path, shaped by one verified Mail.app behaviour: **any AppleScript write to a reply's `content` —
+setting text, or merely inserting an attachment — discards Mail's native quoted original**, and
+`content` reads back empty, so the quote can't be re-inserted. The drafter therefore opens the
+native reply (`openReply`, returns the outgoing message's `id`), then:
+
+- **Paste mode** (FMail has Accessibility, screen unlocked): checks via Mail's own dictionary that
+  the front window is the draft (compose windows are titled with their subject), then pastes the
+  text and the files (`NSPasteboard` file URLs) with System Events Cmd-V. The rich quote survives.
+  The user's clipboard is snapshotted and restored. Drafts are serialised on the main actor.
+- **Fallback**: sets `content` to the draft plus a plain-text `> ` quote FMail builds from the
+  indexed body (`ReplyQuote`), then attaches files. Used when Accessibility is missing or the
+  screen is locked (the phone-over-tunnel case).
+
+Untrusted text and paths reach these scripts only through `osascript … argv`, never spliced into
+source. `runOsascript` refuses to run under XCTest.
+
 Batches are bucketed by mailbox and scoped per account where the account is known; a cross-account
 fallback walks every mailbox matching on `apple_rowid`. Apple Mail's `id` is the Envelope Index
 rowid, *not* the IMAP UID — the whole addressing scheme depends on that.
@@ -212,20 +229,29 @@ the matching entries verbatim, so a wildcard reads "Remove `*vendor.com` from Pr
 
 `MCP/` — a hand-rolled JSON-RPC 2.0 + minimal HTTP/1.1 framing on `Network.framework`'s `NWListener`
 (no SDK dependency), listening on `127.0.0.1:8765`. **On by default**; an explicit toggle-off
-persists. Twelve tools, all read-only against the index, plus the `fmail://schema` resource (and its
+persists. Thirteen tools — twelve read-only against the index, plus `draft_reply` — and the `fmail://schema` resource (and its
 `describe_schema` tool mirror) that reports the live operators and filterable values in *this* index
 so a client can ground queries instead of guessing.
 
 Security posture, in order of how much it matters:
 
-- **Read-only by design.** Mail state changes go through Mail.app. The one deliberate exception is
-  `fetch_from_server`, which drives AppleScript to pull an offloaded body back from the server — it
-  changes nothing in the mailbox. Enforced by convention today, not by the type system; see
-  `mcp-readonly-seam` in TODO.md.
-- **Attachment writes are confined.** Attachment bytes are attacker-controlled (anyone can email you
-  a file) and FMail isn't sandboxed, so every `save_to_path` / `save_dir` from a *tunnel* connection
-  must resolve inside `iCloud Drive/FMail`. Local connections are unrestricted. The root is in
+- **Read-only over the index; drafts, never sends.** Two deliberate Mail.app side effects:
+  `fetch_from_server` (pulls an offloaded body back; changes nothing in the mailbox) and
+  `draft_reply` (opens a reply draft for the user to review). `draft_reply` reaches Mail.app only
+  through `MCPContext.drafter`, an injected `ReplyDrafting` capability — the first step of
+  `mcp-readonly-seam`; the tool isn't registered without it. No code path sends, deletes or moves
+  mail. Worst case past the bearer token: read mail, and open drafts on the user's screen.
+- **File access from a tunnel is confined to `iCloud Drive/FMail`, both ways.** Attachment bytes are
+  attacker-controlled (anyone can email you a file) and FMail isn't sandboxed, so every
+  `save_to_path` / `save_dir` from a *tunnel* connection must resolve inside it. Likewise
+  `draft_reply`'s `path` attachments — otherwise a leaked token could attach `~/.ssh/id_ed25519` to
+  a reply addressed to whoever emailed you. Local connections are unrestricted. The root is in
   iCloud Drive deliberately: a save requested from the phone syncs back to the phone's Files app.
+- **Browsers can't drive the local server.** With no token configured, the loopback server is
+  unauthenticated, so the gate against web pages is: a Host allowlist (DNS rebinding), an Origin
+  allowlist that also **rejects `Origin: null`** (sandboxed iframes, https→http form posts), and
+  **`POST /mcp` requires `Content-Type: application/json`**, which a browser can only send
+  cross-origin after a CORS preflight the server never answers.
 - **Auth.** Loopback with no token when no tunnel is configured; a static bearer token for local
   clients; OAuth 2.1 + PKCE session tokens for remote ones (`MCP/OAuth/`), issued only through a
   user-opened 5-minute approval window. If a tunnel is configured with neither a token nor a session,
@@ -265,10 +291,10 @@ against real temp databases, `.emlx` and MIME parsing, `BodyLoader` external-att
 coverage against a synthetic Mail.app layout, MCP dispatcher / auth / HTTP framing / tool handlers
 against an in-memory index, the OAuth flow, and the relevance eval harness.
 
-One standing hazard: **no test may call `ReadStatusController.setReadStatus`.** `MailScripter`
-runs `osascript` unconditionally, and a fixture rowid can collide with a real one in your actual
-mailbox — the cross-account fallback would then mutate genuine mail. Enforced today only by a doc
-comment; see `mailscripter-test-guard` in TODO.md.
+`MailScripter.runOsascript` refuses to run when `XCTestConfigurationFilePath` is set: a fixture
+rowid can collide with a real one in your actual mailbox, and the cross-account fallback would
+then mutate genuine mail. Tests that need Mail.app behaviour inject a fake (`ReplyDrafting`) or
+assert on the generated script source.
 
 ## 9. Decisions, and things deliberately not built
 
@@ -294,7 +320,9 @@ Removed after shipping, and not coming back without a new reason:
   button. Move-to-Junk is simply not a feature.
 - **MCP write tools** (`mark_read`, `delete_messages`, `move_to_junk`, `diagnose_junk_mailboxes`).
   Dropped so the connector is safe to expose over a tunnel: worst case, someone past the bearer token
-  can read mail, not mutate it.
+  can read mail, not mutate it. `draft_reply` (2026-11) was added back deliberately as the single
+  exception: it only opens a draft for the user to send, and its file reach over the tunnel is
+  confined like attachment saves.
 
 Deferred, designed-for but not started:
 

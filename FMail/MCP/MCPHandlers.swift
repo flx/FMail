@@ -7,10 +7,15 @@ import Foundation
 struct MCPContext: Sendable {
     let indexDB: IndexDB
     let bodyLoader: BodyLoader
+    /// The single, explicitly named Mail-mutating capability: open (never
+    /// send) a reply draft in Mail.app. Nil disables `draft_reply`. Injected
+    /// so tests use a fake and never drive the real Mail.app.
+    let drafter: (any ReplyDrafting)?
 
-    init(indexDB: IndexDB, bodyLoader: BodyLoader) {
+    init(indexDB: IndexDB, bodyLoader: BodyLoader, drafter: (any ReplyDrafting)? = nil) {
         self.indexDB = indexDB
         self.bodyLoader = bodyLoader
+        self.drafter = drafter
     }
 }
 

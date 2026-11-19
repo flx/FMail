@@ -53,6 +53,10 @@ final class MailModel {
     @ObservationIgnored
     private(set) lazy var readStatus = ReadStatusController(model: self)
 
+    /// Opens reply drafts in Mail.app for the MCP `draft_reply` tool.
+    @ObservationIgnored
+    let replyDrafter = MailReplyDrafter()
+
     /// Manages the `cloudflared` child process when the user toggles the
     /// Cloudflare tunnel on/off.
     @ObservationIgnored
@@ -201,8 +205,9 @@ final class MailModel {
         let server = mcpServer ?? MCPServer()
         mcpServer = server
         mcpServerStatus = .starting
-        // Read-only context — MCP intentionally has no write surface.
-        let context = MCPContext(indexDB: indexDB, bodyLoader: bodyLoader)
+        // Read-only over the index; the one Mail side effect MCP gets is the
+        // explicit `drafter` capability (opens reply drafts, never sends).
+        let context = MCPContext(indexDB: indexDB, bodyLoader: bodyLoader, drafter: replyDrafter)
         // If a previous run is still listening on a different port, stop first.
         if await server.isRunning, await server.port != UInt16(desiredPort) {
             await server.stop()

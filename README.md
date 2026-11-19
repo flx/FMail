@@ -274,15 +274,17 @@ Other checks if it still won't compile:
 
 ## MCP server
 
-FMail ships an optional **read-only** MCP (Model Context Protocol) server that exposes the index to
+FMail ships an optional MCP (Model Context Protocol) server — read-only over the index, plus one
+tool that opens (never sends) reply drafts in Mail.app — that exposes the index to
 LLM clients (Claude Code, claude.ai connectors). It listens on `127.0.0.1:8765` and speaks JSON-RPC
 over HTTP/POST. It is **on by default** in this build (an explicit toggle-off persists); turn it off
 or on from the menu under **MCP/Tunnel → MCP**.
 
 ### What's exposed
 
-Twelve tools, all non-destructive — Mail state changes happen through Mail.app, never through MCP.
-Read-only by design so it's safe to expose over a tunnel.
+Thirteen tools. Twelve are read-only. The thirteenth, `draft_reply`, opens a reply draft in Mail.app
+and leaves it for you to review — no MCP tool can send, delete or move mail, so the worst a
+caller past the bearer token can do is read mail and open drafts on your screen.
 
 | Tool | Purpose |
 |---|---|
@@ -298,6 +300,17 @@ Read-only by design so it's safe to expose over a tunnel.
 | `get_attachment` | One attachment by rowid + index. `save_to_path` writes to disk (no size cap); otherwise returns base64 (10 MB cap). `download_if_missing` refetches an offloaded attachment first. |
 | `get_attachments_for_rowids` | Bulk variant — writes every attachment of every supplied rowid to `save_dir/<rowid>/<filename>`, reporting per-message errors instead of failing the batch. |
 | `fetch_from_server` | Ask Mail.app to pull a message's body/attachments back from its IMAP/Gmail server, for mail Apple's "Optimise Mac Storage" has offloaded. |
+| `draft_reply` | Open a reply / reply-all to a message in Mail.app, optionally pre-filled with `body` text and `attachments` (files on disk, or attachments of any indexed email). The draft stays open for you to review and send — **never sent automatically**. |
+
+> **Draft replies.** Mail.app discards its own quoted original whenever AppleScript writes into a
+> reply — even just to add an attachment. So when FMail has **Accessibility** permission (System
+> Settings → Privacy & Security → Accessibility) and the Mac is unlocked, `draft_reply` opens the
+> reply and *pastes* the text and files at the cursor, keeping Mail's rich quote (`mode: "pasted"`;
+> your clipboard is restored afterwards). Otherwise — no permission, or a locked screen, e.g. when
+> you're using the tunnel from your phone — it sets the body via AppleScript with a plain-text
+> `> ` quote instead (`mode: "applescript"`). The first use asks for Automation access to System
+> Events. Over the tunnel, `path` attachments must live inside `iCloud Drive/FMail`. Ad-hoc-signed
+> rebuilds invalidate the Accessibility grant; re-tick FMail after rebuilding.
 
 > **Ranked search.** `sort: "relevance"` ranks by column-weighted BM25 rather than date: subject and
 > sender outweigh body text, quoted reply chains and signatures are weighted near zero (so a quoted

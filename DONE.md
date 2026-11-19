@@ -4,11 +4,13 @@ Implemented and committed. Items are moved here from TODO.md by `/done`.
 
 ## Features
 
-
+- [x] (mcp-draft-reply) MCP `draft_reply`: open a reply / reply-all in Mail.app pre-filled with draft text and attachments (files on disk, or attachments of indexed emails); never sends — **2026-11-19**. Mail.app discards its native quote on any AppleScript write to a reply's content (verified), so the drafter pastes text + files via System Events when FMail has Accessibility and the screen is unlocked, else falls back to AppleScript content with a plain-text quote. Tunnel `path` attachments confined to iCloud Drive/FMail; text/paths passed via `osascript` argv. Reaches Mail only through the injected `MCPContext.drafter` capability (first slice of `mcp-readonly-seam`). Tests in `MCPDraftReplyTests`.
 
 ## Bugs
 
+- [x] (mcp-null-origin) Local MCP server accepted `Origin: null` and any Content-Type, so a web page (sandboxed iframe / https→http form POST with a `text/plain` JSON body) could call tools on the default unauthenticated loopback server, including unconfined `save_to_path` writes — **2026-11-19**. `originIsAllowed` now rejects `null`; `POST /mcp` requires `Content-Type: application/json` (415 otherwise).
 
+- [x] (mailscripter-test-guard) `MailScripter.runOsascript` refuses to run under XCTest (`XCTestConfigurationFilePath` set), so no test can drive the developer's real Mail.app — **2026-11-19**.
 
 ## Architecture
 

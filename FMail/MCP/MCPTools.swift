@@ -26,6 +26,11 @@ enum MCPTools {
         await dispatcher.register(fetchFromServerTool(context: context))
         await dispatcher.register(findUnansweredTool(context: context))
         await dispatcher.register(describeSchemaTool(context: context))
+        // The one deliberate exception to read-only: open (never send) a reply
+        // draft in Mail.app. Only registered when the capability is injected.
+        if context.drafter != nil {
+            await dispatcher.register(draftReplyTool(context: context))
+        }
 
         // The same ontology, exposed as an on-demand resource (the primary
         // surface) so it doesn't ride in any tool description on every call.
@@ -40,6 +45,71 @@ enum MCPTools {
                 return String(data: data, encoding: .utf8) ?? "{}"
             }
         ))
+    }
+
+    // MARK: — draft_reply
+
+    private static func draftReplyTool(context: MCPContext) -> MCPTool {
+        MCPTool(
+            name: "draft_reply",
+            description: """
+            Open a reply (or reply-all) to an indexed email as a draft in Apple
+            Mail on the user's Mac, optionally pre-filled with `body` text and
+            file attachments. The draft is left OPEN for the user to review,
+            edit and send — this tool never sends mail, and there is no tool
+            that does. Find the `rowid` with `search_emails` / `get_thread`.
+
+            `body` is plain text and goes above the quoted original. When FMail
+            has Accessibility permission and the Mac is unlocked, the text and
+            files are pasted into Mail's reply so Mail's own rich quote is
+            kept (`mode: "pasted"`); otherwise the body is set via AppleScript
+            with a plain-text quote (`mode: "applescript"`, see `notes`).
+
+            Attachments: each item is either `{"rowid": N,
+            "attachment_index": i}` (re-attach a file from any indexed email —
+            e.g. forward a PDF into the reply) or `{"path": "..."}` (a file
+            on disk). Over a remote/tunnel connection `path` must be inside
+            iCloud Drive/FMail (relative paths resolve there); local
+            connections may name any readable file. Max \(MCPHandlers.DraftLimits.maxAttachments) attachments, \(MCPHandlers.DraftLimits.maxTotalAttachmentBytes / 1024 / 1024) MB total.
+            Offloaded email attachments need `fetch_from_server` first.
+
+            Requires Apple Mail Automation permission. Takes several seconds:
+            Mail.app locates the message by scanning its mailbox.
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "rowid": .object([
+                        "type": .string("integer"),
+                        "description": .string("rowid of the email to reply to.")
+                    ]),
+                    "body": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional plain-text draft placed above the quoted original. Omit to just open the reply.")
+                    ]),
+                    "reply_all": .object([
+                        "type": .string("boolean"),
+                        "default": .bool(false),
+                        "description": .string("Reply to all recipients instead of just the sender.")
+                    ]),
+                    "attachments": .object([
+                        "type": .string("array"),
+                        "maxItems": .int(Int64(MCPHandlers.DraftLimits.maxAttachments)),
+                        "items": .object([
+                            "type": .string("object"),
+                            "properties": .object([
+                                "path": .object(["type": .string("string")]),
+                                "rowid": .object(["type": .string("integer")]),
+                                "attachment_index": .object(["type": .string("integer"), "minimum": .int(0)])
+                            ])
+                        ]),
+                        "description": .string("Optional files to attach: each {\"path\": …} or {\"rowid\": N, \"attachment_index\": i}.")
+                    ])
+                ]),
+                "required": .array([.string("rowid")])
+            ]),
+            handler: { args in try await MCPHandlers.draftReply(args, context: context) }
+        )
     }
 
     // MARK: — describe_schema
