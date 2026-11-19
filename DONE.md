@@ -10,6 +10,14 @@ Implemented and committed. Items are moved here from TODO.md by `/done`.
 
 - [x] (mcp-null-origin) Local MCP server accepted `Origin: null` and any Content-Type, so a web page (sandboxed iframe / https→http form POST with a `text/plain` JSON body) could call tools on the default unauthenticated loopback server, including unconfined `save_to_path` writes — **2026-11-19**. `originIsAllowed` now rejects `null`; `POST /mcp` requires `Content-Type: application/json` (415 otherwise).
 
+- [x] (mime-param-lowercase-crash) `MIMEParser.paramValue` searched a lowercased copy of the header and reused its offset on the original; length-changing lowercase (`İ`, Kelvin sign) mangled filenames (`ort.pdf`) or indexed past the end and trapped — a crash loop from one received email — **2026-11-19**. Now `range(of:options:.caseInsensitive)` on the original. Regression test confirmed failing (crash + `ort.pdf`) on the old code.
+
+- [x] (body-sweep-marks-missing-done) Missing `.emlx` files were recorded as `body_indexed = 1` with an empty body and never indexed — **2026-11-19**. New state 2 ("missing"), retried after each sweep (all once per launch, then unread / last 14 days), written only once the file appears; `body_on_disk` and the unread auto-fetch treat only state 1 as present. Schema v10 re-queues rows already marked 1 with an empty body.
+
+- [x] (oauth-approve-not-bound) Anyone polling `/authorize` could approve themselves during the approval window — **2026-11-19**. Approve now requires a 6-digit pairing code generated per window and shown only in FMail's menu (constant-time check before the nonce is consumed; 5 wrong codes close the window). Pending authorizations capped at 50; `state`/`scope` over 1024 chars rejected.
+
+- [x] (mcp-int-overflow-trap) `JSONValue.intValue` used `Int(d)`, trapping on 1e300 / 2^63 / NaN; `offset + limit` could overflow — **2026-11-19**. `Int(exactly:)` (out-of-range → nil → default/invalid), offsets clamped to 1,000,000.
+
 - [x] (mailscripter-test-guard) `MailScripter.runOsascript` refuses to run under XCTest (`XCTestConfigurationFilePath` set), so no test can drive the developer's real Mail.app — **2026-11-19**.
 
 ## Architecture

@@ -74,6 +74,11 @@ final class OAuthStore {
     /// and come back to click Approve, but short so a stale nonce can't be
     /// replayed later. Independent of `codeTTL`.
     nonisolated static let pendingAuthorizationTTL: TimeInterval = 600  // 10 minutes
+    /// Upper bound on live pending authorizations (one user pairs a handful
+    /// of clients, ever).
+    nonisolated static let maxPendingAuthorizations = 50
+    /// Longest `state` accepted at `/authorize` (clients use ~32–128 chars).
+    nonisolated static let maxStateLength = 1024
 
     private var pendingAuthorizations: [String: PendingAuthorization] = [:]
 
@@ -90,6 +95,15 @@ final class OAuthStore {
         state: String
     ) -> String {
         gcExpiredPendingAuthorizations()
+        // `GET /authorize` is unauthenticated; cap the records it can create
+        // so a flood can't grow memory without bound. Oldest go first.
+        if pendingAuthorizations.count >= Self.maxPendingAuthorizations {
+            let overflow = pendingAuthorizations.count - Self.maxPendingAuthorizations + 1
+            for key in pendingAuthorizations.sorted(by: { $0.value.createdAt < $1.value.createdAt })
+                .prefix(overflow).map(\.key) {
+                pendingAuthorizations.removeValue(forKey: key)
+            }
+        }
         let nonce = randomToken(byteCount: 32)
         pendingAuthorizations[nonce] = PendingAuthorization(
             clientID: clientID,
@@ -267,13 +281,48 @@ final class OAuthStore {
     /// "Open approval window".
     func openApprovalWindow(duration: TimeInterval = 300) {
         approvalWindowExpiresAt = Date().addingTimeInterval(duration)
+        pairingCode = Self.makePairingCode()
+        failedPairingAttempts = 0
     }
 
     /// Close the window — called after a successful approval, or by the
     /// user via Settings.
     func closeApprovalWindow() {
         approvalWindowExpiresAt = nil
+        pairingCode = nil
+        failedPairingAttempts = 0
     }
+
+    // MARK: — Pairing code
+
+    /// Six-digit code generated each time the window opens and shown only in
+    /// FMail's own menu. `POST /authorize/approve` must present it. This
+    /// binds an approval to someone who can see the Mac's screen: without
+    /// it, anyone who knows the tunnel URL could poll `GET /authorize` and
+    /// approve their own client the moment the user opened the window.
+    private(set) var pairingCode: String?
+    private var failedPairingAttempts = 0
+    /// Wrong codes allowed per window before it closes (guessing odds:
+    /// 5 in 1,000,000 per window the user opens).
+    nonisolated static let maxPairingAttempts = 5
+
+    nonisolated static func makePairingCode() -> String {
+        var rng = SystemRandomNumberGenerator()
+        return String(format: "%06d", Int.random(in: 0..<1_000_000, using: &rng))
+    }
+
+    /// Check a submitted code (spaces ignored). A wrong code counts toward
+    /// ``maxPairingAttempts``; reaching it closes the window.
+    func verifyPairingCode(_ submitted: String) -> Bool {
+        guard approvalWindowIsOpen, let expected = pairingCode else { return false }
+        let cleaned = submitted.filter { !$0.isWhitespace }
+        if MCPHelpers.constantTimeEqual(cleaned, expected) { return true }
+        failedPairingAttempts += 1
+        if failedPairingAttempts >= Self.maxPairingAttempts { closeApprovalWindow() }
+        return false
+    }
+
+    var pairingAttemptsRemaining: Int { max(0, Self.maxPairingAttempts - failedPairingAttempts) }
 
     /// True iff the window is open right now. The approval endpoint
     /// calls this *before* issuing a code; we close the window

@@ -4,7 +4,7 @@ import SQLite3
 /// FMail's own SQLite schema. Versioned via `schema_version` so future
 /// migrations can detect prior state and upgrade in place.
 enum Schema {
-    static let currentVersion: Int = 9
+    static let currentVersion: Int = 10
 
     /// Apply migrations to bring the DB up to `currentVersion`. Idempotent.
     static func apply(to db: OpaquePointer) throws {
@@ -39,6 +39,29 @@ enum Schema {
         if v < 7 { try migrateTo7(db) }
         if v < 8 { try migrateTo8(db) }
         if v < 9 { try migrateTo9(db) }
+        if v < 10 { try migrateTo10(db) }
+    }
+
+    /// `body_indexed` states: 0 = not yet swept, 1 = parsed (or permanently
+    /// unparseable), 2 = `.emlx` wasn't on disk when swept — retried later.
+    /// Before v10 a missing file was marked 1 with an empty body, so it was
+    /// never indexed once Mail.app downloaded it.
+    static let bodyNotSwept = 0
+    static let bodyIndexed = 1
+    static let bodyMissing = 2
+
+    /// v10: re-queue rows that were marked indexed with an empty body — most
+    /// were missing files under the old behaviour. Genuinely empty messages
+    /// are simply re-parsed once and land back on 1.
+    private static func migrateTo10(_ db: OpaquePointer) throws {
+        try runMigration(db, statements: [
+            """
+            UPDATE messages SET body_indexed = 0
+            WHERE body_indexed = 1
+              AND apple_rowid IN (SELECT rowid FROM messages_fts WHERE body_clean = '' AND body_quoted = '')
+            """,
+            "INSERT INTO schema_version(version, applied_at) VALUES (10, strftime('%s','now'));"
+        ])
     }
 
     /// v9: relevance-ranking overhaul. Splits the single `body_text` FTS column

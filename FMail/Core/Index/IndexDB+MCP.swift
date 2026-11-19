@@ -117,7 +117,8 @@ extension IndexDB {
             // has been parsed. Used as a proxy for "body fetch will
             // succeed without a Mail.app IMAP round-trip" — surfaced as
             // `body_on_disk` in MCP result shapes.
-            let bodyOnDisk = sqlite3_column_int(stmt, 4) != 0
+            // Only state 1 means parsed; 2 = file was missing (see Schema).
+            let bodyOnDisk = Int(sqlite3_column_int(stmt, 4)) == Schema.bodyIndexed
             let accountEmail = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
             out[rowid] = MCPMessageEnrichment(
                 mailboxPath: path,

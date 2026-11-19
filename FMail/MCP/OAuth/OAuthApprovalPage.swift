@@ -139,8 +139,19 @@ enum OAuthApprovalPage {
         """
     }
 
+    /// Approve requires the 6-digit pairing code FMail shows in its menu on
+    /// the Mac — proof the approver can see the Mac's screen.
     private static func approveForm(_ ctx: Context) -> String {
-        formWithHiddenFields(action: "/authorize/approve", ctx: ctx, button: "Approve", primary: true)
+        """
+        <form method="POST" action="/authorize/approve">
+            <input type="hidden" name="nonce" value="\(escape(ctx.nonce))">
+            <p><label for="pairing_code">Pairing code — shown in FMail's menu on your Mac (MCP/Tunnel → Approval window):</label></p>
+            <p><input id="pairing_code" name="pairing_code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                      pattern="[0-9 ]{6,7}" maxlength="7" required placeholder="123 456"
+                      style="font: inherit; font-size: 20px; letter-spacing: 4px; padding: 8px; width: 9em;"></p>
+            <button type="submit" class="primary">Approve</button>
+        </form>
+        """
     }
 
     private static func denyForm(_ ctx: Context) -> String {

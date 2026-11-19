@@ -447,10 +447,12 @@ spawns `cloudflared` as a child process and tears it down when you close the tun
 
 claude.ai's "Custom Connector" flow uses OAuth, not a static token:
 
-9. **MCP/Tunnel → Open approval window** (opens a 5-minute window).
+9. **MCP/Tunnel → Open approval window** (opens a 5-minute window). Reopen the menu: the item now
+   reads **Approval window open — code 123 456**.
 10. In claude.ai → add a custom connector → URL `https://fmail.your-domain.com/mcp`.
-11. claude.ai opens FMail's `/authorize` page in your browser — click **Approve** while the window is
-    open. The issued session token is persisted, so the connector survives FMail restarts. To revoke a
+11. claude.ai opens FMail's `/authorize` page in your browser — type the **pairing code** from the
+    menu and click **Approve** while the window is open. Five wrong codes close the window. The
+    issued session token is persisted, so the connector survives FMail restarts. To revoke a
     paired connector later, use **Settings → Connection → Paired sessions → Revoke all paired sessions**.
 
 ### Who can connect over the tunnel
@@ -466,8 +468,9 @@ refuses everything. There are exactly two kinds of valid token:
 
 A new or unknown application **cannot authorize itself** by reaching the public URL. To obtain a
 session token it must, all at once: (1) arrive while you have **deliberately opened the approval
-window** (time-limited; grants exactly one code, then closes), (2) be **approved by you** clicking
-Approve in your browser while seeing its `redirect_uri`, and (3) prove possession of the **PKCE
+window** (time-limited; grants exactly one code, then closes), (2) be **approved by you** entering
+the 6-digit **pairing code shown only in FMail's menu on your Mac** — so someone who merely knows the
+tunnel URL and polls `/authorize` can't approve themselves while the window is open — and (3) prove possession of the **PKCE
 verifier** it generated — so an intercepted code or a drive-by approval can't yield a usable token.
 In short: a third-party app can't get in on its own; it needs either your static token or an approval
 you actively grant during the window.

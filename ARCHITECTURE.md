@@ -34,7 +34,7 @@ window (`MenuBar/MinimalSettingsView.swift`, SwiftUI).
                             │
 ┌───────────────────────────┴─────────────────────────────────────┐
 │  Core (pure Foundation + SQLite; no AppKit)                     │
-│  Index/     — own SQLite + FTS5 mirror (schema v9)              │
+│  Index/     — own SQLite + FTS5 mirror (schema v10)             │
 │  QueryDSL/  — lexer → parser → AST → owner expansion →          │
 │               evaluator → SQL + FTS5 MATCH                      │
 │  Emlx/, HTML/, Threading/                                       │
@@ -112,7 +112,7 @@ rowid, *not* the IMAP UID — the whole addressing scheme depends on that.
 
 `~/Library/Application Support/FMail/index.sqlite`, raw SQLite3 C API (no ORM), WAL enabled,
 accessed through the `IndexDB` actor. Schema is versioned and migrated forward in
-`Core/Index/Schema.swift` — **currently v9**.
+`Core/Index/Schema.swift` — **currently v10**.
 
 Tables: `messages`, `recipients`, `threads`, `mailboxes`, `message_labels`, `message_links`,
 `attachments`, plus the `messages_fts` virtual table.
@@ -159,6 +159,13 @@ so Mail.app's own reflow doesn't race the optimistic update back.
 from `.emlx` files progressively; it pauses during a full sync (the connection is shared — see
 `indexdb-reader-split` in TODO.md). Consequence, and it's user-visible: a brand-new message is
 searchable by subject/sender/recipient/attachment-name immediately, by body slightly later.
+
+`messages.body_indexed` has three states: 0 = not swept, 1 = parsed (or permanently unparseable),
+2 = the `.emlx` wasn't on disk yet (typically unread mail Mail.app is still downloading). State-2 rows
+are retried after each sweep — every one once per launch, then only unread / last-14-days ones, so
+a sync every 60 s doesn't re-list huge mailboxes — and are written only when the file has appeared.
+`body_on_disk` and the unread-body auto-fetch treat only state 1 as present. (Before v10 a missing
+file was recorded as 1 with an empty body and never indexed; the v10 migration re-queues those.)
 
 ### Threading
 
@@ -254,7 +261,8 @@ Security posture, in order of how much it matters:
   cross-origin after a CORS preflight the server never answers.
 - **Auth.** Loopback with no token when no tunnel is configured; a static bearer token for local
   clients; OAuth 2.1 + PKCE session tokens for remote ones (`MCP/OAuth/`), issued only through a
-  user-opened 5-minute approval window. If a tunnel is configured with neither a token nor a session,
+  user-opened 5-minute approval window and only with the 6-digit pairing code FMail shows in its menu
+  (5 wrong codes close the window). If a tunnel is configured with neither a token nor a session,
   the server **fails closed**.
 - **Host-aware OAuth discovery.** A loopback request is told the resource is
   `http://127.0.0.1:<port>/mcp`; a tunnel request gets the configured public URL. The bearer check is

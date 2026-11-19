@@ -310,11 +310,13 @@ enum MIMEParser {
     }
 
     private static func paramValue(in header: String, key: String) -> String? {
-        let lowered = header.lowercased()
-        let target = key.lowercased() + "="
-        guard let r = lowered.range(of: target) else { return nil }
-        let after = header.index(header.startIndex, offsetBy: header.distance(from: lowered.startIndex, to: r.upperBound))
-        var i = after
+        // Search the ORIGINAL string case-insensitively. Searching a
+        // lowercased copy and re-applying its offset to `header` is wrong:
+        // lowercasing can change length (`İ` → `i̇`), which mangled names
+        // and, with enough such characters, indexed past the end and
+        // trapped — a crash loop from one received email.
+        guard let r = header.range(of: key + "=", options: [.caseInsensitive]) else { return nil }
+        var i = r.upperBound
         if i < header.endIndex, header[i] == "\"" {
             i = header.index(after: i)
             var v = ""

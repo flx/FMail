@@ -9,6 +9,10 @@ enum MCPHelpers {
         Swift.max(lo, Swift.min(hi, v))
     }
 
+    /// Ceiling on any caller-supplied `offset`, so `offset + limit` and the
+    /// over-fetch multipliers can't overflow `Int` (which traps).
+    static let maxOffset = 1_000_000
+
     /// Constant-time string compare — keeps a timing oracle from leaking a
     /// secret (bearer token, PKCE challenge) byte by byte. Compares the UTF-8
     /// bytes; differing lengths short-circuit (length isn't secret here).

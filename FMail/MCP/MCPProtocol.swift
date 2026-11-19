@@ -122,8 +122,11 @@ extension JSONValue: Codable {
     }
     var intValue: Int? {
         switch self {
-        case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        case .int(let i): return Int(exactly: i)
+        // `Int(d)` traps on NaN/∞ or anything outside Int's range (1e300,
+        // 2^63). Truncate toward zero as before, but treat out-of-range as
+        // "not an integer" so the handler reports invalid params instead.
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         default: return nil
         }
     }

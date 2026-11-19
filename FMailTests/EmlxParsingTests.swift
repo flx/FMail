@@ -82,6 +82,35 @@ final class EmlxParsingTests: XCTestCase {
                        "base64 transfer-encoding must be decoded for the attachment bytes")
     }
 
+    /// Raw UTF-8 in a part header whose lowercase form has a different length
+    /// (`İ` U+0130 grows, the Kelvin sign U+212A shrinks) used to shift the
+    /// `filename=` offset: 3×`İ` gave "ort.pdf", 40×`İ` indexed past the end
+    /// and trapped — a crash loop, since the body sweep re-parses on launch.
+    func testFilenameAfterLengthChangingCharactersParsesWithoutTrapping() {
+        for (junk, label) in [(String(repeating: "\u{130}", count: 3), "3×İ"),
+                              (String(repeating: "\u{130}", count: 40), "40×İ"),
+                              (String(repeating: "\u{212A}", count: 5), "5×Kelvin")] {
+            let rfc = """
+            From: a@example.com
+            Content-Type: multipart/mixed; boundary="mix"
+
+            --mix
+            Content-Type: text/plain; charset=utf-8
+
+            Hi
+            --mix
+            Content-Disposition: attachment; x=\(junk); filename=report.pdf
+            Content-Type: application/pdf
+
+            PDFDATA
+            --mix--
+
+            """
+            let content = parseMessage(rfc)
+            XCTAssertEqual(content.attachments.first?.name, "report.pdf", label)
+        }
+    }
+
     /// RFC 2231 continuation / encoded parameter — the parser reassembles
     /// `filename*0`, `filename*1`, ... and percent-decodes `*`-tagged segments.
     func testRFC2231ContinuationFilenameIsReassembled() {

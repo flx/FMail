@@ -34,7 +34,7 @@ enum MCPHandlers {
             throw JSONRPCErrorPayload(code: JSONRPCErrorCode.invalidParams, message: "search_emails: `query` is required")
         }
         let limit = MCPHelpers.clampInt(obj["limit"]?.intValue ?? 50, min: 1, max: 500)
-        let offset = max(0, obj["offset"]?.intValue ?? 0)
+        let offset = MCPHelpers.clampInt(obj["offset"]?.intValue ?? 0, min: 0, max: MCPHelpers.maxOffset)
         let sort = try SearchSort.parseStrict(obj["sort"]?.stringValue)
         let includeAttachments = obj["include_attachment_metadata"]?.boolValue ?? false
         let includeSnippets = obj["include_snippets"]?.boolValue ?? false
@@ -183,7 +183,7 @@ enum MCPHandlers {
     static func listThreads(_ args: JSONValue, context: MCPContext) async throws -> JSONValue {
         let obj = args.objectValue ?? [:]
         let limit = MCPHelpers.clampInt(obj["limit"]?.intValue ?? 100, min: 1, max: 600)
-        let offset = max(0, obj["offset"]?.intValue ?? 0)
+        let offset = MCPHelpers.clampInt(obj["offset"]?.intValue ?? 0, min: 0, max: MCPHelpers.maxOffset)
         let unreadOnly = obj["unread_only"]?.boolValue ?? false
         let dedupe = obj["dedupe"]?.boolValue ?? false
 

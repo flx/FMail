@@ -94,6 +94,9 @@ enum OAuthHandlers {
 
         let state = query["state"] ?? ""
         let scope = query["scope"]
+        guard state.count <= OAuthStore.maxStateLength, (scope?.count ?? 0) <= OAuthStore.maxStateLength else {
+            return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(message: "state or scope is too long."))
+        }
 
         // Record the *reviewed* request server-side and bind it to a fresh
         // CSPRNG nonce. The approve/deny POST carries only this nonce; the
@@ -125,7 +128,8 @@ enum OAuthHandlers {
 
     // MARK: — Approve (`POST /authorize/approve`)
 
-    /// Approves the pending request. Two gates, both required:
+    /// Approves the pending request. Three gates, all required (the third,
+    /// the menu-only pairing code, is described inline below):
     ///   1. The approval window must be open *now* (5-minute one-shot).
     ///   2. The `nonce` from the form must resolve to a server-side
     ///      pending record created when the user loaded `GET /authorize`.
@@ -148,6 +152,16 @@ enum OAuthHandlers {
             return htmlResponse(status: 400, html: OAuthApprovalPage.renderError(
                 message: "Approval form was missing the request nonce. Reload the authorization page and try again."
             ))
+        }
+        // Gate 3: the pairing code shown only in FMail's menu on the Mac.
+        // Checked BEFORE consuming the nonce so a typo can be retried from
+        // the same page; wrong codes count toward closing the window.
+        guard OAuthStore.shared.verifyPairingCode(form["pairing_code"] ?? "") else {
+            let left = OAuthStore.shared.pairingAttemptsRemaining
+            let message = OAuthStore.shared.approvalWindowIsOpen
+                ? "Wrong pairing code. Use the 6-digit code shown in FMail's menu (MCP/Tunnel → Approval window). Go back and try again — \(left) attempt(s) left."
+                : "Too many wrong pairing codes — the approval window has closed. Open it again from FMail's menu and restart the connector flow."
+            return htmlResponse(status: 403, html: OAuthApprovalPage.renderError(message: message))
         }
         // Consume (one-shot) the pending record. nil ⇒ unknown/expired/replayed.
         guard let pending = OAuthStore.shared.consumePendingAuthorization(nonce: nonce) else {

@@ -126,7 +126,7 @@ actor IndexDB {
         SELECT m.apple_rowid, m.mailbox_rowid, m.imap_uid, m.rfc_message_id
         FROM messages m
         WHERE m.is_read = 0
-          AND m.body_indexed = 0
+          AND m.body_indexed != \(Schema.bodyIndexed)
           AND m.mailbox_rowid NOT IN (SELECT apple_rowid FROM mailboxes WHERE kind IN ('drafts', 'trash', 'junk'))
         ORDER BY m.date_received DESC
         \(limit.map { "LIMIT \($0)" } ?? "")
@@ -170,6 +170,40 @@ actor IndexDB {
         }
         guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
         return out.map { (rowid: $0.0, mailboxRowId: $0.1) }
+    }
+
+    /// Messages whose `.emlx` wasn't on disk when swept (`body_indexed = 2`),
+    /// newest first. With `recentSince`, only unread ones or ones received
+    /// on/after that date — the rows where a download is likely to land.
+    func fetchBodyMissingMessages(recentSince: Date?) throws -> [(rowid: Int, mailboxRowId: Int)] {
+        var stmt: OpaquePointer?
+        let recentClause = recentSince == nil ? "" : "AND (is_read = 0 OR date_received >= ?)"
+        try prepare("""
+            SELECT apple_rowid, mailbox_rowid
+            FROM messages
+            WHERE body_indexed = \(Schema.bodyMissing) \(recentClause)
+            ORDER BY apple_rowid DESC
+            """, into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        if let recentSince { bind(stmt, 1, Int64(recentSince.timeIntervalSince1970)) }
+        var out: [(Int, Int)] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append((Int(sqlite3_column_int64(stmt, 0)), Int(sqlite3_column_int64(stmt, 1))))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw IndexDBError.stepFailed(String(cString: sqlite3_errmsg(db))) }
+        return out.map { (rowid: $0.0, mailboxRowId: $0.1) }
+    }
+
+    /// Record that a message's `.emlx` wasn't on disk. Leaves FTS alone; the
+    /// row is retried by the sweep instead of being treated as indexed.
+    func markBodyMissing(messageRowId: Int) throws {
+        var stmt: OpaquePointer?
+        try prepare("UPDATE messages SET body_indexed = \(Schema.bodyMissing) WHERE apple_rowid = ?", into: &stmt)
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt, 1, Int64(messageRowId))
+        try stepDone(stmt)
     }
 
     func countUnindexedBody() throws -> Int {

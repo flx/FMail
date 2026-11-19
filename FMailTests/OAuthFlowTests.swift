@@ -95,7 +95,7 @@ final class OAuthFlowTests: XCTestCase {
         let nonce = try await fetchApprovalNonce(
             port: port, challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", state: "xyz"
         )
-        let raw = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
+        let raw = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)&pairing_code=\(await pairingCode())")
         XCTAssertTrue(responseStatus(raw).hasPrefix("HTTP/1.1 302"))
         // Location header contains the auth code + state, points at the
         // requested redirect_uri.
@@ -121,11 +121,93 @@ final class OAuthFlowTests: XCTestCase {
 
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
 
-        let raw = try await postForm(port: port, path: "/authorize/approve", body: "nonce=not-a-real-nonce")
+        let raw = try await postForm(port: port, path: "/authorize/approve", body: "nonce=not-a-real-nonce&pairing_code=\(await pairingCode())")
         XCTAssertTrue(responseStatus(raw).hasPrefix("HTTP/1.1 403"))
         // The window must NOT have been consumed by the bogus attempt.
         let stillOpen = await MainActor.run { OAuthStore.shared.approvalWindowIsOpen }
         XCTAssertTrue(stillOpen)
+    }
+
+    /// An attacker who polls GET /authorize gets a valid nonce but never sees
+    /// the Mac's screen: without the pairing code the approval is refused,
+    /// and the nonce survives so the real user can still approve.
+    func testApproveRequiresPairingCode() async throws {
+        let server = MCPServer()
+        try await server.start(port: 0)
+        let port = await server.port
+        defer { Task { await server.stop() } }
+
+        await MainActor.run { OAuthStore.shared.openApprovalWindow() }
+        let nonce = try await fetchApprovalNonce(
+            port: port, challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", state: "s"
+        )
+        let code = await pairingCode()
+        let wrong = code == "000000" ? "111111" : "000000"
+
+        for body in ["nonce=\(nonce)", "nonce=\(nonce)&pairing_code=\(wrong)"] {
+            let raw = try await postForm(port: port, path: "/authorize/approve", body: body)
+            XCTAssertTrue(responseStatus(raw).hasPrefix("HTTP/1.1 403"), body)
+        }
+        // Spaces are tolerated ("123 456" as shown in the menu).
+        let spaced = "\(code.prefix(3))%20\(code.suffix(3))"
+        let ok = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)&pairing_code=\(spaced)")
+        XCTAssertTrue(responseStatus(ok).hasPrefix("HTTP/1.1 302"))
+    }
+
+    func testTooManyWrongPairingCodesCloseTheWindow() async throws {
+        await MainActor.run {
+            let store = OAuthStore.shared
+            store.openApprovalWindow()
+            let wrong = store.pairingCode == "000000" ? "111111" : "000000"
+            for _ in 0..<OAuthStore.maxPairingAttempts {
+                XCTAssertFalse(store.verifyPairingCode(wrong))
+            }
+            XCTAssertFalse(store.approvalWindowIsOpen)
+            XCTAssertNil(store.pairingCode)
+            XCTAssertFalse(store.verifyPairingCode(""), "no code verifies while closed")
+        }
+    }
+
+    func testEachWindowGetsAFreshSixDigitCode() async {
+        await MainActor.run {
+            let store = OAuthStore.shared
+            store.openApprovalWindow()
+            let first = store.pairingCode ?? ""
+            XCTAssertEqual(first.count, 6)
+            XCTAssertTrue(first.allSatisfy(\.isNumber))
+            store.closeApprovalWindow()
+            XCTAssertNil(store.pairingCode)
+        }
+    }
+
+    func testPendingAuthorizationsAreCapped() async {
+        await MainActor.run {
+            let store = OAuthStore.shared
+            var first: String?
+            for i in 0..<(OAuthStore.maxPendingAuthorizations + 5) {
+                let nonce = store.recordPendingAuthorization(
+                    clientID: "c", redirectURI: "https://claude.ai/cb", codeChallenge: "x",
+                    codeChallengeMethod: "S256", scope: nil, state: "\(i)")
+                if i == 0 { first = nonce }
+            }
+            // The oldest was evicted once the cap was exceeded.
+            XCTAssertNil(store.consumePendingAuthorization(nonce: first ?? ""))
+        }
+    }
+
+    func testOversizedStateIsRejected() async {
+        let html = await MainActor.run {
+            OAuthHandlers.authorizePage(query: [
+                "response_type": "code", "client_id": "c", "redirect_uri": "https://claude.ai/cb",
+                "code_challenge": "x", "code_challenge_method": "S256",
+                "state": String(repeating: "a", count: OAuthStore.maxStateLength + 1),
+            ])
+        }
+        XCTAssertTrue(String(decoding: html, as: UTF8.self).hasPrefix("HTTP/1.1 400"))
+    }
+
+    private func pairingCode() async -> String {
+        await MainActor.run { OAuthStore.shared.pairingCode ?? "" }
     }
 
     // MARK: — End-to-end /token exchange
@@ -143,7 +225,7 @@ final class OAuthFlowTests: XCTestCase {
         //    to obtain the nonce, then approve with it).
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
         let nonce = try await fetchApprovalNonce(port: port, challenge: challenge, state: "xyz")
-        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
+        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)&pairing_code=\(await pairingCode())")
         XCTAssertTrue(responseStatus(approveResp).hasPrefix("HTTP/1.1 302"))
         let code = try XCTUnwrap(extractQueryParam("code", fromLocationIn: approveResp))
 
@@ -171,7 +253,7 @@ final class OAuthFlowTests: XCTestCase {
 
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
         let nonce = try await fetchApprovalNonce(port: port, challenge: challenge, state: "xyz")
-        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
+        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)&pairing_code=\(await pairingCode())")
         let code = try XCTUnwrap(extractQueryParam("code", fromLocationIn: approveResp))
 
         // Wrong verifier.
@@ -193,7 +275,7 @@ final class OAuthFlowTests: XCTestCase {
 
         await MainActor.run { OAuthStore.shared.openApprovalWindow() }
         let nonce = try await fetchApprovalNonce(port: port, challenge: challenge, state: "xyz")
-        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)")
+        let approveResp = try await postForm(port: port, path: "/authorize/approve", body: "nonce=\(nonce)&pairing_code=\(await pairingCode())")
         let code = try XCTUnwrap(extractQueryParam("code", fromLocationIn: approveResp))
 
         let tokenBody = "grant_type=authorization_code&code=\(code)&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb&client_id=test&code_verifier=\(verifier)"

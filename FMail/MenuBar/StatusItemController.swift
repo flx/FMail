@@ -166,6 +166,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         tunnelOpenItem.state = tunnelLive ? .on : .off
         tunnelOpenItem.title = tunnelOpenTitle()
         approvalItem.state = OAuthStore.shared.approvalWindowIsOpen ? .on : .off
+        // The pairing code the browser approval page asks for. Shown only
+        // here, on the Mac, so approving proves you can see this screen.
+        if OAuthStore.shared.approvalWindowIsOpen, let code = OAuthStore.shared.pairingCode {
+            approvalItem.title = "Approval window open — code \(code.prefix(3)) \(code.suffix(3))"
+        } else {
+            approvalItem.title = "Open approval window"
+        }
         // Parent checkmark tracks the tunnel only — it's the sensitive,
         // publicly-exposed state. A check here means "tunnel live"; the title
         // spells it out too.

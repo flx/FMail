@@ -72,11 +72,10 @@ actor BodyIndexer {
                             attachments: body.attachments
                         )
                     } else {
-                        // No .emlx on disk yet; mark with empty body so we move
-                        // on. A later sync re-runs this sweep (and now drops the
-                        // BodyLoader cache), so the body is picked up once the
-                        // file appears.
-                        try await indexDB.setBodyText(messageRowId: entry.rowid, bodyText: "")
+                        // No .emlx on disk yet (e.g. Mail.app is still
+                        // downloading it). Mark it missing, not indexed, so
+                        // `retryMissingBodies` picks it up once it lands.
+                        try await indexDB.markBodyMissing(messageRowId: entry.rowid)
                     }
                 } catch {
                     // Skip; mark as done so we don't loop on a corrupt file.
@@ -90,7 +89,47 @@ actor BodyIndexer {
                 }
             }
         }
+        if !cancelled {
+            await retryMissingBodies(mailboxByRowId: mailboxByRowId)
+        }
         await reportProgress(progress, stage: cancelled ? "Paused" : "Idle", done: done, total: total)
+    }
+
+    /// Set once this process has retried *every* missing body; after that
+    /// each sweep only retries recent/unread ones.
+    private var retriedAllMissing = false
+    /// Window for the per-sweep retry (unread mail is always included).
+    static let missingRetryWindow: TimeInterval = 14 * 86_400
+
+    /// Re-check messages whose `.emlx` was missing. Each sweep follows a sync,
+    /// which drops BodyLoader's file-map cache, so newly downloaded files are
+    /// visible here. Only rows whose file has now appeared are written; a
+    /// still-missing row costs a map lookup. Every missing row is retried
+    /// once per launch; afterwards only unread or recent ones, so huge
+    /// mailboxes aren't re-listed on every 60-second sync.
+    func retryMissingBodies(mailboxByRowId: [Int: Mailbox]) async {
+        let since: Date? = retriedAllMissing ? Date().addingTimeInterval(-Self.missingRetryWindow) : nil
+        guard let rows = try? await indexDB.fetchBodyMissingMessages(recentSince: since) else { return }
+        for (i, entry) in rows.enumerated() {
+            if cancelled { return }
+            guard let mb = mailboxByRowId[entry.mailboxRowId] else { continue }
+            do {
+                guard let body = try await bodyLoader.loadBody(messageRowId: entry.rowid, mailbox: mb) else { continue }
+                let split = BodyCleaner.split(body.displayText)
+                try await indexDB.setBodyContent(
+                    messageRowId: entry.rowid,
+                    bodyClean: split.clean,
+                    bodyQuoted: split.quoted,
+                    isBulk: BulkHeuristic.isBulk(body.headers),
+                    attachments: body.attachments
+                )
+            } catch {
+                // Present but unparseable: stop retrying it.
+                try? await indexDB.setBodyText(messageRowId: entry.rowid, bodyText: "")
+            }
+            if i % 200 == 199 { await Task.yield() }
+        }
+        retriedAllMissing = true
     }
 
     private func reportProgress(_ closure: @MainActor @escaping (BodyIndexProgress) -> Void, stage: String, done: Int, total: Int) async {
