@@ -248,12 +248,17 @@ Security posture, in order of how much it matters:
   through `MCPContext.drafter`, an injected `ReplyDrafting` capability — the first step of
   `mcp-readonly-seam`; the tool isn't registered without it. No code path sends, deletes or moves
   mail. Worst case past the bearer token: read mail, and open drafts on the user's screen.
-- **File access from a tunnel is confined to `iCloud Drive/FMail`, both ways.** Attachment bytes are
+- **File writes from a tunnel are confined to `iCloud Drive/FMail`.** Attachment bytes are
   attacker-controlled (anyone can email you a file) and FMail isn't sandboxed, so every
-  `save_to_path` / `save_dir` from a *tunnel* connection must resolve inside it. Likewise
-  `draft_reply`'s `path` attachments — otherwise a leaked token could attach `~/.ssh/id_ed25519` to
-  a reply addressed to whoever emailed you. Local connections are unrestricted. The root is in
-  iCloud Drive deliberately: a save requested from the phone syncs back to the phone's Files app.
+  `save_to_path` / `save_dir` from a *tunnel* connection must resolve inside it — an unconfined
+  write is a code-execution primitive (`~/.zshrc`, LaunchAgents). Local connections are
+  unrestricted. The root is in iCloud Drive deliberately: a save requested from the phone syncs back
+  to the phone's Files app.
+- **`draft_reply` file reads are not confined, from the tunnel either** (decision 2026-11-19).
+  claude.ai connectors always arrive via the tunnel, even from this Mac, so confining them blocked
+  attaching project files at all. Accepted risk: a leaked token can put any readable file (e.g. an
+  SSH key) into a draft addressed to whoever emailed you; it leaves the Mac only if the user presses
+  Send. Revisit (allowed-folders list, or on-Mac confirmation) if that trade-off changes.
 - **Browsers can't drive the local server.** With no token configured, the loopback server is
   unauthenticated, so the gate against web pages is: a Host allowlist (DNS rebinding), an Origin
   allowlist that also **rejects `Origin: null`** (sandboxed iframes, https→http form posts), and
@@ -329,8 +334,7 @@ Removed after shipping, and not coming back without a new reason:
 - **MCP write tools** (`mark_read`, `delete_messages`, `move_to_junk`, `diagnose_junk_mailboxes`).
   Dropped so the connector is safe to expose over a tunnel: worst case, someone past the bearer token
   can read mail, not mutate it. `draft_reply` (2026-11) was added back deliberately as the single
-  exception: it only opens a draft for the user to send, and its file reach over the tunnel is
-  confined like attachment saves.
+  exception: it only opens a draft for the user to send (its attachment reads are unconfined; see §6).
 
 Deferred, designed-for but not started:
 

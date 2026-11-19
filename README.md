@@ -309,7 +309,8 @@ caller past the bearer token can do is read mail and open drafts on your screen.
 > your clipboard is restored afterwards). Otherwise — no permission, or a locked screen, e.g. when
 > you're using the tunnel from your phone — it sets the body via AppleScript with a plain-text
 > `> ` quote instead (`mode: "applescript"`). The first use asks for Automation access to System
-> Events. Over the tunnel, `path` attachments must live inside `iCloud Drive/FMail`. Ad-hoc-signed
+> Events. `path` attachments may be any readable file on the Mac, over the tunnel too — claude.ai connectors
+> always arrive via the tunnel, even from this Mac. The safeguard is that the draft never sends. Ad-hoc-signed
 > rebuilds invalidate the Accessibility grant; re-tick FMail after rebuilding.
 
 > **Ranked search.** `sort: "relevance"` ranks by column-weighted BM25 rather than date: subject and

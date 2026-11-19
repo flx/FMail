@@ -113,8 +113,15 @@ extension MCPHandlers {
     }
 
     /// Resolve one `attachments[]` entry to a local file:
-    /// `{"path": …}` — a file on disk; tunnel requests are confined to
-    /// iCloud Drive/FMail, local requests may name any readable file.
+    /// `{"path": …}` — any readable file on the Mac, for local AND tunnel
+    /// requests. Deliberately NOT confined (Felix's decision, 2026-11-19):
+    /// claude.ai connectors always arrive over the tunnel even from this Mac,
+    /// so confinement blocked attaching project files. The safeguard is that
+    /// the draft never sends — a file leaves the Mac only if the user presses
+    /// Send. (Writes — `save_to_path` / `save_dir` — stay confined: an
+    /// unconfined write is a code-execution primitive, a read into a draft
+    /// is not.) Relative paths resolve against `$HOME`, falling back to
+    /// iCloud Drive/FMail.
     /// `{"rowid": N, "attachment_index": i}` — an attachment of an indexed
     /// message, copied into a private staging folder.
     private static func resolveDraftAttachment(
@@ -126,13 +133,18 @@ extension MCPHandlers {
         guard let obj = spec.objectValue else { throw invalid("must be an object") }
 
         if let rawPath = obj["path"]?.stringValue {
-            let path: String
+            var path: String
             do {
-                path = MCPRequestContext.isLocal
-                    ? URL(fileURLWithPath: try unconfinedAbsolutePath(rawPath)).resolvingSymlinksInPath().path
-                    : try safeAbsolutePath(rawPath)
+                path = URL(fileURLWithPath: try unconfinedAbsolutePath(rawPath)).resolvingSymlinksInPath().path
             } catch {
                 throw invalid(String(describing: error))
+            }
+            let expanded = (rawPath.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+            if !FileManager.default.fileExists(atPath: path), !(expanded as NSString).isAbsolutePath {
+                let inRoot = (attachmentSaveRoot as NSString).appendingPathComponent(expanded)
+                if FileManager.default.fileExists(atPath: inRoot) {
+                    path = URL(fileURLWithPath: inRoot).resolvingSymlinksInPath().path
+                }
             }
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue,

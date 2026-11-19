@@ -81,20 +81,25 @@ final class MCPDraftReplyTests: XCTestCase {
         XCTAssertEqual(att?["source"]?.stringValue, "file")
     }
 
-    func testTunnelPathOutsideICloudRootIsRejected() async throws {
+    /// claude.ai connectors always arrive over the tunnel, so draft attachments
+    /// are deliberately unconfined for tunnel requests too (drafts never send).
+    func testTunnelRequestMayAttachProjectFiles() async throws {
         let fixture = try await Fixture.make()
         defer { try? fixture.cleanup() }
+        let file = try tmpFile("sheet_01.dxf", bytes: 2048)
         let drafter = FakeDrafter()
-        do {
-            _ = try await call([
-                "rowid": .int(Int64(fixture.lunchMessageRowId)),
-                "attachments": .array([.object(["path": .string("/etc/hosts")])]),
-            ], fixture: fixture, drafter: drafter, local: false)
-            XCTFail("tunnel request attached a file outside iCloud Drive/FMail")
-        } catch let e as JSONRPCErrorPayload {
-            XCTAssertTrue(e.message.contains("outside the allowed directory"), e.message)
+        _ = try await call([
+            "rowid": .int(Int64(fixture.lunchMessageRowId)),
+            "attachments": .array([.object(["path": .string(file.path)])]),
+        ], fixture: fixture, drafter: drafter, local: false)
+        XCTAssertEqual(drafter.requests.first?.attachmentURLs.map(\.lastPathComponent), ["sheet_01.dxf"])
+    }
+
+    /// Writes from the tunnel stay confined — only draft *reads* were opened up.
+    func testTunnelSavePathsAreStillConfined() throws {
+        try MCPRequestContext.$isLocal.withValue(false) {
+            XCTAssertThrowsError(try MCPHandlers.resolveSavePath("/tmp/evil.plist"))
         }
-        XCTAssertTrue(drafter.requests.isEmpty, "Mail must not be touched when validation fails")
     }
 
     func testDirectoryAndMissingFilesAreRejected() async throws {

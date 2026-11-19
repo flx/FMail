@@ -4,7 +4,7 @@ Implemented and committed. Items are moved here from TODO.md by `/done`.
 
 ## Features
 
-- [x] (mcp-draft-reply) MCP `draft_reply`: open a reply / reply-all in Mail.app pre-filled with draft text and attachments (files on disk, or attachments of indexed emails); never sends — **2026-11-19**. Mail.app discards its native quote on any AppleScript write to a reply's content (verified), so the drafter pastes text + files via System Events when FMail has Accessibility and the screen is unlocked, else falls back to AppleScript content with a plain-text quote. Tunnel `path` attachments confined to iCloud Drive/FMail; text/paths passed via `osascript` argv. Reaches Mail only through the injected `MCPContext.drafter` capability (first slice of `mcp-readonly-seam`). Tests in `MCPDraftReplyTests`.
+- [x] (mcp-draft-reply) MCP `draft_reply`: open a reply / reply-all in Mail.app pre-filled with draft text and attachments (files on disk, or attachments of indexed emails); never sends — **2026-11-19**. Mail.app discards its native quote on any AppleScript write to a reply's content (verified), so the drafter pastes text + files via System Events when FMail has Accessibility and the screen is unlocked, else falls back to AppleScript content with a plain-text quote. `path` attachments unconfined for tunnel requests too (2026-11-19: claude.ai connectors always come via the tunnel; drafts never send); text/paths passed via `osascript` argv. Reaches Mail only through the injected `MCPContext.drafter` capability (first slice of `mcp-readonly-seam`). Tests in `MCPDraftReplyTests`.
 
 ## Bugs
 

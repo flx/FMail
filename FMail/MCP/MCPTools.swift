@@ -68,9 +68,10 @@ enum MCPTools {
             Attachments: each item is either `{"rowid": N,
             "attachment_index": i}` (re-attach a file from any indexed email —
             e.g. forward a PDF into the reply) or `{"path": "..."}` (a file
-            on disk). Over a remote/tunnel connection `path` must be inside
-            iCloud Drive/FMail (relative paths resolve there); local
-            connections may name any readable file. Max \(MCPHandlers.DraftLimits.maxAttachments) attachments, \(MCPHandlers.DraftLimits.maxTotalAttachmentBytes / 1024 / 1024) MB total.
+            on the user's Mac — any readable file, local or remote connection;
+            give an absolute path or `~/…`, e.g.
+            `~/Documents/Project/plan.pdf`; a relative path resolves against
+            the home folder, then iCloud Drive/FMail). Max \(MCPHandlers.DraftLimits.maxAttachments) attachments, \(MCPHandlers.DraftLimits.maxTotalAttachmentBytes / 1024 / 1024) MB total.
             Offloaded email attachments need `fetch_from_server` first.
 
             Requires Apple Mail Automation permission. Takes several seconds:
